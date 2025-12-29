@@ -369,6 +369,8 @@ class TestNotify:
         call_args = mock_run.call_args[0][0]
         assert call_args[0] == "terminal-notifier"
         assert "-group" in call_args
+        assert "-sender" in call_args
+        assert "com.apple.Terminal" in call_args
 
     @patch("event_bus.server.platform.system")
     @patch("event_bus.server.shutil.which")

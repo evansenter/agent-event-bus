@@ -182,6 +182,8 @@ def _send_notification(title: str, message: str, sound: bool = False) -> bool:
                     message,
                     "-group",
                     "event-bus",  # Group notifications together
+                    "-sender",
+                    "com.apple.Terminal",  # Use Terminal's notification permissions
                 ]
                 if sound:
                     cmd.extend(["-sound", "default"])
