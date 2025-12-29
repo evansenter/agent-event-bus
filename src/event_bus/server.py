@@ -52,7 +52,10 @@ def _extract_repo_from_cwd(cwd: str) -> str:
 
 @mcp.tool()
 def register_session(
-    name: str, machine: Optional[str] = None, cwd: Optional[str] = None
+    name: str,
+    machine: Optional[str] = None,
+    cwd: Optional[str] = None,
+    pid: Optional[int] = None,
 ) -> dict:
     """Register this Claude session with the event bus.
 
@@ -60,19 +63,40 @@ def register_session(
         name: A short name for this session (e.g., branch name, task)
         machine: Machine identifier (defaults to hostname)
         cwd: Working directory (defaults to CWD env var)
+        pid: Process ID of the Claude Code client (for session deduplication)
 
     Returns:
         Session info including assigned session_id
     """
     storage.cleanup_stale_sessions()
 
-    session_id = str(uuid.uuid4())[:8]
     now = datetime.now()
-
     machine = machine or socket.gethostname()
     cwd = cwd or os.environ.get("PWD", os.getcwd())
     repo = _extract_repo_from_cwd(cwd)
 
+    # Check for existing session with same machine+cwd+pid
+    existing = None
+    if pid is not None:
+        existing = storage.find_session_by_key(machine, cwd, pid)
+
+    if existing:
+        # Update existing session
+        existing.name = name
+        existing.last_heartbeat = now
+        storage.add_session(existing)  # INSERT OR REPLACE
+        return {
+            "session_id": existing.id,
+            "name": name,
+            "machine": machine,
+            "cwd": cwd,
+            "repo": repo,
+            "active_sessions": storage.session_count(),
+            "resumed": True,
+        }
+
+    # Create new session
+    session_id = str(uuid.uuid4())[:8]
     session = Session(
         id=session_id,
         name=name,
@@ -81,6 +105,7 @@ def register_session(
         repo=repo,
         registered_at=now,
         last_heartbeat=now,
+        pid=pid,
     )
     storage.add_session(session)
 
@@ -98,6 +123,7 @@ def register_session(
         "cwd": cwd,
         "repo": repo,
         "active_sessions": storage.session_count(),
+        "resumed": False,
     }
 
 
@@ -117,6 +143,7 @@ def list_sessions() -> list[dict]:
             "machine": s.machine,
             "repo": s.repo,
             "cwd": s.cwd,
+            "pid": s.pid,
             "registered_at": s.registered_at.isoformat(),
             "last_heartbeat": s.last_heartbeat.isoformat(),
             "age_seconds": (datetime.now() - s.registered_at).total_seconds(),

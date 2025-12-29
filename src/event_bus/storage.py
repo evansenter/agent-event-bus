@@ -113,8 +113,8 @@ class SQLiteStorage:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions
-                (id, name, machine, cwd, repo, registered_at, last_heartbeat)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, machine, cwd, repo, registered_at, last_heartbeat, pid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
@@ -124,8 +124,35 @@ class SQLiteStorage:
                     session.repo,
                     session.registered_at,
                     session.last_heartbeat,
+                    session.pid,
                 ),
             )
+
+    def find_session_by_key(
+        self, machine: str, cwd: str, pid: int
+    ) -> Optional[Session]:
+        """Find an existing session by machine+cwd+pid key."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE machine = ? AND cwd = ? AND pid = ?",
+                (machine, cwd, pid),
+            ).fetchone()
+            if row:
+                return self._row_to_session(row)
+            return None
+
+    def _row_to_session(self, row: sqlite3.Row) -> Session:
+        """Convert a database row to a Session object."""
+        return Session(
+            id=row["id"],
+            name=row["name"],
+            machine=row["machine"],
+            cwd=row["cwd"],
+            repo=row["repo"],
+            registered_at=row["registered_at"],
+            last_heartbeat=row["last_heartbeat"],
+            pid=row["pid"],
+        )
 
     def get_session(self, session_id: str) -> Optional[Session]:
         """Get a session by ID."""
@@ -134,15 +161,7 @@ class SQLiteStorage:
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
             if row:
-                return Session(
-                    id=row["id"],
-                    name=row["name"],
-                    machine=row["machine"],
-                    cwd=row["cwd"],
-                    repo=row["repo"],
-                    registered_at=row["registered_at"],
-                    last_heartbeat=row["last_heartbeat"],
-                )
+                return self._row_to_session(row)
             return None
 
     def update_heartbeat(self, session_id: str, timestamp: datetime) -> bool:
@@ -158,18 +177,7 @@ class SQLiteStorage:
         """List all sessions (including stale ones)."""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM sessions").fetchall()
-            return [
-                Session(
-                    id=row["id"],
-                    name=row["name"],
-                    machine=row["machine"],
-                    cwd=row["cwd"],
-                    repo=row["repo"],
-                    registered_at=row["registered_at"],
-                    last_heartbeat=row["last_heartbeat"],
-                )
-                for row in rows
-            ]
+            return [self._row_to_session(row) for row in rows]
 
     def cleanup_stale_sessions(self, timeout_seconds: int = SESSION_TIMEOUT) -> int:
         """Remove sessions that haven't sent a heartbeat recently.
