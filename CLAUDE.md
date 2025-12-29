@@ -36,7 +36,6 @@ pytest
 | `list_sessions()` | List all active sessions |
 | `publish_event(type, payload, session_id?, channel?)` | Publish event to channel |
 | `get_events(since_id?, limit?, session_id?)` | Poll for events (filtered by subscriptions) |
-| `heartbeat(session_id)` | Keep session alive |
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
 
