@@ -11,6 +11,23 @@ from typing import Optional
 
 logger = logging.getLogger("event-bus")
 
+# Register datetime adapters/converters (required for Python 3.12+)
+# See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
+
+
+def _adapt_datetime(dt: datetime) -> str:
+    """Convert datetime to ISO format string for SQLite storage."""
+    return dt.isoformat()
+
+
+def _convert_datetime(data: bytes) -> datetime:
+    """Convert ISO format string from SQLite to datetime."""
+    return datetime.fromisoformat(data.decode())
+
+
+sqlite3.register_adapter(datetime, _adapt_datetime)
+sqlite3.register_converter("TIMESTAMP", _convert_datetime)
+
 
 @dataclass
 class Session:

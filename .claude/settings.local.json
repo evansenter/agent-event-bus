@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.shuttle.dev)",
+      "Bash(brew list:*)",
+      "Bash(brew search:*)",
+      "Bash(brew install:*)",
+      "Bash(/opt/homebrew/bin/python3.12 -m pip install:*)",
+      "Bash(/opt/homebrew/bin/python3.12:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(python -m event_bus.server:*)",
+      "Bash(cat:*)",
+      "Bash(curl:*)",
+      "Bash(SESSION_ID=\"3a4f2c591cec476aa7dd57f2c5253300\":*)",
+      "Bash(pytest:*)",
+      "Bash(mkdir:*)",
+      "Bash(chmod:*)",
+      "mcp__event-bus__register_session",
+      "mcp__event-bus__list_sessions",
+      "mcp__event-bus__get_events",
+      "mcp__event-bus__publish_event",
+      "Bash(./scripts/stop.sh:*)",
+      "Bash(./scripts/start.sh)",
+      "Bash(lsof:*)",
+      "Bash(kill:*)",
+      "Bash(gh repo view:*)",
+      "mcp__event-bus__heartbeat",
+      "Bash(xargs kill:*)",
+      "Bash(./scripts/install-launchagent.sh:*)",
+      "Bash(launchctl list:*)",
+      "Skill(rfc)",
+      "mcp__event-bus__notify",
+      "Bash(python:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

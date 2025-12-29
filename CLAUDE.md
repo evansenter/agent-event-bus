@@ -39,6 +39,14 @@ pytest
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
 
+## MCP Resources
+
+| Resource | Purpose |
+|----------|---------|
+| `event-bus://guide` | Usage guide and best practices for CC sessions |
+
+**Important**: Keep `usage_guide()` in `server.py` up to date when changing APIs. This is how CC sessions learn to use the event bus effectively.
+
 ## Channel-Based Messaging
 
 Events can be targeted to specific channels:

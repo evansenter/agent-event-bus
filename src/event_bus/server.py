@@ -40,6 +40,96 @@ mcp = FastMCP("event-bus")
 storage = SQLiteStorage()
 
 
+@mcp.resource("event-bus://guide", description="Usage guide and best practices")
+def usage_guide() -> str:
+    """Return the event bus usage guide."""
+    return """# Event Bus Usage Guide
+
+## Quick Start
+
+1. **Register** your session on startup:
+   ```
+   register_session(name="my-feature", pid=<your_pid>)
+   → Returns: {session_id, repo, machine, ...}
+   ```
+
+2. **Poll** for events (pass session_id for filtering):
+   ```
+   get_events(since_id=0, session_id="<your_session_id>")
+   → Returns events for your subscribed channels only
+   ```
+
+3. **Publish** updates to relevant channels:
+   ```
+   publish_event("task_done", "Finished API", session_id="...", channel="repo:my-project")
+   ```
+
+4. **Unregister** when exiting:
+   ```
+   unregister_session(session_id="...")
+   ```
+
+## Channels
+
+Sessions are auto-subscribed to channels based on their attributes:
+
+| Channel | Who Receives | Use For |
+|---------|--------------|---------|
+| `all` | Everyone | Broadcasts, announcements |
+| `session:{id}` | One session | Direct messages, help requests |
+| `repo:{name}` | Same repo | Coordinating parallel work |
+| `machine:{name}` | Same machine | Local coordination |
+
+### Examples
+
+```
+# Broadcast to all sessions
+publish_event("announcement", "Taking a break", channel="all")
+
+# Direct message to specific session
+publish_event("help", "Can you review auth.ts?", channel="session:abc123")
+
+# Coordinate within same repo (most common)
+publish_event("api_ready", "API merged, you can integrate", channel="repo:my-project")
+```
+
+## Best Practices
+
+1. **Always pass session_id** to `get_events` - enables channel filtering and auto-heartbeat
+2. **Use repo channels** for most coordination - avoids noise from unrelated projects
+3. **Use DMs sparingly** - only when you need a specific session's attention
+4. **Poll periodically** - `get_events` also refreshes your heartbeat
+
+## Common Patterns
+
+### Wait for another session
+```
+# Poll until you see the event you're waiting for
+events = get_events(since_id=last_id, session_id=my_id)
+for e in events:
+    if e.event_type == "api_ready":
+        # Proceed with integration
+```
+
+### Request help from specific session
+```
+# Find the session you need
+sessions = list_sessions()
+target = [s for s in sessions if "auth" in s.name][0]
+
+# Send direct message
+publish_event("help_needed", "Stuck on auth flow",
+              channel=f"session:{target.session_id}")
+```
+
+### Announce completion
+```
+publish_event("task_completed", "Feature X is done and merged",
+              session_id=my_id, channel="repo:my-project")
+```
+"""
+
+
 def _extract_repo_from_cwd(cwd: str) -> str:
     """Extract repo name from working directory."""
     # Try to get git repo name
@@ -50,7 +140,8 @@ def _extract_repo_from_cwd(cwd: str) -> str:
         if idx > 0:
             return parts[idx - 1]
     # Fall back to last directory component
-    return parts[-1] if parts else "unknown"
+    last = parts[-1] if parts else ""
+    return last if last else "unknown"
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -124,6 +215,8 @@ def register_session(
 
     Returns:
         Session info including assigned session_id
+
+    Tip: Read the resource at event-bus://guide for usage patterns and best practices.
     """
     storage.cleanup_stale_sessions()
 
