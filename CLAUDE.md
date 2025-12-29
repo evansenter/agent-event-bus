@@ -132,9 +132,15 @@ On macOS, notifications use terminal-notifier (if installed) with osascript fall
 
 Install terminal-notifier: `brew install terminal-notifier`
 
+### Custom Icon
+
+A pixel art Birman cat icon is included in `assets/`:
+```bash
+EVENT_BUS_ICON=$(pwd)/assets/icon-512.png event-bus
+```
+
 ## Future Work
 
 - Tailscale support for multi-machine
 - File locking tools for conflict detection
 - SSE streaming for lower latency
-- Custom app icon for event-bus notifications
