@@ -168,23 +168,8 @@ def _send_notification(title: str, message: str, sound: bool = False) -> bool:
 
     try:
         if system == "Darwin":  # macOS
-            # Prefer terminal-notifier for better customization (custom icons, etc.)
-            if shutil.which("terminal-notifier"):
-                cmd = [
-                    "terminal-notifier",
-                    "-title",
-                    title,
-                    "-message",
-                    message,
-                    "-group",
-                    "event-bus",  # Group notifications together
-                ]
-                if sound:
-                    cmd.extend(["-sound", "default"])
-                subprocess.run(cmd, check=True, capture_output=True)
-                return True
-
-            # Fall back to osascript
+            # TODO: terminal-notifier support for custom icons (needs debugging)
+            # For now, use osascript which works reliably
             script = f'display notification "{message}" with title "{title}"'
             if sound:
                 script += ' sound name "default"'
