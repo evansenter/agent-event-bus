@@ -20,3 +20,4 @@ rm -f "$PLIST_DEST"
 echo "Event bus LaunchAgent uninstalled."
 echo ""
 echo "Note: Logs remain at ~/.claude/event-bus.log"
+osascript -e 'display notification "LaunchAgent uninstalled" with title "Event Bus"' 2>/dev/null
