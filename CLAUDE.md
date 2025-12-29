@@ -24,7 +24,7 @@ pytest
 ## Architecture
 
 - `src/event_bus/server.py` - Main MCP server with all tools
-- In-memory storage (MVP) - sessions and events stored in dicts/lists
+- `src/event_bus/storage.py` - SQLite storage backend
 - FastMCP framework for MCP protocol handling
 - Uvicorn for HTTP transport
 
@@ -42,12 +42,22 @@ pytest
 
 - **Polling over push**: MCP is request/response, so sessions poll with `get_events(since_id)`
 - **Heartbeat-based cleanup**: Sessions timeout after 2 minutes without heartbeat
-- **In-memory first**: No persistence yet - restart clears all state
+- **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
+- **Event retention**: Keeps last 1000 events, auto-cleans on write
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
+
+## Configuration
+
+```bash
+# Override database path (default: ~/.claude/event-bus.db)
+EVENT_BUS_DB=/path/to/db.sqlite event-bus
+
+# Enable request/response logging (for dev mode)
+DEV_MODE=1 event-bus
+```
 
 ## Future Work
 
-- SQLite persistence for crash recovery
 - Tailscale support for multi-machine
 - File locking tools for conflict detection
 - SSE streaming for lower latency

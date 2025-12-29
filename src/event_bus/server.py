@@ -13,11 +13,12 @@ import logging
 import os
 import socket
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
+
+from event_bus.storage import SQLiteStorage, Session
 
 # Configure logging - only enable DEBUG for our logger, not third-party libs
 logging.basicConfig(
@@ -32,39 +33,8 @@ if os.environ.get("DEV_MODE"):
 # Initialize MCP server (stateless_http=True allows resilience to server restarts)
 mcp = FastMCP("event-bus", stateless_http=True)
 
-
-# In-memory storage (MVP - will add persistence later)
-@dataclass
-class Session:
-    """Represents an active Claude Code session."""
-
-    id: str
-    name: str
-    machine: str
-    cwd: str
-    repo: str
-    registered_at: datetime
-    last_heartbeat: datetime
-
-
-@dataclass
-class Event:
-    """An event broadcast to all sessions."""
-
-    id: int
-    event_type: str
-    payload: str
-    session_id: str
-    timestamp: datetime
-
-
-# Global state
-sessions: dict[str, Session] = {}
-events: list[Event] = []
-event_counter: int = 0
-
-# Session timeout (seconds)
-SESSION_TIMEOUT = 120  # 2 minutes without heartbeat = dead
+# SQLite-backed storage (persists across restarts)
+storage = SQLiteStorage()
 
 
 def _extract_repo_from_cwd(cwd: str) -> str:
@@ -78,18 +48,6 @@ def _extract_repo_from_cwd(cwd: str) -> str:
             return parts[idx - 1]
     # Fall back to last directory component
     return parts[-1] if parts else "unknown"
-
-
-def _cleanup_stale_sessions() -> None:
-    """Remove sessions that haven't sent a heartbeat recently."""
-    now = datetime.now()
-    stale = [
-        sid
-        for sid, session in sessions.items()
-        if (now - session.last_heartbeat).total_seconds() > SESSION_TIMEOUT
-    ]
-    for sid in stale:
-        del sessions[sid]
 
 
 @mcp.tool()
@@ -106,9 +64,7 @@ def register_session(
     Returns:
         Session info including assigned session_id
     """
-    global event_counter
-
-    _cleanup_stale_sessions()
+    storage.cleanup_stale_sessions()
 
     session_id = str(uuid.uuid4())[:8]
     now = datetime.now()
@@ -126,18 +82,13 @@ def register_session(
         registered_at=now,
         last_heartbeat=now,
     )
-    sessions[session_id] = session
+    storage.add_session(session)
 
     # Auto-publish registration event
-    event_counter += 1
-    events.append(
-        Event(
-            id=event_counter,
-            event_type="session_registered",
-            payload=f"{name} started on {machine} in {cwd}",
-            session_id=session_id,
-            timestamp=now,
-        )
+    storage.add_event(
+        event_type="session_registered",
+        payload=f"{name} started on {machine} in {cwd}",
+        session_id=session_id,
     )
 
     return {
@@ -146,7 +97,7 @@ def register_session(
         "machine": machine,
         "cwd": cwd,
         "repo": repo,
-        "active_sessions": len(sessions),
+        "active_sessions": storage.session_count(),
     }
 
 
@@ -157,7 +108,7 @@ def list_sessions() -> list[dict]:
     Returns:
         List of active sessions with their info
     """
-    _cleanup_stale_sessions()
+    storage.cleanup_stale_sessions()
 
     return [
         {
@@ -170,7 +121,7 @@ def list_sessions() -> list[dict]:
             "last_heartbeat": s.last_heartbeat.isoformat(),
             "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
         }
-        for s in sessions.values()
+        for s in storage.list_sessions()
     ]
 
 
@@ -188,17 +139,11 @@ def publish_event(
     Returns:
         The created event with its ID
     """
-    global event_counter
-    event_counter += 1
-
-    event = Event(
-        id=event_counter,
+    event = storage.add_event(
         event_type=event_type,
         payload=payload,
         session_id=session_id or "anonymous",
-        timestamp=datetime.now(),
     )
-    events.append(event)
 
     return {
         "event_id": event.id,
@@ -218,9 +163,6 @@ def get_events(since_id: int = 0, limit: int = 50) -> list[dict]:
     Returns:
         List of events since the given ID
     """
-    filtered = [e for e in events if e.id > since_id]
-    filtered = filtered[-limit:]  # Take last N
-
     return [
         {
             "id": e.id,
@@ -229,7 +171,7 @@ def get_events(since_id: int = 0, limit: int = 50) -> list[dict]:
             "session_id": e.session_id,
             "timestamp": e.timestamp.isoformat(),
         }
-        for e in filtered
+        for e in storage.get_events(since_id=since_id, limit=limit)
     ]
 
 
@@ -243,16 +185,14 @@ def heartbeat(session_id: str) -> dict:
     Returns:
         Updated session info
     """
-    if session_id not in sessions:
+    now = datetime.now()
+    if not storage.update_heartbeat(session_id, now):
         return {"error": "Session not found", "session_id": session_id}
-
-    session = sessions[session_id]
-    session.last_heartbeat = datetime.now()
 
     return {
         "session_id": session_id,
-        "last_heartbeat": session.last_heartbeat.isoformat(),
-        "active_sessions": len(sessions),
+        "last_heartbeat": now.isoformat(),
+        "active_sessions": storage.session_count(),
     }
 
 
