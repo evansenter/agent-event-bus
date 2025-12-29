@@ -119,10 +119,22 @@ EVENT_BUS_DB=/path/to/db.sqlite event-bus
 
 # Enable request/response logging (for dev mode)
 DEV_MODE=1 event-bus
+
+# Custom notification icon (requires terminal-notifier on macOS)
+EVENT_BUS_ICON=/path/to/icon.png event-bus
 ```
+
+## Notifications
+
+On macOS, notifications use terminal-notifier (if installed) with osascript fallback:
+- **terminal-notifier**: Supports custom icons via `EVENT_BUS_ICON` env var
+- **osascript**: Built-in fallback, no custom icon support
+
+Install terminal-notifier: `brew install terminal-notifier`
 
 ## Future Work
 
 - Tailscale support for multi-machine
 - File locking tools for conflict detection
 - SSE streaming for lower latency
+- Custom app icon for event-bus notifications

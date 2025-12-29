@@ -163,13 +163,38 @@ def _auto_heartbeat(session_id: str | None) -> None:
 
 
 def _send_notification(title: str, message: str, sound: bool = False) -> bool:
-    """Send a system notification. Returns True if successful."""
+    """Send a system notification. Returns True if successful.
+
+    On macOS, prefers terminal-notifier (supports custom icons) with osascript fallback.
+    Icon can be set via EVENT_BUS_ICON environment variable (absolute path to PNG).
+    """
     system = platform.system()
 
     try:
         if system == "Darwin":  # macOS
-            # TODO: terminal-notifier support for custom icons (needs debugging)
-            # For now, use osascript which works reliably
+            # Prefer terminal-notifier for custom icon support
+            if shutil.which("terminal-notifier"):
+                cmd = [
+                    "terminal-notifier",
+                    "-title",
+                    title,
+                    "-message",
+                    message,
+                    "-group",
+                    "event-bus",  # Group notifications together
+                ]
+                if sound:
+                    cmd.extend(["-sound", "default"])
+
+                # Custom icon support via environment variable
+                icon_path = os.environ.get("EVENT_BUS_ICON")
+                if icon_path and os.path.exists(icon_path):
+                    cmd.extend(["-appIcon", icon_path])
+
+                subprocess.run(cmd, check=True, capture_output=True)
+                return True
+
+            # Fallback to osascript (no custom icon support)
             script = f'display notification "{message}" with title "{title}"'
             if sound:
                 script += ' sound name "default"'

@@ -352,10 +352,12 @@ class TestNotify:
     """Tests for notify tool."""
 
     @patch("event_bus.server.platform.system")
+    @patch("event_bus.server.shutil.which")
     @patch("event_bus.server.subprocess.run")
-    def test_notify_macos(self, mock_run, mock_system):
-        """Test notification on macOS."""
+    def test_notify_macos_terminal_notifier(self, mock_run, mock_which, mock_system):
+        """Test notification on macOS with terminal-notifier."""
         mock_system.return_value = "Darwin"
+        mock_which.return_value = "/opt/homebrew/bin/terminal-notifier"
         mock_run.return_value = MagicMock()
 
         result = notify(title="Test", message="Hello")
@@ -364,12 +366,65 @@ class TestNotify:
         assert result["title"] == "Test"
         assert result["message"] == "Hello"
         mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert call_args[0] == "terminal-notifier"
+        assert "-group" in call_args
 
     @patch("event_bus.server.platform.system")
+    @patch("event_bus.server.shutil.which")
     @patch("event_bus.server.subprocess.run")
-    def test_notify_macos_with_sound(self, mock_run, mock_system):
-        """Test notification with sound on macOS."""
+    def test_notify_macos_terminal_notifier_with_sound(self, mock_run, mock_which, mock_system):
+        """Test notification with sound on macOS using terminal-notifier."""
         mock_system.return_value = "Darwin"
+        mock_which.return_value = "/opt/homebrew/bin/terminal-notifier"
+        mock_run.return_value = MagicMock()
+
+        notify(title="Test", message="Hello", sound=True)
+
+        call_args = mock_run.call_args[0][0]
+        assert "-sound" in call_args
+        assert "default" in call_args
+
+    @patch.dict(os.environ, {"EVENT_BUS_ICON": "/tmp/test-icon.png"})
+    @patch("event_bus.server.os.path.exists")
+    @patch("event_bus.server.platform.system")
+    @patch("event_bus.server.shutil.which")
+    @patch("event_bus.server.subprocess.run")
+    def test_notify_macos_with_custom_icon(self, mock_run, mock_which, mock_system, mock_exists):
+        """Test notification with custom icon."""
+        mock_system.return_value = "Darwin"
+        mock_which.return_value = "/opt/homebrew/bin/terminal-notifier"
+        mock_exists.return_value = True
+        mock_run.return_value = MagicMock()
+
+        notify(title="Test", message="Hello")
+
+        call_args = mock_run.call_args[0][0]
+        assert "-appIcon" in call_args
+        assert "/tmp/test-icon.png" in call_args
+
+    @patch("event_bus.server.platform.system")
+    @patch("event_bus.server.shutil.which")
+    @patch("event_bus.server.subprocess.run")
+    def test_notify_macos_osascript_fallback(self, mock_run, mock_which, mock_system):
+        """Test notification falls back to osascript when terminal-notifier not available."""
+        mock_system.return_value = "Darwin"
+        mock_which.return_value = None  # No terminal-notifier
+        mock_run.return_value = MagicMock()
+
+        result = notify(title="Test", message="Hello")
+
+        assert result["success"] is True
+        call_args = mock_run.call_args[0][0]
+        assert call_args[0] == "osascript"
+
+    @patch("event_bus.server.platform.system")
+    @patch("event_bus.server.shutil.which")
+    @patch("event_bus.server.subprocess.run")
+    def test_notify_macos_osascript_with_sound(self, mock_run, mock_which, mock_system):
+        """Test notification with sound using osascript fallback."""
+        mock_system.return_value = "Darwin"
+        mock_which.return_value = None  # No terminal-notifier
         mock_run.return_value = MagicMock()
 
         notify(title="Test", message="Hello", sound=True)
