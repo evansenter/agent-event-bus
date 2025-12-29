@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "fastmcp>=0.1.0",
     "uvicorn>=0.30.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,7 @@ dev = [
 
 [project.scripts]
 event-bus = "event_bus.server:main"
+event-bus-cli = "event_bus.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/event_bus"]

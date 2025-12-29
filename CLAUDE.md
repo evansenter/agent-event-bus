@@ -87,6 +87,30 @@ publish_event("api_ready", "API merged", channel="repo:my-project")
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
 
+## CLI Wrapper
+
+For shell scripts and hooks (e.g., CC SessionStart/SessionEnd hooks):
+
+```bash
+# Register session
+event-bus-cli register --name "my-feature" --pid $$
+
+# Unregister session
+event-bus-cli unregister --session-id abc123
+
+# List sessions
+event-bus-cli sessions
+
+# Publish event
+event-bus-cli publish --type "task_done" --payload "Finished" --channel "repo:my-project"
+
+# Get events
+event-bus-cli events --since 0 --session-id abc123
+
+# Send notification
+event-bus-cli notify --title "Done" --message "Build complete"
+```
+
 ## Configuration
 
 ```bash
