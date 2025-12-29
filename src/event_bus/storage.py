@@ -40,8 +40,8 @@ class Event:
 # Default database path
 DEFAULT_DB_PATH = Path.home() / ".claude" / "event-bus.db"
 
-# Session timeout in seconds (2 minutes without heartbeat = dead)
-SESSION_TIMEOUT = 120
+# Session timeout in seconds (30 minutes without activity = dead)
+SESSION_TIMEOUT = 1800
 
 # Event retention settings
 MAX_EVENTS = 1000  # Keep last N events

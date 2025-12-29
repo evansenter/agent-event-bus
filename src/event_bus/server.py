@@ -53,6 +53,25 @@ def _extract_repo_from_cwd(cwd: str) -> str:
     return parts[-1] if parts else "unknown"
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    if pid is None:
+        return True  # Can't check, assume alive
+    try:
+        os.kill(pid, 0)  # Signal 0 = check if process exists
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # Process exists but we can't signal it
+
+
+def _auto_heartbeat(session_id: Optional[str]) -> None:
+    """Refresh heartbeat for a session if it exists."""
+    if session_id and session_id != "anonymous":
+        storage.update_heartbeat(session_id, datetime.now())
+
+
 def _send_notification(title: str, message: str, sound: bool = False) -> bool:
     """Send a system notification. Returns True if successful."""
     system = platform.system()
@@ -174,8 +193,21 @@ def list_sessions() -> list[dict]:
     """
     storage.cleanup_stale_sessions()
 
-    return [
-        {
+    local_hostname = socket.gethostname()
+    results = []
+
+    for s in storage.list_sessions():
+        # For local sessions with PIDs, check if process is still alive
+        is_local = s.machine == local_hostname
+        pid_alive = _is_pid_alive(s.pid) if is_local and s.pid else True
+
+        if not pid_alive:
+            # Clean up dead session
+            storage.delete_session(s.id)
+            logger.info(f"Cleaned up dead session {s.id} (PID {s.pid} not running)")
+            continue
+
+        results.append({
             "session_id": s.id,
             "name": s.name,
             "machine": s.machine,
@@ -185,9 +217,9 @@ def list_sessions() -> list[dict]:
             "registered_at": s.registered_at.isoformat(),
             "last_heartbeat": s.last_heartbeat.isoformat(),
             "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
-        }
-        for s in storage.list_sessions()
-    ]
+        })
+
+    return results
 
 
 @mcp.tool()
@@ -199,11 +231,14 @@ def publish_event(
     Args:
         event_type: Type of event (e.g., 'task_completed', 'help_needed')
         payload: Event payload/message
-        session_id: Your session ID (for attribution)
+        session_id: Your session ID (for attribution and auto-heartbeat)
 
     Returns:
         The created event with its ID
     """
+    # Auto-refresh heartbeat when session publishes
+    _auto_heartbeat(session_id)
+
     event = storage.add_event(
         event_type=event_type,
         payload=payload,
@@ -218,16 +253,22 @@ def publish_event(
 
 
 @mcp.tool()
-def get_events(since_id: int = 0, limit: int = 50) -> list[dict]:
+def get_events(
+    since_id: int = 0, limit: int = 50, session_id: Optional[str] = None
+) -> list[dict]:
     """Get events since a given event ID.
 
     Args:
         since_id: Return events with ID greater than this (default: 0 = all)
         limit: Maximum number of events to return (default: 50)
+        session_id: Your session ID (for auto-heartbeat)
 
     Returns:
         List of events since the given ID
     """
+    # Auto-refresh heartbeat when session polls
+    _auto_heartbeat(session_id)
+
     storage.cleanup_stale_sessions()
 
     return [
