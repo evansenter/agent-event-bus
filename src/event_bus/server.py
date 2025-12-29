@@ -190,6 +190,8 @@ def get_events(since_id: int = 0, limit: int = 50) -> list[dict]:
     Returns:
         List of events since the given ID
     """
+    storage.cleanup_stale_sessions()
+
     return [
         {
             "id": e.id,
