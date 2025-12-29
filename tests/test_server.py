@@ -4,7 +4,7 @@ import os
 import socket
 import tempfile
 from datetime import datetime
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,8 +12,8 @@ import pytest
 _temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["EVENT_BUS_DB"] = _temp_db.name
 
-from event_bus import server
-from event_bus.storage import SQLiteStorage, Session
+from event_bus import server  # noqa: E402
+from event_bus.storage import Session, SQLiteStorage  # noqa: E402
 
 # Access the underlying functions from FunctionTool wrappers
 register_session = server.register_session.fn
@@ -48,7 +48,10 @@ class TestExtractRepoFromCwd:
 
     def test_worktree_path(self):
         """Test extracting repo from worktree path."""
-        assert server._extract_repo_from_cwd("/home/user/myproject/.worktrees/feature-branch") == "myproject"
+        assert (
+            server._extract_repo_from_cwd("/home/user/myproject/.worktrees/feature-branch")
+            == "myproject"
+        )
 
     def test_empty_path(self):
         """Test empty path."""
@@ -243,6 +246,7 @@ class TestPublishEvent:
 
         # Publish event
         import time
+
         time.sleep(0.01)  # Small delay to ensure time difference
         publish_event("test", "payload", session_id=session_id)
 
@@ -275,8 +279,8 @@ class TestGetEvents:
         """Test getting events since a given ID."""
         # Publish some events
         result1 = publish_event("event1", "payload1")
-        result2 = publish_event("event2", "payload2")
-        result3 = publish_event("event3", "payload3")
+        publish_event("event2", "payload2")
+        publish_event("event3", "payload3")
 
         # Get events since event1
         events = get_events(since_id=result1["event_id"])
@@ -438,6 +442,7 @@ class TestAutoHeartbeat:
         original = server.storage.get_session(session_id).last_heartbeat
 
         import time
+
         time.sleep(0.01)
         server._auto_heartbeat(session_id)
 

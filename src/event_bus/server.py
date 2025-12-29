@@ -17,11 +17,10 @@ import socket
 import subprocess
 import uuid
 from datetime import datetime
-from typing import Optional
 
 from fastmcp import FastMCP
 
-from event_bus.storage import SQLiteStorage, Session
+from event_bus.storage import Session, SQLiteStorage
 
 # Configure logging - only enable DEBUG for our logger, not third-party libs
 logging.basicConfig(
@@ -157,7 +156,7 @@ def _is_pid_alive(pid: int) -> bool:
         return True  # Process exists but we can't signal it
 
 
-def _auto_heartbeat(session_id: Optional[str]) -> None:
+def _auto_heartbeat(session_id: str | None) -> None:
     """Refresh heartbeat for a session if it exists."""
     if session_id and session_id != "anonymous":
         storage.update_heartbeat(session_id, datetime.now())
@@ -201,9 +200,9 @@ def _send_notification(title: str, message: str, sound: bool = False) -> bool:
 @mcp.tool()
 def register_session(
     name: str,
-    machine: Optional[str] = None,
-    cwd: Optional[str] = None,
-    pid: Optional[int] = None,
+    machine: str | None = None,
+    cwd: str | None = None,
+    pid: int | None = None,
 ) -> dict:
     """Register this Claude session with the event bus.
 
@@ -300,17 +299,19 @@ def list_sessions() -> list[dict]:
             logger.info(f"Cleaned up dead session {s.id} (PID {s.pid} not running)")
             continue
 
-        results.append({
-            "session_id": s.id,
-            "name": s.name,
-            "machine": s.machine,
-            "repo": s.repo,
-            "cwd": s.cwd,
-            "pid": s.pid,
-            "registered_at": s.registered_at.isoformat(),
-            "last_heartbeat": s.last_heartbeat.isoformat(),
-            "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
-        })
+        results.append(
+            {
+                "session_id": s.id,
+                "name": s.name,
+                "machine": s.machine,
+                "repo": s.repo,
+                "cwd": s.cwd,
+                "pid": s.pid,
+                "registered_at": s.registered_at.isoformat(),
+                "last_heartbeat": s.last_heartbeat.isoformat(),
+                "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
+            }
+        )
 
     return results
 
@@ -319,7 +320,7 @@ def list_sessions() -> list[dict]:
 def publish_event(
     event_type: str,
     payload: str,
-    session_id: Optional[str] = None,
+    session_id: str | None = None,
     channel: str = "all",
 ) -> dict:
     """Publish an event to a channel.
@@ -355,7 +356,7 @@ def publish_event(
     }
 
 
-def _get_implicit_channels(session_id: Optional[str]) -> Optional[list[str]]:
+def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     """Get the channels a session is implicitly subscribed to.
 
     Returns None if no session (returns all events), or a list of channels.
@@ -377,9 +378,7 @@ def _get_implicit_channels(session_id: Optional[str]) -> Optional[list[str]]:
 
 
 @mcp.tool()
-def get_events(
-    since_id: int = 0, limit: int = 50, session_id: Optional[str] = None
-) -> list[dict]:
+def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None) -> list[dict]:
     """Get events since a given event ID.
 
     Events are filtered to channels the session is subscribed to:

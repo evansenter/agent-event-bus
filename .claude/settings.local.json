@@ -35,7 +35,9 @@
       "Skill(rfc)",
       "mcp__event-bus__notify",
       "Bash(python:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(ruff format:*)",
+      "Bash(ruff check:*)"
     ]
   }
 }

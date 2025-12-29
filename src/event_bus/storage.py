@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("event-bus")
 
@@ -40,7 +39,7 @@ class Session:
     repo: str
     registered_at: datetime
     last_heartbeat: datetime
-    pid: Optional[int] = None  # Client process ID for deduplication
+    pid: int | None = None  # Client process ID for deduplication
 
 
 @dataclass
@@ -70,7 +69,7 @@ MAX_EVENTS = 1000  # Keep last N events
 class SQLiteStorage:
     """SQLite-backed storage for sessions and events."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: str | None = None):
         """Initialize storage with optional custom DB path."""
         if db_path is None:
             db_path = os.environ.get("EVENT_BUS_DB", str(DEFAULT_DB_PATH))
@@ -157,9 +156,7 @@ class SQLiteStorage:
                 ),
             )
 
-    def find_session_by_key(
-        self, machine: str, cwd: str, pid: int
-    ) -> Optional[Session]:
+    def find_session_by_key(self, machine: str, cwd: str, pid: int) -> Session | None:
         """Find an existing session by machine+cwd+pid key."""
         with self._connect() as conn:
             row = conn.execute(
@@ -183,12 +180,10 @@ class SQLiteStorage:
             pid=row["pid"],
         )
 
-    def get_session(self, session_id: str) -> Optional[Session]:
+    def get_session(self, session_id: str) -> Session | None:
         """Get a session by ID."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             if row:
                 return self._row_to_session(row)
             return None
@@ -199,9 +194,7 @@ class SQLiteStorage:
         Returns True if the session was deleted, False if not found.
         """
         with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE id = ?", (session_id,)
-            )
+            cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return cursor.rowcount > 0
 
     def update_heartbeat(self, session_id: str, timestamp: datetime) -> bool:
@@ -228,9 +221,7 @@ class SQLiteStorage:
         cutoff_dt = datetime.fromtimestamp(cutoff)
 
         with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE last_heartbeat < ?", (cutoff_dt,)
-            )
+            cursor = conn.execute("DELETE FROM sessions WHERE last_heartbeat < ?", (cutoff_dt,))
             count = cursor.rowcount
             if count > 0:
                 logger.warning(f"Cleaned up {count} stale session(s)")
@@ -275,7 +266,7 @@ class SQLiteStorage:
         self,
         since_id: int = 0,
         limit: int = 50,
-        channels: Optional[list[str]] = None,
+        channels: list[str] | None = None,
     ) -> list[Event]:
         """Get events since a given event ID.
 
@@ -342,7 +333,5 @@ class SQLiteStorage:
     def get_last_event_id(self) -> int:
         """Get the ID of the most recent event, or 0 if none."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT MAX(id) as max_id FROM events"
-            ).fetchone()
+            row = conn.execute("SELECT MAX(id) as max_id FROM events").fetchone()
             return row["max_id"] or 0

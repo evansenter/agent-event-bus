@@ -9,16 +9,22 @@ MCP server providing an event bus for cross-session Claude Code communication. S
 ## Commands
 
 ```bash
-# Install in development mode
-pip install -e .
+# Install with dev dependencies
+make dev
+# or: pip install -e ".[dev]"
+
+# Run all quality gates (format, lint, test)
+make check
+
+# Run individual checks
+make fmt      # Check formatting
+make lint     # Run linter
+make test     # Run tests
 
 # Run the server
 python -m event_bus.server
 # or
 event-bus
-
-# Run tests
-pytest
 ```
 
 ## Architecture

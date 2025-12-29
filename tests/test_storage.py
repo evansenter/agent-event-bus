@@ -2,9 +2,7 @@
 
 from datetime import datetime, timedelta
 
-import pytest
-
-from event_bus.storage import Session, Event, SQLiteStorage, SESSION_TIMEOUT, MAX_EVENTS
+from event_bus.storage import SESSION_TIMEOUT, Session, SQLiteStorage
 
 
 class TestSessionOperations:
@@ -375,6 +373,7 @@ class TestEventCleanup:
         """Test that old events are cleaned up when MAX_EVENTS is exceeded."""
         # Create storage with a lower MAX_EVENTS for testing
         import event_bus.storage as storage_module
+
         original_max = storage_module.MAX_EVENTS
         storage_module.MAX_EVENTS = 10
 
@@ -441,7 +440,7 @@ class TestDatabaseInitialization:
         """Test that channel column is added to existing schema."""
         storage = SQLiteStorage(db_path=temp_db)
 
-        event = storage.add_event(
+        storage.add_event(
             event_type="test",
             payload="test",
             session_id="s1",
