@@ -12,15 +12,91 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import socket
 import subprocess
-import uuid
 from datetime import datetime
 
 from fastmcp import FastMCP
 
 from event_bus.storage import Session, SQLiteStorage
+
+# Word lists for human-readable session IDs (Docker-style)
+ADJECTIVES = [
+    "brave",
+    "calm",
+    "clever",
+    "eager",
+    "fancy",
+    "gentle",
+    "happy",
+    "jolly",
+    "keen",
+    "lively",
+    "merry",
+    "nice",
+    "polite",
+    "quick",
+    "sharp",
+    "swift",
+    "tender",
+    "upbeat",
+    "vivid",
+    "warm",
+    "witty",
+    "zesty",
+    "bold",
+    "bright",
+    "crisp",
+    "daring",
+    "epic",
+    "fresh",
+    "grand",
+    "humble",
+    "jovial",
+    "kind",
+]
+ANIMALS = [
+    "badger",
+    "cat",
+    "dog",
+    "eagle",
+    "falcon",
+    "gopher",
+    "heron",
+    "ibis",
+    "jaguar",
+    "koala",
+    "lemur",
+    "moose",
+    "newt",
+    "otter",
+    "panda",
+    "quail",
+    "rabbit",
+    "salmon",
+    "tiger",
+    "urchin",
+    "viper",
+    "walrus",
+    "yak",
+    "zebra",
+    "bear",
+    "crane",
+    "duck",
+    "fox",
+    "goose",
+    "hawk",
+    "iguana",
+    "jay",
+]
+
+
+def _generate_session_id() -> str:
+    """Generate a human-readable session ID like 'brave-tiger'."""
+    return f"{random.choice(ADJECTIVES)}-{random.choice(ANIMALS)}"
+
 
 # Configure logging - only enable DEBUG for our logger, not third-party libs
 logging.basicConfig(
@@ -316,8 +392,8 @@ def register_session(
             "resumed": True,
         }
 
-    # Create new session
-    session_id = str(uuid.uuid4())[:8]
+    # Create new session with human-readable ID
+    session_id = _generate_session_id()
     session = Session(
         id=session_id,
         name=name,
