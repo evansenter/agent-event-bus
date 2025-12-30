@@ -7,6 +7,20 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI="${HOME}/.local/bin/event-bus-cli"
 
+# Session IDs for cleanup
+SESSION_A_ID=""
+SESSION_B_ID=""
+
+# Cleanup function to unregister sessions on exit
+cleanup_sessions() {
+    echo -e "\n${YELLOW}Cleaning up sessions...${NC}"
+    [[ -n "$SESSION_A_ID" ]] && $CLI unregister --session-id "$SESSION_A_ID" 2>/dev/null && echo "  ✓ Unregistered $SESSION_A_ID" || true
+    [[ -n "$SESSION_B_ID" ]] && $CLI unregister --session-id "$SESSION_B_ID" 2>/dev/null && echo "  ✓ Unregistered $SESSION_B_ID" || true
+}
+
+# Register cleanup trap for early exit
+trap cleanup_sessions EXIT
+
 # Colors for output
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -123,13 +137,6 @@ $CLI publish \
 echo "  ✓ Published to repo channel (should NOT show notification)"
 echo
 
-echo -e "${GREEN}Step 10: Cleanup - Unregister sessions${NC}"
-$CLI unregister --session-id "$SESSION_A_ID" > /dev/null
-echo "  ✓ Unregistered Session A ($SESSION_A_ID)"
-$CLI unregister --session-id "$SESSION_B_ID" > /dev/null
-echo "  ✓ Unregistered Session B ($SESSION_B_ID)"
-echo
-
 echo -e "${BLUE}=== Test Complete ===${NC}\n"
 echo "Summary of what was tested:"
 echo "  ✓ Session registration with tips"
@@ -138,7 +145,7 @@ echo "  ✓ DM with empty payload"
 echo "  ✓ DM with special characters (emoji, newlines, tabs)"
 echo "  ✓ DM to non-existent session (should not crash)"
 echo "  ✓ Repo channel message (should NOT notify)"
-echo "  ✓ Session cleanup"
+echo "  ✓ Session cleanup (via EXIT trap)"
 echo
 echo -e "${YELLOW}Manual verification needed:${NC}"
 echo "  1. Did you see notifications for DMs to session:$SESSION_B_ID?"
