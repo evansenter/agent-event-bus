@@ -10,25 +10,18 @@
 //! GEMINI_API_KEY=your_key cargo run --release -- "your custom prompt"
 //! ```
 
-use base64::Engine;
 use image::imageops::FilterType;
 use image::ImageFormat;
-use rust_genai::{Client, InteractionContent, InteractionStatus};
+use rust_genai::{Client, InteractionResponseExt, InteractionStatus};
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
 
 const DEFAULT_PROMPT: &str = r#"Create a pixel art style icon (32x32 pixels scaled up) of a cute white and orange Birman cat with bright blue eyes, playfully batting at a colorful ball of yarn. The yarn ball should have rainbow colors (red, orange, yellow, green, blue, purple). The cat should have the characteristic Birman coloring: creamy white body with orange/seal points on the face, ears, and paws. The style should be clean pixel art suitable for a macOS notification icon. Transparent background. The cat should look happy and playful."#;
 
-fn save_image(
-    base64_data: &str,
-    output_dir: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Decode base64
-    let bytes = base64::engine::general_purpose::STANDARD.decode(base64_data)?;
-
-    // Load image
-    let img = image::load_from_memory(&bytes)?;
+fn save_image(bytes: &[u8], output_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    // Load image from bytes (already decoded)
+    let img = image::load_from_memory(bytes)?;
     println!("Original size: {}x{}", img.width(), img.height());
 
     // Crop to square (center crop)
@@ -86,8 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .interaction()
         .with_model(model)
         .with_text(&prompt)
-        .with_response_modalities(vec!["IMAGE".to_string()])
-        .with_store(true)
+        .with_image_output()
         .create()
         .await;
 
@@ -96,36 +88,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Status: {:?}", response.status);
 
             if response.status == InteractionStatus::Completed {
-                for output in response.outputs.iter() {
-                    if let InteractionContent::Image {
-                        data: Some(base64_data),
-                        ..
-                    } = output
-                    {
-                        // Get assets directory (relative to this crate)
-                        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-                        let output_dir = PathBuf::from(manifest_dir)
-                            .parent()
-                            .unwrap()
-                            .parent()
-                            .unwrap()
-                            .join("assets");
+                // Get assets directory (relative to this crate)
+                let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                let output_dir = PathBuf::from(manifest_dir)
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("assets");
 
-                        match save_image(base64_data, &output_dir) {
-                            Ok(()) => {
-                                println!("\nIcons saved to: {}", output_dir.display());
-                                println!(
-                                    "\nTo use:\n  EVENT_BUS_ICON={}/icon-512.png event-bus",
-                                    output_dir.display()
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to save icon: {}", e);
-                            }
-                        }
-                        break;
-                    }
-                }
+                // Use new DX helper - no manual base64 decoding needed!
+                let bytes = response
+                    .first_image_bytes()?
+                    .ok_or("No image in response")?;
+
+                save_image(&bytes, &output_dir)?;
+                println!("\nIcons saved to: {}", output_dir.display());
+                println!(
+                    "\nTo use:\n  EVENT_BUS_ICON={}/icon-512.png event-bus",
+                    output_dir.display()
+                );
             }
 
             if let Some(usage) = &response.usage {

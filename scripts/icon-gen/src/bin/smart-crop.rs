@@ -8,7 +8,6 @@
 //! GEMINI_API_KEY=your_key cargo run --bin smart-crop
 //! ```
 
-use base64::Engine;
 use image::imageops::FilterType;
 use image::ImageFormat;
 use rust_genai::{Client, InteractionStatus};
@@ -37,9 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== SMART CROP ===\n");
     println!("Loading: {}\n", icon_path.display());
 
-    // Load and encode current icon
+    // Load current icon
     let icon_bytes = std::fs::read(&icon_path)?;
-    let icon_base64 = base64::engine::general_purpose::STANDARD.encode(&icon_bytes);
 
     // Ask Gemini for bounding box
     println!("Analyzing image to find cat bounds...\n");
@@ -55,12 +53,12 @@ Example response: 150,80,620,550
 
 Do not include any other text, just the four numbers."#;
 
+    // Use new DX helper - no manual base64 encoding needed!
     let response = client
         .interaction()
         .with_model("gemini-3-flash-preview")
         .with_text(prompt)
-        .add_image_data(&icon_base64, "image/png")
-        .with_store(true)
+        .add_image_bytes(&icon_bytes, "image/png")
         .create()
         .await?;
 

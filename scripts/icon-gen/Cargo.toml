@@ -11,5 +11,4 @@ path = "src/main.rs"
 [dependencies]
 rust-genai = { path = "../../../rust-genai" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-base64 = "0.22"
 image = "0.25"
