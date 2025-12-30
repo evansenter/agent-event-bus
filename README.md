@@ -34,10 +34,13 @@ When running multiple Claude Code sessions (via `/parallel-work` or separate ter
 # Clone and install
 git clone https://github.com/evansenter/claude-event-bus.git
 cd claude-event-bus
-pip install -e .
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
-# Install as LaunchAgent (recommended - auto-starts on login)
+# Install as LaunchAgent (recommended - auto-starts on login, also installs CLI)
 ./scripts/install-launchagent.sh
+
+# Or install just the CLI (for use in hooks/scripts)
+./scripts/install-cli.sh
 
 # Or run in dev mode (foreground, auto-reload)
 ./scripts/dev.sh
@@ -97,7 +100,8 @@ The LaunchAgent and dev.sh set `EVENT_BUS_ICON` automatically.
 
 | Script | Purpose |
 |--------|---------|
-| `install-launchagent.sh` | Install as macOS LaunchAgent (auto-start) |
+| `install-launchagent.sh` | Install as macOS LaunchAgent (auto-start) + CLI |
+| `install-cli.sh` | Install CLI to ~/.local/bin for hooks/scripts |
 | `uninstall-launchagent.sh` | Remove LaunchAgent |
 | `dev.sh` | Run in foreground with auto-reload |
 
