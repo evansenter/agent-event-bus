@@ -21,6 +21,8 @@
         <string>/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONPATH</key>
         <string>__PROJECT_DIR__/src</string>
+        <key>EVENT_BUS_ICON</key>
+        <string>__PROJECT_DIR__/assets/icon.png</string>
     </dict>
 
     <key>RunAtLoad</key>

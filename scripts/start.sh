@@ -15,6 +15,7 @@ fi
 
 # Activate venv and start server
 source "$VENV_DIR/bin/activate"
+export EVENT_BUS_ICON="$PROJECT_DIR/assets/icon.png"
 nohup python -m event_bus.server > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
