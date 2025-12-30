@@ -146,7 +146,7 @@ each session is isolated. This MCP server lets sessions:
 ### 1. Register on startup
 ```
 register_session(name="auth-feature")
-→ {session_id: "abc123", repo: "my-project", machine: "macbook", ...}
+→ {session_id: "brave-tiger", repo: "my-project", machine: "macbook", ...}
 ```
 Save the `session_id` - you'll need it for other calls.
 
@@ -163,7 +163,7 @@ publish_event("api_ready", "Auth endpoints merged", channel="repo:my-project")
 
 ### 4. Poll for events from others
 ```
-get_events(since_id=0, session_id="abc123")
+get_events(since_id=0, session_id="brave-tiger")
 → [{event_type: "api_ready", payload: "Auth endpoints merged", ...}]
 ```
 
@@ -174,7 +174,7 @@ notify("Build Complete", "All tests passing", sound=True)
 
 ### 6. Unregister when done
 ```
-unregister_session(session_id="abc123")
+unregister_session(session_id="brave-tiger")
 ```
 
 ## Channels
@@ -226,18 +226,44 @@ notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
 
 ## Best Practices
 
-1. **Always pass session_id to get_events** - enables filtering and auto-heartbeat
-2. **Use repo channels** - avoids noise from unrelated projects
-3. **Keep payloads short** - they're for coordination, not data transfer
-4. **Notify sparingly** - only for things the user needs to know
-5. **Unregister on exit** - keeps the session list clean
+### Session Registration
+1. **Register on session start** - Makes you discoverable; enables DMs
+2. **Save your session_id** - You'll need it for get_events and publish_event
+3. **Include session_id in get_events** - Enables filtering and auto-heartbeat
+4. **Poll at natural breakpoints** - Check for messages at session start, before/after major tasks
+5. **Unregister on exit** - Keeps the session list clean
+
+### Communication
+6. **Use repo channels** - Avoids noise from unrelated projects (prefer `repo:` over `all`)
+7. **Keep payloads short** - They're for coordination, not data transfer
+8. **DMs auto-notify** - When you send to `session:{id}`, the human gets notified
+
+### Notifications
+9. **Notify sparingly** - Only for things the user needs to know
+10. **Understand the human-as-router pattern** - Notifications go to the user, not Claude
+
+## How Direct Messages Work (Human as Router)
+
+MCP is request/response only - the server can't push to Claude Code sessions.
+When you send a DM, here's what happens:
+
+1. Session A sends: `publish_event("help", "Need review", channel="session:brave-tiger")`
+2. Server sends macOS notification: "📨 Message for my-feature (From: auth-work)"
+   (Uses terminal-notifier if installed, falls back to osascript)
+3. Human sees notification, switches to that terminal
+4. Human tells Claude: "check the event bus"
+5. Claude polls: `get_events(since_id=last_seen_id, session_id=my_id)` and sees the message
+
+The notification alerts the **human** who routes the message to the correct session.
 
 ## Tips
 
 - `get_events` and `publish_event` auto-refresh your heartbeat
 - Sessions are auto-cleaned after 7 days of inactivity
+- Local sessions are cleaned immediately on PID death (remote sessions use 7-day timeout)
 - Events are retained for the last 1000 entries
 - The repo name is auto-detected from your working directory
+- SessionStart hooks can auto-register you on startup
 """
 
 
@@ -334,7 +360,14 @@ def _send_notification(title: str, message: str, sound: bool = False) -> bool:
             return False
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Notification failed: {e}")
+        # Include stderr/stdout for debugging
+        stderr = e.stderr.decode() if e.stderr else "no stderr"
+        stdout = e.stdout.decode() if e.stdout else "no stdout"
+        logger.error(
+            f"Notification command failed (exit code {e.returncode}): {e.cmd}\n"
+            f"Stdout: {stdout}\n"
+            f"Stderr: {stderr}"
+        )
         return False
 
 
@@ -390,6 +423,7 @@ def register_session(
             "repo": repo,
             "active_sessions": storage.session_count(),
             "resumed": True,
+            "tip": f"You are '{name}' ({existing.id}). Other sessions can DM you at channel 'session:{existing.id}'. Poll get_events() periodically to check for messages.",
         }
 
     # Create new session with human-readable ID
@@ -421,6 +455,7 @@ def register_session(
         "repo": repo,
         "active_sessions": storage.session_count(),
         "resumed": False,
+        "tip": f"You are '{name}' ({session_id}). Other sessions can DM you at channel 'session:{session_id}'. Poll get_events() periodically to check for messages.",
     }
     _dev_notify("register_session", f"{name} → {session_id}")
     return result
@@ -491,6 +526,64 @@ def publish_event(
     """
     # Auto-refresh heartbeat when session publishes
     _auto_heartbeat(session_id)
+
+    # Validate channel format for known channel types
+    if channel not in ["all"] and ":" in channel:
+        channel_type, _, channel_value = channel.partition(":")
+        if channel_type in ["session", "repo", "machine"]:
+            if not channel_value:
+                logger.warning(
+                    f"Invalid {channel_type} channel format: '{channel}'. "
+                    f"Expected '{channel_type}:<value>'"
+                )
+
+    # Auto-notify on direct messages (DMs)
+    if channel.startswith("session:"):
+        parts = channel.split(":", 1)
+        if len(parts) != 2 or not parts[1]:
+            logger.warning(f"Invalid session channel format: '{channel}'. Expected 'session:<id>'")
+        else:
+            target_id = parts[1]
+            target_session = storage.get_session(target_id)
+
+            if target_session:
+                # Get sender info for notification context
+                sender_name = "anonymous"
+                if session_id:
+                    sender_session = storage.get_session(session_id)
+                    if sender_session:
+                        sender_name = sender_session.name
+                    else:
+                        logger.warning(
+                            f"Sender session '{session_id}' not found when sending DM to {target_id}. "
+                            f"Using anonymous as sender name."
+                        )
+
+                # Send notification to alert the human
+                payload_preview = payload[:50] + "..." if len(payload) > 50 else payload
+                try:
+                    notification_sent = _send_notification(
+                        title=f"📨 Message for {target_session.name}",
+                        message=f"From: {sender_name}\n{payload_preview}",
+                    )
+
+                    if not notification_sent:
+                        logger.warning(
+                            f"Failed to send DM notification to session {target_id} "
+                            f"(name: {target_session.name}, sender: {sender_name}). "
+                            f"The event was published successfully, but the human may not be notified."
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Exception while sending DM notification to session {target_id}: {e}. "
+                        f"The event will still be published."
+                    )
+            else:
+                logger.warning(
+                    f"Cannot send DM notification: target session '{target_id}' not found. "
+                    f"The event was published to channel 'session:{target_id}', but no active session "
+                    f"exists with that ID. Session may have expired or ID may be incorrect."
+                )
 
     event = storage.add_event(
         event_type=event_type,

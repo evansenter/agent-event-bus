@@ -515,3 +515,237 @@ class TestAutoHeartbeat:
         """Test that auto_heartbeat ignores None."""
         # Should not raise
         server._auto_heartbeat(None)
+
+
+class TestRegisterSessionTip:
+    """Tests for tip field in register_session response."""
+
+    def test_new_session_includes_tip(self):
+        """Test that new session registration includes a tip."""
+        result = register_session(name="test-session", machine="test-machine", cwd="/test")
+
+        assert "tip" in result
+        assert result["session_id"] in result["tip"]
+        assert "test-session" in result["tip"]
+        assert "get_events()" in result["tip"]
+
+    def test_resumed_session_includes_tip(self):
+        """Test that resumed session includes a tip."""
+        register_session(name="original", machine="test", cwd="/test", pid=12345)
+        result = register_session(name="resumed", machine="test", cwd="/test", pid=12345)
+
+        assert "tip" in result
+        assert result["session_id"] in result["tip"]
+
+
+class TestAutoNotifyOnDM:
+    """Tests for auto-notify on direct messages."""
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_triggers_notification(self, mock_notify):
+        """Test that DM to a session triggers notification."""
+        # Register target session
+        target = register_session(name="target-session", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        # Register sender session
+        sender = register_session(name="sender-session", machine="test", cwd="/test2")
+        sender_id = sender["session_id"]
+
+        # Send DM
+        publish_event(
+            event_type="help_needed",
+            payload="Can you review my code?",
+            session_id=sender_id,
+            channel=f"session:{target_id}",
+        )
+
+        # Verify notification was sent
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        assert "target-session" in call_kwargs["title"]  # Title includes target name
+        assert "sender-session" in call_kwargs["message"]  # Message includes sender name
+        assert "Can you review my code?" in call_kwargs["message"]  # Message includes payload
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_to_nonexistent_session_no_notification(self, mock_notify):
+        """Test that DM to nonexistent session doesn't trigger notification."""
+        publish_event(
+            event_type="test",
+            payload="test message",
+            channel="session:nonexistent",
+        )
+
+        # No notification should be sent
+        mock_notify.assert_not_called()
+
+    @patch("event_bus.server._send_notification")
+    def test_broadcast_no_notification(self, mock_notify):
+        """Test that broadcast doesn't trigger notification."""
+        publish_event(
+            event_type="test",
+            payload="broadcast message",
+            channel="all",
+        )
+
+        # No notification should be sent
+        mock_notify.assert_not_called()
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_truncates_long_payload(self, mock_notify):
+        """Test that DM notification truncates long payloads."""
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        long_payload = "x" * 100
+        publish_event(
+            event_type="test",
+            payload=long_payload,
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        message = call_kwargs["message"]
+
+        # Verify truncation happened (full payload not in message)
+        assert long_payload not in message
+        # Verify ellipsis indicates truncation
+        assert "..." in message
+        # Verify some portion of payload is present
+        assert "xxx" in message  # At least some x's
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_notification_failure_still_publishes_event(self, mock_notify):
+        """Test that notification failures don't prevent event publishing."""
+        mock_notify.side_effect = Exception("Notification system error")
+
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        # Should not raise - event should still be published
+        result = publish_event(
+            event_type="test",
+            payload="important message",
+            channel=f"session:{target_id}",
+        )
+
+        assert "event_id" in result
+        # Verify event was stored despite notification failure
+        events = get_events(session_id=target_id)
+        event_types = [e["event_type"] for e in events]
+        assert "test" in event_types
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_from_anonymous_sender(self, mock_notify):
+        """Test that DM from anonymous sender shows 'anonymous' in notification."""
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        # Send DM without session_id
+        publish_event(
+            event_type="test",
+            payload="anonymous message",
+            session_id=None,  # Anonymous sender
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        assert "anonymous" in call_kwargs["message"]
+        assert "anonymous message" in call_kwargs["message"]
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_from_deleted_sender_session(self, mock_notify):
+        """Test that DM from deleted sender session shows anonymous."""
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        # Send DM with session_id that doesn't exist
+        publish_event(
+            event_type="test",
+            payload="message from ghost",
+            session_id="nonexistent-session",
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        assert "anonymous" in call_kwargs["message"]
+
+    @patch("event_bus.server._send_notification")
+    def test_repo_channel_no_notification(self, mock_notify):
+        """Test that repo channel doesn't trigger notification."""
+        register_session(name="target", machine="test", cwd="/test/myrepo")
+
+        publish_event(
+            event_type="test",
+            payload="repo message",
+            channel="repo:myrepo",
+        )
+
+        mock_notify.assert_not_called()
+
+    @patch("event_bus.server._send_notification")
+    def test_machine_channel_no_notification(self, mock_notify):
+        """Test that machine channel doesn't trigger notification."""
+        publish_event(
+            event_type="test",
+            payload="machine message",
+            channel="machine:test",
+        )
+
+        mock_notify.assert_not_called()
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_with_empty_payload(self, mock_notify):
+        """Test that DM with empty payload still notifies."""
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        publish_event(
+            event_type="test",
+            payload="",
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        # Should still have sender info even with empty payload
+        assert "From:" in call_kwargs["message"]
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_with_very_long_session_name(self, mock_notify):
+        """Test notification with very long session name in title."""
+        very_long_name = "a" * 200
+        target = register_session(name=very_long_name, machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        publish_event(
+            event_type="test",
+            payload="test message",
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        # Title should contain the long name
+        assert very_long_name in call_kwargs["title"]
+
+    @patch("event_bus.server._send_notification")
+    def test_dm_with_special_characters(self, mock_notify):
+        """Test notification handles emoji and special characters."""
+        target = register_session(name="target", machine="test", cwd="/test")
+        target_id = target["session_id"]
+
+        special_payload = "Hello 🎉\nMultiline\tWith\ttabs and emoji 😊"
+        publish_event(
+            event_type="test",
+            payload=special_payload,
+            channel=f"session:{target_id}",
+        )
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args.kwargs
+        # Should contain the special characters
+        assert "🎉" in call_kwargs["message"] or "Hello" in call_kwargs["message"]
