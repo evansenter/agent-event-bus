@@ -44,88 +44,124 @@ def usage_guide() -> str:
     """Return the event bus usage guide."""
     return """# Event Bus Usage Guide
 
+## What is this?
+
+The Event Bus enables communication between Claude Code sessions. When you're
+running multiple CC sessions (e.g., via `/parallel-work` or separate terminals),
+each session is isolated. This MCP server lets sessions:
+
+- See what other sessions are active
+- Coordinate work (signal when APIs are ready, request help)
+- Send system notifications to the user
+
+## Available Tools
+
+| Tool | Purpose |
+|------|---------|
+| `register_session(name, pid?)` | Register yourself, get a session_id |
+| `list_sessions()` | See all active sessions |
+| `publish_event(type, payload, channel?)` | Send event to a channel |
+| `get_events(since_id?, session_id?)` | Poll for new events |
+| `unregister_session(session_id)` | Clean up when exiting |
+| `notify(title, message, sound?)` | Send macOS notification to user |
+
 ## Quick Start
 
-1. **Register** your session on startup:
-   ```
-   register_session(name="my-feature", pid=<your_pid>)
-   → Returns: {session_id, repo, machine, ...}
-   ```
+### 1. Register on startup
+```
+register_session(name="auth-feature")
+→ {session_id: "abc123", repo: "my-project", machine: "macbook", ...}
+```
+Save the `session_id` - you'll need it for other calls.
 
-2. **Poll** for events (pass session_id for filtering):
-   ```
-   get_events(since_id=0, session_id="<your_session_id>")
-   → Returns events for your subscribed channels only
-   ```
+### 2. Check who else is working
+```
+list_sessions()
+→ [{name: "auth-feature", repo: "my-project"}, {name: "api-refactor", ...}]
+```
 
-3. **Publish** updates to relevant channels:
-   ```
-   publish_event("task_done", "Finished API", session_id="...", channel="repo:my-project")
-   ```
+### 3. Publish events to coordinate
+```
+publish_event("api_ready", "Auth endpoints merged", channel="repo:my-project")
+```
 
-4. **Unregister** when exiting:
-   ```
-   unregister_session(session_id="...")
-   ```
+### 4. Poll for events from others
+```
+get_events(since_id=0, session_id="abc123")
+→ [{event_type: "api_ready", payload: "Auth endpoints merged", ...}]
+```
+
+### 5. Notify the user
+```
+notify("Build Complete", "All tests passing", sound=True)
+```
+
+### 6. Unregister when done
+```
+unregister_session(session_id="abc123")
+```
 
 ## Channels
 
-Sessions are auto-subscribed to channels based on their attributes:
+Events are published to channels. Sessions auto-subscribe based on their attributes:
 
-| Channel | Who Receives | Use For |
-|---------|--------------|---------|
-| `all` | Everyone | Broadcasts, announcements |
+| Channel | Who Receives | When to Use |
+|---------|--------------|-------------|
+| `all` | Everyone | Rare - major announcements only |
+| `repo:{name}` | Same repository | **Most common** - coordinate parallel work |
 | `session:{id}` | One session | Direct messages, help requests |
-| `repo:{name}` | Same repo | Coordinating parallel work |
 | `machine:{name}` | Same machine | Local coordination |
 
-### Examples
+**Default is `all`**, but prefer `repo:` for most coordination to avoid noise.
 
+## Common Patterns
+
+### Signal when your work is ready for others
 ```
-# Broadcast to all sessions
-publish_event("announcement", "Taking a break", channel="all")
+# You finished the API, another session is waiting to integrate
+publish_event("api_ready", "Auth API merged to main", channel="repo:my-project")
+```
 
-# Direct message to specific session
-publish_event("help", "Can you review auth.ts?", channel="session:abc123")
+### Wait for another session's work
+```
+# Poll periodically until you see what you're waiting for
+events = get_events(since_id=last_seen_id, session_id=my_session_id)
+for e in events:
+    if e["event_type"] == "api_ready":
+        # Now safe to integrate
+```
 
-# Coordinate within same repo (most common)
-publish_event("api_ready", "API merged, you can integrate", channel="repo:my-project")
+### Ask another session for help
+```
+# Find the session working on auth
+sessions = list_sessions()
+auth_session = next(s for s in sessions if "auth" in s["name"])
+
+# Send them a direct message
+publish_event("help_needed", "How do I call the new auth endpoint?",
+              channel=f"session:{auth_session['session_id']}")
+```
+
+### Notify user when task completes
+```
+# Useful for long-running tasks
+notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
 ```
 
 ## Best Practices
 
-1. **Always pass session_id** to `get_events` - enables channel filtering and auto-heartbeat
-2. **Use repo channels** for most coordination - avoids noise from unrelated projects
-3. **Use DMs sparingly** - only when you need a specific session's attention
-4. **Poll periodically** - `get_events` also refreshes your heartbeat
+1. **Always pass session_id to get_events** - enables filtering and auto-heartbeat
+2. **Use repo channels** - avoids noise from unrelated projects
+3. **Keep payloads short** - they're for coordination, not data transfer
+4. **Notify sparingly** - only for things the user needs to know
+5. **Unregister on exit** - keeps the session list clean
 
-## Common Patterns
+## Tips
 
-### Wait for another session
-```
-# Poll until you see the event you're waiting for
-events = get_events(since_id=last_id, session_id=my_id)
-for e in events:
-    if e.event_type == "api_ready":
-        # Proceed with integration
-```
-
-### Request help from specific session
-```
-# Find the session you need
-sessions = list_sessions()
-target = [s for s in sessions if "auth" in s.name][0]
-
-# Send direct message
-publish_event("help_needed", "Stuck on auth flow",
-              channel=f"session:{target.session_id}")
-```
-
-### Announce completion
-```
-publish_event("task_completed", "Feature X is done and merged",
-              session_id=my_id, channel="repo:my-project")
-```
+- `get_events` and `publish_event` auto-refresh your heartbeat
+- Sessions are auto-cleaned after 7 days of inactivity
+- Events are retained for the last 1000 entries
+- The repo name is auto-detected from your working directory
 """
 
 
