@@ -41,6 +41,27 @@ class Session:
     last_heartbeat: datetime
     pid: int | None = None  # Client process ID for deduplication
 
+    def get_project_name(self) -> str:
+        """Get the project name, preferring explicit repo over cwd basename.
+
+        Returns:
+            Project name derived from repo field, or the last directory component of cwd
+        """
+        if self.repo:
+            return self._sanitize_project_name(self.repo)
+
+        if self.cwd:
+            # Strip trailing slashes to handle paths like "/path/to/project/"
+            basename = os.path.basename(self.cwd.rstrip("/"))
+            if basename:
+                return self._sanitize_project_name(basename)
+
+        return "unknown"
+
+    def _sanitize_project_name(self, name: str) -> str:
+        """Sanitize project name by replacing special characters."""
+        return name.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+
 
 @dataclass
 class Event:

@@ -58,6 +58,88 @@ class TestExtractRepoFromCwd:
         assert server._extract_repo_from_cwd("") == "unknown"
 
 
+class TestSessionGetProjectName:
+    """Tests for Session.get_project_name helper."""
+
+    def test_get_project_name_with_repo(self):
+        """Test that repo field takes precedence."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/myproject",
+            repo="my-repo",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "my-repo"
+
+    def test_get_project_name_fallback_to_cwd(self):
+        """Test fallback to cwd basename when repo is empty."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/fallback-proj",
+            repo="",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "fallback-proj"
+
+    def test_get_project_name_none_cwd(self):
+        """Test fallback to 'unknown' when cwd is None."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd=None,
+            repo="",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "unknown"
+
+    def test_get_project_name_root_directory(self):
+        """Test that root directory returns 'unknown' not empty string."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/",
+            repo="",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "unknown"
+
+    def test_get_project_name_trailing_slash(self):
+        """Test that trailing slashes are handled correctly."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/myproject/",
+            repo="",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "myproject"
+
+    def test_get_project_name_sanitizes_special_chars(self):
+        """Test that special characters are sanitized."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/project",
+            repo="my\nproject\twith\rchars",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "my project with chars"
+
+
 class TestIsPidAlive:
     """Tests for _is_pid_alive helper."""
 
@@ -560,10 +642,11 @@ class TestAutoNotifyOnDM:
             channel=f"session:{target_id}",
         )
 
-        # Verify notification was sent
+        # Verify notification was sent with correct format
         mock_notify.assert_called_once()
         call_kwargs = mock_notify.call_args.kwargs
-        assert "target-session" in call_kwargs["title"]  # Title includes target name
+        assert "📨 target-session" in call_kwargs["title"]  # Title includes emoji and target name
+        assert "test" in call_kwargs["title"]  # Title includes project name from cwd="/test"
         assert "sender-session" in call_kwargs["message"]  # Message includes sender name
         assert "Can you review my code?" in call_kwargs["message"]  # Message includes payload
 

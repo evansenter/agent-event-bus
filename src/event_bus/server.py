@@ -562,8 +562,9 @@ def publish_event(
                 # Send notification to alert the human
                 payload_preview = payload[:50] + "..." if len(payload) > 50 else payload
                 try:
+                    project_name = target_session.get_project_name()
                     notification_sent = _send_notification(
-                        title=f"📨 Message for {target_session.name}",
+                        title=f"📨 {target_session.name} • {project_name}",
                         message=f"From: {sender_name}\n{payload_preview}",
                     )
 
