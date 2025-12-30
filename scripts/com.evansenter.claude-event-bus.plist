@@ -18,7 +18,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>PYTHONPATH</key>
         <string>__PROJECT_DIR__/src</string>
         <key>EVENT_BUS_ICON</key>
