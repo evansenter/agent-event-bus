@@ -21,10 +21,14 @@ make fmt      # Check formatting
 make lint     # Run linter
 make test     # Run tests
 
-# Run the server
-python -m event_bus.server
-# or
-event-bus
+# Install as LaunchAgent (auto-starts on login, auto-restarts on crash)
+./scripts/install-launchagent.sh
+
+# Uninstall LaunchAgent
+./scripts/uninstall-launchagent.sh
+
+# Run in dev mode (foreground, auto-reload)
+./scripts/dev.sh
 ```
 
 ## Architecture
@@ -132,11 +136,16 @@ On macOS, notifications use terminal-notifier (if installed) with osascript fall
 
 Install terminal-notifier: `brew install terminal-notifier`
 
-### Custom Icon
+### Icon
 
-A pixel art Birman cat icon is included in `assets/`:
+A pixel art Birman cat icon is included in `assets/` and set by default in the LaunchAgent and dev.sh.
+
+To regenerate or customize the icon:
 ```bash
-EVENT_BUS_ICON=$(pwd)/assets/icon-512.png event-bus
+cd scripts/icon-gen
+GEMINI_API_KEY=key cargo run --release -- "your custom prompt"
+cargo run --bin smart-crop   # AI-powered tight crop
+cargo run --bin remove-bg    # Remove background
 ```
 
 ## Future Work
