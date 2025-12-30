@@ -34,4 +34,5 @@ echo "Add to Claude Code: claude mcp add --transport http --scope user event-bus
 echo ""
 
 # DEV_MODE enables request/response body logging
+export EVENT_BUS_ICON="$PROJECT_DIR/assets/icon.png"
 DEV_MODE=1 uvicorn event_bus.server:create_app --host 127.0.0.1 --port 8080 --reload --factory
