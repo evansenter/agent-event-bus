@@ -1,0 +1,15 @@
+[package]
+name = "icon-gen"
+version = "0.1.0"
+edition = "2021"
+description = "Generate event-bus notification icon using Gemini"
+
+[[bin]]
+name = "generate-icon"
+path = "src/main.rs"
+
+[dependencies]
+rust-genai = { path = "../../../rust-genai" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+base64 = "0.22"
+image = "0.25"
