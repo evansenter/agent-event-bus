@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
 
@@ -11,6 +11,9 @@ MCP server providing an event bus for cross-session Claude Code communication. S
 ```bash
 # Full installation (venv + deps + LaunchAgent + CLI + MCP)
 make install
+
+# Uninstall everything
+make uninstall
 
 # Install with dev dependencies (for development)
 make dev
@@ -23,14 +26,14 @@ make fmt      # Check formatting
 make lint     # Run linter
 make test     # Run tests
 
-# Uninstall LaunchAgent
-./scripts/uninstall-launchagent.sh
+# Run a single test
+pytest tests/test_server.py::TestRegisterSession -v
 
 # Run in dev mode (foreground, auto-reload)
 ./scripts/dev.sh
 ```
 
-**Note**: `make install` is idempotent - safe to run multiple times. It will skip steps that are already complete.
+**Note**: `make install` and `make uninstall` are idempotent - safe to run multiple times.
 
 ## Architecture
 
@@ -91,6 +94,7 @@ publish_event("api_ready", "API merged", channel="repo:my-project")
 - **Event retention**: Keeps last 1000 events, auto-cleans on write
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
+- **Human-readable IDs**: Session IDs use Docker-style names (e.g., `brave-tiger`) instead of UUIDs
 
 ## CLI Wrapper
 
@@ -149,7 +153,3 @@ cargo run --bin smart-crop   # AI-powered tight crop
 cargo run --bin remove-bg    # Remove background
 ```
 
-## Future Work
-
-- Tailscale support for multi-machine
-- SSE streaming for lower latency
