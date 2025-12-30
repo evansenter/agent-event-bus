@@ -47,7 +47,20 @@ class Session:
         Returns:
             Project name derived from repo field, or the last directory component of cwd
         """
-        return self.repo or os.path.basename(self.cwd or "unknown") or "unknown"
+        if self.repo:
+            return self._sanitize_project_name(self.repo)
+
+        if self.cwd:
+            # Strip trailing slashes to handle paths like "/path/to/project/"
+            basename = os.path.basename(self.cwd.rstrip("/"))
+            if basename:
+                return self._sanitize_project_name(basename)
+
+        return "unknown"
+
+    def _sanitize_project_name(self, name: str) -> str:
+        """Sanitize project name by replacing special characters."""
+        return name.replace("\n", " ").replace("\t", " ").replace("\r", " ")
 
 
 @dataclass

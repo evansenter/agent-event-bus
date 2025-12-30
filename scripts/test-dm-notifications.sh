@@ -23,6 +23,13 @@ if [[ ! -x "$CLI" ]]; then
     exit 1
 fi
 
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    echo -e "${RED}Error: jq is required but not installed${NC}"
+    echo "Install with: brew install jq"
+    exit 1
+fi
+
 # Check if event bus server is running
 if ! curl -s http://127.0.0.1:8080/health > /dev/null 2>&1; then
     echo -e "${YELLOW}Warning: Event bus server doesn't appear to be running${NC}"

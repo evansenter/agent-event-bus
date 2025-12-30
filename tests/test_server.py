@@ -113,6 +113,32 @@ class TestSessionGetProjectName:
         )
         assert session.get_project_name() == "unknown"
 
+    def test_get_project_name_trailing_slash(self):
+        """Test that trailing slashes are handled correctly."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/myproject/",
+            repo="",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "myproject"
+
+    def test_get_project_name_sanitizes_special_chars(self):
+        """Test that special characters are sanitized."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/project",
+            repo="my\nproject\twith\rchars",
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        assert session.get_project_name() == "my project with chars"
+
 
 class TestIsPidAlive:
     """Tests for _is_pid_alive helper."""
