@@ -46,6 +46,11 @@ if launchctl list | grep -q "$LABEL"; then
     echo "  Logs: ~/.claude/event-bus.log"
     echo "  Errors: ~/.claude/event-bus.err"
     echo ""
+
+    # Also install CLI for use in hooks/scripts
+    echo "Installing CLI..."
+    "$SCRIPT_DIR/install-cli.sh"
+    echo ""
     echo "To uninstall: $SCRIPT_DIR/uninstall-launchagent.sh"
     osascript -e 'display notification "LaunchAgent installed and running" with title "Evan Bus"' 2>/dev/null
 else
