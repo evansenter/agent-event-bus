@@ -1,35 +1,37 @@
 #!/bin/bash
-# Install event-bus-cli to ~/.local/bin for use in shell scripts and hooks
+# Install event-bus-cli to ~/.local/bin as a symlink
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
+VENV_CLI="$PROJECT_DIR/.venv/bin/event-bus-cli"
 INSTALL_DIR="$HOME/.local/bin"
 CLI_PATH="$INSTALL_DIR/event-bus-cli"
 
-# Check venv exists
-if [[ ! -f "$VENV_PYTHON" ]]; then
-    echo "Error: Virtual environment not found at $PROJECT_DIR/.venv"
-    echo "Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e ."
+# Check venv CLI exists
+if [[ ! -f "$VENV_CLI" ]]; then
+    echo "Error: CLI not found at $VENV_CLI"
+    echo "Run: make dev (or pip install -e .)"
     exit 1
 fi
 
 # Create install directory
 mkdir -p "$INSTALL_DIR"
 
-# Create wrapper script
-cat > "$CLI_PATH" << EOF
-#!/bin/bash
-# event-bus-cli wrapper - installed by claude-event-bus
-# Source: $PROJECT_DIR
-exec "$VENV_PYTHON" -m event_bus.cli "\$@"
-EOF
+# Remove existing file/symlink if present
+if [[ -e "$CLI_PATH" || -L "$CLI_PATH" ]]; then
+    # Skip if already correctly symlinked
+    if [[ -L "$CLI_PATH" && "$(readlink "$CLI_PATH")" == "$VENV_CLI" ]]; then
+        echo "event-bus-cli already symlinked correctly"
+        exit 0
+    fi
+    rm -f "$CLI_PATH"
+fi
 
-chmod +x "$CLI_PATH"
-
-echo "Installed event-bus-cli to $CLI_PATH"
+# Create symlink
+ln -s "$VENV_CLI" "$CLI_PATH"
+echo "Installed event-bus-cli to $CLI_PATH (symlink)"
 
 # Check if ~/.local/bin is in PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

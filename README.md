@@ -31,26 +31,34 @@ When running multiple Claude Code sessions (via `/parallel-work` or separate ter
 ## Installation
 
 ```bash
-# Clone and install
+# Clone and install everything
 git clone https://github.com/evansenter/claude-event-bus.git
 cd claude-event-bus
-python3 -m venv .venv && source .venv/bin/activate && pip install -e .
-
-# Install as LaunchAgent (recommended - auto-starts on login, also installs CLI)
-./scripts/install-launchagent.sh
-
-# Or install just the CLI (for use in hooks/scripts)
-./scripts/install-cli.sh
-
-# Or run in dev mode (foreground, auto-reload)
-./scripts/dev.sh
+make install
 ```
 
-## Add to Claude Code
+This installs:
+- Virtual environment with dependencies
+- LaunchAgent (auto-starts on login)
+- CLI to `~/.local/bin/event-bus-cli`
+- MCP server to Claude Code
+
+Make sure `~/.local/bin` is in your PATH:
+```bash
+export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc
+```
+
+## Development
 
 ```bash
-# Add globally (available in all projects)
-claude mcp add --transport http --scope user event-bus http://localhost:8080/mcp
+# Install with dev dependencies
+make dev
+
+# Run in dev mode (foreground, auto-reload)
+./scripts/dev.sh
+
+# Run quality checks
+make check
 ```
 
 ## MCP Tools

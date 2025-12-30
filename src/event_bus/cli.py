@@ -187,7 +187,7 @@ def main():
         help="Event bus URL (default: http://127.0.0.1:8080/mcp)",
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     # register
     p_register = subparsers.add_parser("register", help="Register a session")
@@ -226,6 +226,12 @@ def main():
     p_notify.set_defaults(func=cmd_notify)
 
     args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        print("\nUse -h or --help with any command for more details.")
+        sys.exit(1)
+
     args.func(args)
 
 

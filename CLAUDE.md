@@ -9,9 +9,11 @@ MCP server providing an event bus for cross-session Claude Code communication. S
 ## Commands
 
 ```bash
-# Install with dev dependencies
+# Full installation (venv + deps + LaunchAgent + CLI + MCP)
+make install
+
+# Install with dev dependencies (for development)
 make dev
-# or: pip install -e ".[dev]"
 
 # Run all quality gates (format, lint, test)
 make check
@@ -21,15 +23,14 @@ make fmt      # Check formatting
 make lint     # Run linter
 make test     # Run tests
 
-# Install as LaunchAgent (auto-starts on login, auto-restarts on crash)
-./scripts/install-launchagent.sh
-
 # Uninstall LaunchAgent
 ./scripts/uninstall-launchagent.sh
 
 # Run in dev mode (foreground, auto-reload)
 ./scripts/dev.sh
 ```
+
+**Note**: `make install` is idempotent - safe to run multiple times. It will skip steps that are already complete.
 
 ## Architecture
 
