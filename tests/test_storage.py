@@ -366,42 +366,6 @@ class TestEventChannelFiltering:
         assert len(events) == 3
 
 
-class TestEventCleanup:
-    """Tests for event retention/cleanup."""
-
-    def test_event_cleanup_on_add(self, temp_db):
-        """Test that old events are cleaned up when MAX_EVENTS is exceeded."""
-        # Create storage with a lower MAX_EVENTS for testing
-        import event_bus.storage as storage_module
-
-        original_max = storage_module.MAX_EVENTS
-        storage_module.MAX_EVENTS = 10
-
-        try:
-            storage = SQLiteStorage(db_path=temp_db)
-
-            # Add more events than MAX_EVENTS
-            for i in range(15):
-                storage.add_event(
-                    event_type=f"event_{i}",
-                    payload=f"payload {i}",
-                    session_id="session-123",
-                )
-
-            # Should only have MAX_EVENTS (10) events
-            events = storage.get_events(limit=100)
-            assert len(events) == 10
-
-            # Should have the most recent events
-            types = [e.event_type for e in events]
-            assert "event_5" in types  # First retained event
-            assert "event_14" in types  # Last event
-            assert "event_0" not in types  # Should be cleaned up
-
-        finally:
-            storage_module.MAX_EVENTS = original_max
-
-
 class TestDatabaseInitialization:
     """Tests for database initialization."""
 

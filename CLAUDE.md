@@ -100,7 +100,6 @@ publish_event("api_ready", "API merged", channel="repo:my-project")
 - **Session cleanup**: 7-day heartbeat timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
 - **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
-- **Event retention**: Keeps last 1000 events, auto-cleans on write
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
 - **Human-readable IDs**: Session IDs use Docker-style names (e.g., `brave-tiger`) instead of UUIDs

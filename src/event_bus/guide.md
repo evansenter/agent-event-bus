@@ -183,6 +183,5 @@ The notification alerts the **human** who routes the message to the correct sess
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 7 days of inactivity
 - Local sessions are cleaned immediately on PID death (remote sessions use 7-day timeout)
-- Events are retained for the last 1000 entries
 - The repo name is auto-detected from your working directory
 - SessionStart hooks can auto-register you on startup

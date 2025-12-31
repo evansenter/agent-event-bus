@@ -82,9 +82,6 @@ DEFAULT_DB_PATH = Path.home() / ".claude" / "event-bus.db"
 # cleaned up faster via PID liveness check in list_sessions()
 SESSION_TIMEOUT = 604800  # 7 days
 
-# Event retention settings
-MAX_EVENTS = 1000  # Keep last N events
-
 
 class SQLiteStorage:
     """SQLite-backed storage for sessions and events."""
@@ -151,6 +148,10 @@ class SQLiteStorage:
             # Index for efficient event polling
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)
+            """)
+            # Index for efficient session ordering by activity
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat)
             """)
 
     # Session operations
@@ -270,9 +271,6 @@ class SQLiteStorage:
             )
             event_id = cursor.lastrowid
 
-            # Cleanup old events
-            self._cleanup_events(conn)
-
             return Event(
                 id=event_id,
                 event_type=event_type,
@@ -342,25 +340,6 @@ class SQLiteStorage:
                 )
                 for row in rows
             ]
-
-    def _cleanup_events(self, conn: sqlite3.Connection) -> int:
-        """Remove old events, keeping only the last MAX_EVENTS.
-
-        Returns the number of events removed.
-        """
-        cursor = conn.execute(
-            """
-            DELETE FROM events
-            WHERE id NOT IN (
-                SELECT id FROM events ORDER BY id DESC LIMIT ?
-            )
-            """,
-            (MAX_EVENTS,),
-        )
-        count = cursor.rowcount
-        if count > 0:
-            logger.warning(f"Cleaned up {count} old event(s)")
-        return count
 
     def get_last_event_id(self) -> int:
         """Get the ID of the most recent event, or 0 if none."""
