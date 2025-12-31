@@ -349,6 +349,44 @@ class TestListSessions:
         # Session should be deleted
         assert server.storage.get_session("dead-session") is None
 
+    def test_list_sessions_ordered_by_most_recent_activity(self):
+        """Test that sessions are returned most recently active first."""
+        import time
+
+        # Register sessions with delays to ensure different heartbeat times
+        register_session(name="oldest", machine="remote-1", cwd="/path1")
+        time.sleep(0.01)
+        register_session(name="middle", machine="remote-2", cwd="/path2")
+        time.sleep(0.01)
+        register_session(name="newest", machine="remote-3", cwd="/path3")
+
+        result = list_sessions()
+
+        # Should be ordered: newest, middle, oldest (most recent first)
+        names = [s["name"] for s in result]
+        assert names == ["newest", "middle", "oldest"]
+
+    def test_list_sessions_ordering_reflects_heartbeat_updates(self):
+        """Test that ordering updates when heartbeat is refreshed."""
+        import time
+
+        # Register sessions
+        reg1 = register_session(name="first", machine="remote-1", cwd="/path1")
+        time.sleep(0.01)
+        register_session(name="second", machine="remote-2", cwd="/path2")
+
+        # Initially, second should be first (most recent)
+        result = list_sessions()
+        assert result[0]["name"] == "second"
+
+        # Refresh first session's heartbeat via get_events
+        time.sleep(0.01)
+        get_events(session_id=reg1["session_id"])
+
+        # Now first should be first (most recent heartbeat)
+        result = list_sessions()
+        assert result[0]["name"] == "first"
+
 
 class TestPublishEvent:
     """Tests for publish_event tool."""
@@ -463,6 +501,90 @@ class TestGetEvents:
         assert "my_repo" in types
         assert "for_other" not in types
         assert "other_repo" not in types
+
+
+class TestGetEventsOrdering:
+    """Tests for get_events ordering behavior."""
+
+    def test_since_id_zero_returns_newest_first(self):
+        """Test that since_id=0 returns events newest first (DESC)."""
+        # Clear storage and publish events in order
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        publish_event("first", "1")
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Get events with since_id=0 (default)
+        events = get_events(since_id=0)
+
+        # Should be newest first: third, second, first
+        types = [e["event_type"] for e in events]
+        assert types.index("third") < types.index("second")
+        assert types.index("second") < types.index("first")
+
+    def test_since_id_positive_returns_chronological(self):
+        """Test that since_id>0 returns events in chronological order (ASC)."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Publish first event to get a starting point
+        result1 = publish_event("first", "1")
+        start_id = result1["event_id"]
+
+        # Publish more events
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Get events since start_id
+        events = get_events(since_id=start_id)
+
+        # Should be chronological: second, third (first is excluded by since_id)
+        types = [e["event_type"] for e in events]
+        assert "first" not in types  # Excluded by since_id
+        assert types.index("second") < types.index("third")
+
+    def test_polling_pattern_works(self):
+        """Test the recommended polling pattern works correctly."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Publish initial events
+        publish_event("before_registration", "0")
+
+        # Register session (simulates session start)
+        reg = register_session(name="test", machine="test", cwd="/test")
+        last_seen = reg["last_event_id"]
+
+        # Publish new events after registration
+        publish_event("after_registration_1", "1")
+        publish_event("after_registration_2", "2")
+
+        # Poll for new events using last_event_id from registration
+        events = get_events(since_id=last_seen)
+
+        # Should only get events AFTER registration, in chronological order
+        types = [e["event_type"] for e in events]
+        assert "before_registration" not in types
+        assert "after_registration_1" in types
+        assert "after_registration_2" in types
+        # Chronological order
+        assert types.index("after_registration_1") < types.index("after_registration_2")
+
+    def test_since_id_future_returns_empty(self):
+        """Test that since_id beyond current events returns empty list."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Publish some events
+        result = publish_event("test", "payload")
+        last_id = result["event_id"]
+
+        # Query with a future ID that doesn't exist yet
+        events = get_events(since_id=last_id + 1000)
+
+        # Should return empty list
+        assert events == []
 
 
 class TestUnregisterSession:
@@ -679,7 +801,7 @@ class TestRegisterSessionTip:
         assert "tip" in result
         assert result["session_id"] in result["tip"]
         assert "test-session" in result["tip"]
-        assert "get_events()" in result["tip"]
+        assert "get_events(" in result["tip"]
 
     def test_resumed_session_includes_tip(self):
         """Test that resumed session includes a tip."""
@@ -688,6 +810,47 @@ class TestRegisterSessionTip:
 
         assert "tip" in result
         assert result["session_id"] in result["tip"]
+
+
+class TestRegisterSessionLastEventId:
+    """Tests for last_event_id in register_session response."""
+
+    def test_new_session_includes_last_event_id(self):
+        """Test that new session registration includes last_event_id."""
+        result = register_session(name="test-session", machine="test-machine", cwd="/test")
+
+        assert "last_event_id" in result
+        assert isinstance(result["last_event_id"], int)
+
+    def test_resumed_session_includes_last_event_id(self):
+        """Test that resumed session includes last_event_id."""
+        register_session(name="original", machine="test", cwd="/test", pid=12345)
+        result = register_session(name="resumed", machine="test", cwd="/test", pid=12345)
+
+        assert "last_event_id" in result
+        assert isinstance(result["last_event_id"], int)
+
+    def test_last_event_id_reflects_current_state(self):
+        """Test that last_event_id reflects current event state."""
+        # Publish some events before registration
+        publish_event("pre_event1", "payload1")
+        result1 = publish_event("pre_event2", "payload2")
+        before_registration_id = result1["event_id"]
+
+        # Register session - note that registration itself publishes a session_registered event
+        reg_result = register_session(name="test", machine="test", cwd="/test")
+
+        # last_event_id should be >= the pre-registration event (registration adds one more event)
+        assert reg_result["last_event_id"] > before_registration_id
+        # And specifically, it should be exactly 1 more (the session_registered event)
+        assert reg_result["last_event_id"] == before_registration_id + 1
+
+    def test_last_event_id_in_tip(self):
+        """Test that tip mentions last_event_id for polling."""
+        result = register_session(name="test", machine="test", cwd="/test")
+
+        assert "last_event_id" in result["tip"]
+        assert "since_id" in result["tip"]
 
 
 class TestAutoNotifyOnDM:

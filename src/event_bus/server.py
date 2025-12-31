@@ -143,7 +143,7 @@ def register_session(
         pid: Process ID of the Claude Code client (for session deduplication)
 
     Returns:
-        Session info including assigned session_id
+        Session info including assigned session_id and last_event_id for polling
 
     Tip: Read the resource at event-bus://guide for usage patterns and best practices.
     """
@@ -172,8 +172,9 @@ def register_session(
             "cwd": cwd,
             "repo": repo,
             "active_sessions": storage.session_count(),
+            "last_event_id": storage.get_last_event_id(),
             "resumed": True,
-            "tip": f"You are '{name}' ({existing.id}). Other sessions can DM you at channel 'session:{existing.id}'. Poll get_events() periodically to check for messages.",
+            "tip": f"You are '{name}' ({existing.id}). Use last_event_id to start polling: get_events(since_id=last_event_id).",
         }
 
     # Create new session with human-readable ID
@@ -190,8 +191,9 @@ def register_session(
     )
     storage.add_session(session)
 
-    # Auto-publish registration event
-    storage.add_event(
+    # Auto-publish registration event and capture its ID directly
+    # (avoids race condition if another event is published between add and get)
+    registration_event = storage.add_event(
         event_type="session_registered",
         payload=f"{name} started on {machine} in {cwd}",
         session_id=session_id,
@@ -204,8 +206,9 @@ def register_session(
         "cwd": cwd,
         "repo": repo,
         "active_sessions": storage.session_count(),
+        "last_event_id": registration_event.id,
         "resumed": False,
-        "tip": f"You are '{name}' ({session_id}). Other sessions can DM you at channel 'session:{session_id}'. Poll get_events() periodically to check for messages.",
+        "tip": f"You are '{name}' ({session_id}). Use last_event_id to start polling: get_events(since_id=last_event_id).",
     }
     dev_notify("register_session", f"{name} → {session_id}")
     return result
@@ -214,6 +217,9 @@ def register_session(
 @mcp.tool()
 def list_sessions() -> list[dict]:
     """List all active sessions on the event bus.
+
+    Sessions are ordered by most recently active first (last_heartbeat DESC),
+    so the most likely-to-be-alive sessions appear first.
 
     Returns:
         List of active sessions with their info
@@ -331,7 +337,16 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
 
 @mcp.tool()
 def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None) -> list[dict]:
-    """Get events since a given event ID.
+    """Get events from the event bus.
+
+    Ordering behavior (important!):
+    - since_id=0: Returns newest events first (DESC) - "What's happening?"
+    - since_id>0: Returns events after that ID in order (ASC) - for polling
+
+    Typical usage:
+    1. On session start, get last_event_id from register_session()
+    2. Poll with get_events(since_id=last_event_id) to get new events in order
+    3. Use get_events() (no since_id) to see recent activity
 
     Events are filtered to channels the session is subscribed to:
     - "all": Broadcasts (everyone receives)
@@ -340,12 +355,12 @@ def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None
     - "machine:{your_machine}": Events for your machine
 
     Args:
-        since_id: Return events with ID greater than this (default: 0 = all)
+        since_id: Event ID to start from (0 = recent activity, >0 = poll from that point)
         limit: Maximum number of events to return (default: 50)
         session_id: Your session ID (for auto-heartbeat and channel filtering)
 
     Returns:
-        List of events since the given ID
+        List of events (newest first if since_id=0, chronological if since_id>0)
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)

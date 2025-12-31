@@ -82,9 +82,6 @@ DEFAULT_DB_PATH = Path.home() / ".claude" / "event-bus.db"
 # cleaned up faster via PID liveness check in list_sessions()
 SESSION_TIMEOUT = 604800  # 7 days
 
-# Event retention settings
-MAX_EVENTS = 1000  # Keep last N events
-
 
 class SQLiteStorage:
     """SQLite-backed storage for sessions and events."""
@@ -151,6 +148,10 @@ class SQLiteStorage:
             # Index for efficient event polling
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)
+            """)
+            # Index for efficient session ordering by activity
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat)
             """)
 
     # Session operations
@@ -227,9 +228,9 @@ class SQLiteStorage:
             return cursor.rowcount > 0
 
     def list_sessions(self) -> list[Session]:
-        """List all sessions (including stale ones)."""
+        """List all sessions, ordered by most recently active first."""
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM sessions").fetchall()
+            rows = conn.execute("SELECT * FROM sessions ORDER BY last_heartbeat DESC").fetchall()
             return [self._row_to_session(row) for row in rows]
 
     def cleanup_stale_sessions(self, timeout_seconds: int = SESSION_TIMEOUT) -> int:
@@ -270,9 +271,6 @@ class SQLiteStorage:
             )
             event_id = cursor.lastrowid
 
-            # Cleanup old events
-            self._cleanup_events(conn)
-
             return Event(
                 id=event_id,
                 event_type=event_type,
@@ -288,36 +286,48 @@ class SQLiteStorage:
         limit: int = 50,
         channels: list[str] | None = None,
     ) -> list[Event]:
-        """Get events since a given event ID.
+        """Get events, with ordering based on since_id.
+
+        Ordering behavior:
+        - since_id=0: Returns newest events first (DESC) - for "what's new?" queries
+        - since_id>0: Returns events after that ID in order (ASC) - for polling
 
         Args:
-            since_id: Return events with ID greater than this
+            since_id: Return events with ID greater than this (0 = recent activity)
             limit: Maximum number of events to return
             channels: Optional list of channels to filter by (None = all events)
         """
         with self._connect() as conn:
-            if channels:
-                # Filter by channels
-                placeholders = ",".join("?" * len(channels))
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM events
-                    WHERE id > ? AND channel IN ({placeholders})
-                    ORDER BY id ASC
-                    LIMIT ?
-                    """,
-                    (since_id, *channels, limit),
-                ).fetchall()
+            # Determine ordering based on use case:
+            # - since_id=0: "What's happening?" → newest first (DESC)
+            # - since_id>0: "Catch me up from X" → in order (ASC)
+            if since_id == 0:
+                order = "DESC"
+                where_clause = ""
+                params_base: tuple = ()
             else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM events
-                    WHERE id > ?
-                    ORDER BY id ASC
-                    LIMIT ?
-                    """,
-                    (since_id, limit),
-                ).fetchall()
+                order = "ASC"
+                where_clause = "WHERE id > ?"
+                params_base = (since_id,)
+
+            if channels:
+                placeholders = ",".join("?" * len(channels))
+                channel_filter = f"channel IN ({placeholders})"
+                if where_clause:
+                    where_clause += f" AND {channel_filter}"
+                else:
+                    where_clause = f"WHERE {channel_filter}"
+                params = (*params_base, *channels, limit)
+            else:
+                params = (*params_base, limit)
+
+            query = f"""
+                SELECT * FROM events
+                {where_clause}
+                ORDER BY id {order}
+                LIMIT ?
+            """
+            rows = conn.execute(query, params).fetchall()
 
             return [
                 Event(
@@ -330,25 +340,6 @@ class SQLiteStorage:
                 )
                 for row in rows
             ]
-
-    def _cleanup_events(self, conn: sqlite3.Connection) -> int:
-        """Remove old events, keeping only the last MAX_EVENTS.
-
-        Returns the number of events removed.
-        """
-        cursor = conn.execute(
-            """
-            DELETE FROM events
-            WHERE id NOT IN (
-                SELECT id FROM events ORDER BY id DESC LIMIT ?
-            )
-            """,
-            (MAX_EVENTS,),
-        )
-        count = cursor.rowcount
-        if count > 0:
-            logger.warning(f"Cleaned up {count} old event(s)")
-        return count
 
     def get_last_event_id(self) -> int:
         """Get the ID of the most recent event, or 0 if none."""

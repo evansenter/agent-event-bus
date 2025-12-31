@@ -55,10 +55,10 @@ src/event_bus/
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, machine?, cwd?, pid?)` | Register session, get session_id |
-| `list_sessions()` | List all active sessions |
+| `register_session(name, machine?, cwd?, pid?)` | Register session, get session_id + last_event_id for polling |
+| `list_sessions()` | List active sessions (most recently active first) |
 | `publish_event(type, payload, session_id?, channel?)` | Publish event to channel |
-| `get_events(since_id?, limit?, session_id?)` | Poll for events (filtered by subscriptions) |
+| `get_events(since_id?, limit?, session_id?)` | Get events (since_id=0: newest first; >0: chronological) |
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
 
@@ -100,7 +100,6 @@ publish_event("api_ready", "API merged", channel="repo:my-project")
 - **Session cleanup**: 7-day heartbeat timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
 - **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
-- **Event retention**: Keeps last 1000 events, auto-cleans on write
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
 - **Human-readable IDs**: Session IDs use Docker-style names (e.g., `brave-tiger`) instead of UUIDs

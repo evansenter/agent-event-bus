@@ -26,26 +26,29 @@ each session is isolated. This MCP server lets sessions:
 ### 1. Register on startup
 ```
 register_session(name="auth-feature")
-→ {session_id: "brave-tiger", repo: "my-project", machine: "macbook", ...}
+→ {session_id: "brave-tiger", last_event_id: 42, repo: "my-project", ...}
 ```
-Save the `session_id` - you'll need it for other calls.
+Save `session_id` and `last_event_id` - you'll need them for polling.
 
 ### 2. Check who else is working
 ```
 list_sessions()
-→ [{name: "auth-feature", repo: "my-project"}, {name: "api-refactor", ...}]
+→ [{name: "auth-feature", ...}, {name: "api-refactor", ...}]
 ```
+Sessions are ordered by most recently active first.
 
 ### 3. Publish events to coordinate
 ```
 publish_event("api_ready", "Auth endpoints merged", channel="repo:my-project")
 ```
 
-### 4. Poll for events from others
+### 4. Poll for events
 ```
-get_events(since_id=0, session_id="brave-tiger")
-→ [{event_type: "api_ready", payload: "Auth endpoints merged", ...}]
+# Use last_event_id from registration to start polling
+get_events(since_id=42, session_id="brave-tiger")
+→ [{id: 43, event_type: "api_ready", ...}, {id: 44, ...}]
 ```
+Events come back in chronological order when using since_id.
 
 ### 5. Notify the user
 ```
@@ -70,6 +73,41 @@ Events are published to channels. Sessions auto-subscribe based on their attribu
 
 **Default is `all`**, but prefer `repo:` for most coordination to avoid noise.
 
+## Event Polling
+
+`get_events` has two distinct behaviors based on `since_id`:
+
+### "What's happening?" (since_id=0 or omitted)
+```
+get_events()
+→ [{id: 50, ...}, {id: 49, ...}, {id: 48, ...}]  # Newest first (DESC)
+```
+Returns recent events, **newest first**. Use this for a quick check of recent activity.
+
+### Polling loop (since_id > 0)
+```
+get_events(since_id=42)
+→ [{id: 43, ...}, {id: 44, ...}, {id: 45, ...}]  # Chronological (ASC)
+```
+Returns events after the given ID, **in order**. Use this for catching up.
+
+### Recommended Pattern
+```python
+# 1. On session start, get your starting point
+result = register_session(name="my-feature")
+session_id = result["session_id"]
+last_seen = result["last_event_id"]  # Start from here
+
+# 2. Poll periodically for new events
+events = get_events(since_id=last_seen, session_id=session_id)
+for event in events:
+    # Process each event
+    last_seen = event["id"]  # Track progress
+
+# 3. To just peek at recent activity (one-off check)
+recent = get_events()  # No since_id = newest first
+```
+
 ## Common Patterns
 
 ### Signal when your work is ready for others
@@ -80,11 +118,12 @@ publish_event("api_ready", "Auth API merged to main", channel="repo:my-project")
 
 ### Wait for another session's work
 ```
-# Poll periodically until you see what you're waiting for
-events = get_events(since_id=last_seen_id, session_id=my_session_id)
+# Use last_event_id from register_session as starting point
+events = get_events(since_id=last_event_id, session_id=my_session_id)
 for e in events:
     if e["event_type"] == "api_ready":
         # Now safe to integrate
+    last_event_id = e["id"]  # Track for next poll
 ```
 
 ### Ask another session for help
@@ -108,9 +147,9 @@ notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
 
 ### Session Registration
 1. **Register on session start** - Makes you discoverable; enables DMs
-2. **Save your session_id** - You'll need it for get_events and publish_event
+2. **Save session_id and last_event_id** - You'll need both for polling
 3. **Include session_id in get_events** - Enables filtering and auto-heartbeat
-4. **Poll at natural breakpoints** - Check for messages at session start, before/after major tasks
+4. **Poll at natural breakpoints** - Check for messages before/after major tasks
 5. **Unregister on exit** - Keeps the session list clean
 
 ### Communication
@@ -138,9 +177,11 @@ The notification alerts the **human** who routes the message to the correct sess
 
 ## Tips
 
+- `register_session` returns `last_event_id` - use it to start polling from the right place
 - `get_events` and `publish_event` auto-refresh your heartbeat
+- `get_events()` with no since_id returns newest first; with since_id returns chronological
+- `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 7 days of inactivity
 - Local sessions are cleaned immediately on PID death (remote sessions use 7-day timeout)
-- Events are retained for the last 1000 entries
 - The repo name is auto-detected from your working directory
 - SessionStart hooks can auto-register you on startup
