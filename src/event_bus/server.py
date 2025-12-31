@@ -191,8 +191,9 @@ def register_session(
     )
     storage.add_session(session)
 
-    # Auto-publish registration event
-    storage.add_event(
+    # Auto-publish registration event and capture its ID directly
+    # (avoids race condition if another event is published between add and get)
+    registration_event = storage.add_event(
         event_type="session_registered",
         payload=f"{name} started on {machine} in {cwd}",
         session_id=session_id,
@@ -205,7 +206,7 @@ def register_session(
         "cwd": cwd,
         "repo": repo,
         "active_sessions": storage.session_count(),
-        "last_event_id": storage.get_last_event_id(),
+        "last_event_id": registration_event.id,
         "resumed": False,
         "tip": f"You are '{name}' ({session_id}). Use last_event_id to start polling: get_events(since_id=last_event_id).",
     }
