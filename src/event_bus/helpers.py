@@ -31,10 +31,30 @@ def extract_repo_from_cwd(cwd: str) -> str:
     return _sanitize_name(last) if last else "unknown"
 
 
-def is_pid_alive(pid: int | None) -> bool:
-    """Check if a process with the given PID is still running."""
-    if pid is None:
-        return True  # Can't check, assume alive
+def is_client_alive(client_id: str | None, is_local: bool) -> bool:
+    """Check if a client is still alive based on its client_id.
+
+    For local sessions where client_id is a numeric PID, we check process liveness.
+    For remote sessions or non-numeric client_ids, we can't check and assume alive.
+
+    Args:
+        client_id: The client identifier (may be a PID string or other identifier)
+        is_local: Whether the session is on the local machine
+
+    Returns:
+        True if client is alive or we can't determine, False if definitely dead.
+    """
+    if client_id is None or not is_local:
+        return True  # Can't check remote or unknown clients, assume alive
+
+    # Try to parse as PID for liveness check
+    try:
+        pid = int(client_id)
+    except ValueError:
+        logger.debug(f"Skipping liveness check for non-numeric client_id: {client_id}")
+        return True  # Non-numeric client_id, can't check, assume alive
+
+    # Check PID liveness
     try:
         os.kill(pid, 0)  # Signal 0 = check if process exists
         return True

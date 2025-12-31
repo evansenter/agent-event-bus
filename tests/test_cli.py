@@ -87,7 +87,7 @@ class TestCmdRegister:
         mock_getcwd.return_value = "/home/user/project"
         mock_call.return_value = {"session_id": "abc123", "name": "my-session"}
 
-        args = Namespace(name="my-session", pid=None, url=None)
+        args = Namespace(name="my-session", client_id=None, url=None)
         cli.cmd_register(args)
 
         mock_call.assert_called_once_with(
@@ -103,7 +103,7 @@ class TestCmdRegister:
         mock_getcwd.return_value = "/home/user/my-project"
         mock_call.return_value = {"session_id": "abc123", "name": "my-project"}
 
-        args = Namespace(name=None, pid=None, url=None)
+        args = Namespace(name=None, client_id=None, url=None)
         cli.cmd_register(args)
 
         mock_call.assert_called_once_with(
@@ -114,16 +114,16 @@ class TestCmdRegister:
 
     @patch("event_bus.cli.call_tool")
     @patch("event_bus.cli.os.getcwd")
-    def test_register_with_pid(self, mock_getcwd, mock_call):
-        """Test register with PID."""
+    def test_register_with_client_id(self, mock_getcwd, mock_call):
+        """Test register with client_id."""
         mock_getcwd.return_value = "/home/user/project"
         mock_call.return_value = {"session_id": "abc123"}
 
-        args = Namespace(name="test", pid=12345, url=None)
+        args = Namespace(name="test", client_id="abc-session", url=None)
         cli.cmd_register(args)
 
         call_args = mock_call.call_args[0][1]
-        assert call_args["pid"] == 12345
+        assert call_args["client_id"] == "abc-session"
 
 
 class TestCmdUnregister:
@@ -168,7 +168,7 @@ class TestCmdSessions:
                 "repo": "my-repo",
                 "machine": "my-machine",
                 "age_seconds": 120,
-                "pid": 12345,
+                "client_id": "xyz789",
             }
         ]
 
@@ -643,14 +643,16 @@ class TestMainArgumentParsing:
         """Test register subcommand parsing."""
         import sys
 
-        with patch.object(sys, "argv", ["cli", "register", "--name", "test", "--pid", "123"]):
+        with patch.object(
+            sys, "argv", ["cli", "register", "--name", "test", "--client-id", "abc123"]
+        ):
             with patch("event_bus.cli.cmd_register") as mock_cmd:
                 mock_cmd.return_value = None
                 cli.main()
 
                 args = mock_cmd.call_args[0][0]
                 assert args.name == "test"
-                assert args.pid == 123
+                assert args.client_id == "abc123"
 
     def test_unregister_parser(self):
         """Test unregister subcommand parsing."""

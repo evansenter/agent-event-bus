@@ -19,7 +19,7 @@ class TestSessionOperations:
             repo="project",
             registered_at=now,
             last_heartbeat=now,
-            pid=12345,
+            client_id="12345",
         )
         storage.add_session(session)
 
@@ -30,7 +30,7 @@ class TestSessionOperations:
         assert retrieved.machine == "localhost"
         assert retrieved.cwd == "/home/user/project"
         assert retrieved.repo == "project"
-        assert retrieved.pid == 12345
+        assert retrieved.client_id == "12345"
 
     def test_get_nonexistent_session(self, storage):
         """Test getting a session that doesn't exist."""
@@ -119,10 +119,10 @@ class TestSessionOperations:
 
 
 class TestSessionDeduplication:
-    """Tests for session deduplication by machine+cwd+pid."""
+    """Tests for session deduplication by machine+client_id."""
 
-    def test_find_session_by_key(self, storage):
-        """Test finding a session by machine+cwd+pid key."""
+    def test_find_session_by_client(self, storage):
+        """Test finding a session by machine+client_id key."""
         now = datetime.now()
         session = Session(
             id="test-123",
@@ -132,15 +132,15 @@ class TestSessionDeduplication:
             repo="project",
             registered_at=now,
             last_heartbeat=now,
-            pid=12345,
+            client_id="12345",
         )
         storage.add_session(session)
 
-        found = storage.find_session_by_key("localhost", "/home/user/project", 12345)
+        found = storage.find_session_by_client("localhost", "12345")
         assert found is not None
         assert found.id == "test-123"
 
-    def test_find_session_by_key_not_found(self, storage):
+    def test_find_session_by_client_not_found(self, storage):
         """Test finding a session that doesn't match."""
         now = datetime.now()
         session = Session(
@@ -151,16 +151,14 @@ class TestSessionDeduplication:
             repo="project",
             registered_at=now,
             last_heartbeat=now,
-            pid=12345,
+            client_id="12345",
         )
         storage.add_session(session)
 
         # Different machine
-        assert storage.find_session_by_key("other-host", "/home/user/project", 12345) is None
-        # Different cwd
-        assert storage.find_session_by_key("localhost", "/other/path", 12345) is None
-        # Different pid
-        assert storage.find_session_by_key("localhost", "/home/user/project", 99999) is None
+        assert storage.find_session_by_client("other-host", "12345") is None
+        # Different client_id
+        assert storage.find_session_by_client("localhost", "99999") is None
 
 
 class TestHeartbeat:
@@ -378,8 +376,8 @@ class TestDatabaseInitialization:
         # Verify it works
         assert storage.session_count() == 0
 
-    def test_schema_migration_pid_column(self, temp_db):
-        """Test that pid column is added to existing schema."""
+    def test_schema_migration_client_id_column(self, temp_db):
+        """Test that client_id column exists in schema."""
         # This is implicitly tested by using the storage,
         # but we verify the column exists
         storage = SQLiteStorage(db_path=temp_db)
@@ -393,12 +391,12 @@ class TestDatabaseInitialization:
             repo="test",
             registered_at=now,
             last_heartbeat=now,
-            pid=12345,
+            client_id="abc123",
         )
         storage.add_session(session)
 
         retrieved = storage.get_session("test")
-        assert retrieved.pid == 12345
+        assert retrieved.client_id == "abc123"
 
     def test_schema_migration_channel_column(self, temp_db):
         """Test that channel column is added to existing schema."""

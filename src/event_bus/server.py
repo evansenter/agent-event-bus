@@ -19,7 +19,7 @@ from fastmcp import FastMCP
 from event_bus.helpers import (
     dev_notify,
     extract_repo_from_cwd,
-    is_pid_alive,
+    is_client_alive,
     send_notification,
 )
 from event_bus.middleware import RequestLoggingMiddleware
@@ -132,7 +132,7 @@ def register_session(
     name: str,
     machine: str | None = None,
     cwd: str | None = None,
-    pid: int | None = None,
+    client_id: str | None = None,
 ) -> dict:
     """Register this Claude session with the event bus.
 
@@ -140,7 +140,7 @@ def register_session(
         name: A short name for this session (e.g., branch name, task)
         machine: Machine identifier (defaults to hostname)
         cwd: Working directory (defaults to CWD env var)
-        pid: Process ID of the Claude Code client (for session deduplication)
+        client_id: Client identifier for session deduplication (e.g., CC session ID or PID)
 
     Returns:
         Session info including assigned session_id and last_event_id for polling
@@ -154,10 +154,10 @@ def register_session(
     cwd = cwd or os.environ.get("PWD", os.getcwd())
     repo = extract_repo_from_cwd(cwd)
 
-    # Check for existing session with same machine+cwd+pid
+    # Check for existing session with same machine+client_id
     existing = None
-    if pid is not None:
-        existing = storage.find_session_by_key(machine, cwd, pid)
+    if client_id is not None:
+        existing = storage.find_session_by_client(machine, client_id)
 
     if existing:
         # Update existing session
@@ -187,7 +187,7 @@ def register_session(
         repo=repo,
         registered_at=now,
         last_heartbeat=now,
-        pid=pid,
+        client_id=client_id,
     )
     storage.add_session(session)
 
@@ -230,14 +230,14 @@ def list_sessions() -> list[dict]:
     results = []
 
     for s in storage.list_sessions():
-        # For local sessions with PIDs, check if process is still alive
+        # For local sessions, check if client is still alive
         is_local = s.machine == local_hostname
-        pid_alive = is_pid_alive(s.pid) if is_local and s.pid else True
+        client_alive = is_client_alive(s.client_id, is_local)
 
-        if not pid_alive:
+        if not client_alive:
             # Clean up dead session
             storage.delete_session(s.id)
-            logger.info(f"Cleaned up dead session {s.id} (PID {s.pid} not running)")
+            logger.info(f"Cleaned up dead session {s.id} (client_id {s.client_id} not running)")
             continue
 
         results.append(
@@ -247,7 +247,7 @@ def list_sessions() -> list[dict]:
                 "machine": s.machine,
                 "repo": s.repo,
                 "cwd": s.cwd,
-                "pid": s.pid,
+                "client_id": s.client_id,
                 "registered_at": s.registered_at.isoformat(),
                 "last_heartbeat": s.last_heartbeat.isoformat(),
                 "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
