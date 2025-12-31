@@ -121,12 +121,30 @@ event-bus-cli sessions
 # Publish event
 event-bus-cli publish --type "task_done" --payload "Finished" --channel "repo:my-project"
 
-# Get events
+# Get events (basic)
 event-bus-cli events --since 0 --session-id abc123
+
+# Get events with JSON output (for scripting)
+event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
+
+# Get events with automatic state tracking (ideal for hooks)
+event-bus-cli events --track-state ~/.local/state/claude/last_event_id --json --timeout 200
 
 # Send notification
 event-bus-cli notify --title "Done" --message "Build complete"
 ```
+
+### Events Command Options
+
+| Option | Description |
+|--------|-------------|
+| `--since ID` | Get events after this ID (default: 0) |
+| `--session-id ID` | Your session ID for channel filtering |
+| `--limit N` | Maximum events to return |
+| `--exclude-types T1,T2` | Comma-separated event types to filter out |
+| `--timeout MS` | Request timeout in milliseconds (default: 10000) |
+| `--track-state FILE` | Read/write last event ID for incremental polling |
+| `--json` | Output as JSON with `events` array and `last_id` |
 
 ## Configuration
 

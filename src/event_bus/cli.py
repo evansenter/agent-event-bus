@@ -6,7 +6,8 @@ Usage:
     event-bus-cli unregister --session-id ID
     event-bus-cli sessions
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
-    event-bus-cli events [--since ID] [--session-id ID]
+    event-bus-cli events [--since ID] [--session-id ID] [--limit N] [--exclude-types T1,T2]
+                         [--timeout MS] [--track-state FILE] [--json]
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -24,6 +25,12 @@ Examples:
 
     # Get recent events
     event-bus-cli events --since 0 --session-id abc123
+
+    # Get events with JSON output (for scripting)
+    event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
+
+    # Use state file for incremental polling (ideal for hooks)
+    event-bus-cli events --track-state ~/.local/state/claude/last_event_id --json
 
     # Send notification
     event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -43,8 +50,18 @@ HEADERS = {
 }
 
 
-def call_tool(tool_name: str, arguments: dict, url: str = DEFAULT_URL) -> dict:
-    """Call an MCP tool and return the result."""
+def call_tool(
+    tool_name: str, arguments: dict, url: str = DEFAULT_URL, timeout_ms: int | None = None
+) -> dict:
+    """Call an MCP tool and return the result.
+
+    Args:
+        tool_name: Name of the MCP tool to call
+        arguments: Tool arguments
+        url: Event bus URL
+        timeout_ms: Timeout in milliseconds (default: 10000)
+    """
+    timeout_sec = (timeout_ms / 1000) if timeout_ms else 10
     try:
         resp = requests.post(
             url or DEFAULT_URL,
@@ -55,7 +72,7 @@ def call_tool(tool_name: str, arguments: dict, url: str = DEFAULT_URL) -> dict:
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments},
             },
-            timeout=10,
+            timeout=timeout_sec,
         )
         resp.raise_for_status()
 
@@ -94,7 +111,7 @@ def cmd_register(args):
         arguments["pid"] = args.pid
     arguments["cwd"] = os.getcwd()
 
-    result = call_tool("register_session", arguments)
+    result = call_tool("register_session", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
     # Also print just the session_id for easy capture in scripts
@@ -104,13 +121,13 @@ def cmd_register(args):
 
 def cmd_unregister(args):
     """Unregister a session."""
-    result = call_tool("unregister_session", {"session_id": args.session_id})
+    result = call_tool("unregister_session", {"session_id": args.session_id}, url=args.url)
     print(json.dumps(result, indent=2))
 
 
 def cmd_sessions(args):
     """List active sessions."""
-    result = call_tool("list_sessions", {})
+    result = call_tool("list_sessions", {}, url=args.url)
     if not result:
         print("No active sessions")
         return
@@ -134,28 +151,70 @@ def cmd_publish(args):
     if args.session_id:
         arguments["session_id"] = args.session_id
 
-    result = call_tool("publish_event", arguments)
+    result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
 
 def cmd_events(args):
     """Get recent events."""
-    arguments = {}
-    if args.since is not None:
-        arguments["since_id"] = args.since
+    # Handle --track-state: read since_id from file
+    since_id = args.since
+    if args.track_state:
+        state_path = os.path.expanduser(args.track_state)
+        try:
+            with open(state_path) as f:
+                since_id = int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            since_id = 0  # Start from beginning if file doesn't exist or is invalid
+
+    arguments = {"since_id": since_id}
+    if args.limit is not None:
+        arguments["limit"] = args.limit
     if args.session_id:
         arguments["session_id"] = args.session_id
 
-    result = call_tool("get_events", arguments)
+    result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
     if not result:
-        print("No events")
+        if args.json:
+            print(json.dumps({"events": [], "last_id": since_id}))
+        else:
+            print("No events")
         return
 
-    for e in result:
-        print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
-        print(f"    {e['payload']}")
-        print(f"    from: {e['session_id']} at {e['timestamp']}")
-        print()
+    # Determine last_id for state tracking BEFORE filtering
+    # This ensures we track the actual highest ID from the server, not filtered results.
+    # Otherwise, excluded events would be re-fetched on every poll.
+    last_id = max((e["id"] for e in result), default=since_id)
+
+    # Apply --exclude-types filter (after computing last_id)
+    if args.exclude_types:
+        exclude_set = {t.strip() for t in args.exclude_types.split(",")}
+        result = [e for e in result if e["event_type"] not in exclude_set]
+
+    # Handle --track-state: write new last_id to file
+    # Always write if we got events from server (last_id is already computed before filtering)
+    if args.track_state:
+        state_path = os.path.expanduser(args.track_state)
+        # Ensure parent directory exists
+        state_dir = os.path.dirname(state_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        with open(state_path, "w") as f:
+            f.write(str(last_id))
+
+    # Output format
+    if args.json:
+        output = {"events": result, "last_id": last_id}
+        print(json.dumps(output))
+    else:
+        if not result:
+            print("No events")
+            return
+        for e in result:
+            print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
+            print(f"    {e['payload']}")
+            print(f"    from: {e['session_id']} at {e['timestamp']}")
+            print()
 
 
 def cmd_notify(args):
@@ -167,7 +226,7 @@ def cmd_notify(args):
     if args.sound:
         arguments["sound"] = True
 
-    result = call_tool("notify", arguments)
+    result = call_tool("notify", arguments, url=args.url)
     if result.get("success"):
         print("Notification sent")
     else:
@@ -216,6 +275,26 @@ def main():
     p_events = subparsers.add_parser("events", help="Get recent events")
     p_events.add_argument("--since", type=int, default=0, help="Get events after this ID")
     p_events.add_argument("--session-id", help="Your session ID (for filtering)")
+    p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
+    p_events.add_argument(
+        "--exclude-types",
+        help="Comma-separated event types to exclude (e.g., session_registered,session_unregistered)",
+    )
+    p_events.add_argument(
+        "--timeout",
+        type=int,
+        default=10000,
+        help="Request timeout in milliseconds (default: 10000)",
+    )
+    p_events.add_argument(
+        "--track-state",
+        help="File to read/write last event ID for incremental polling",
+    )
+    p_events.add_argument(
+        "--json",
+        action="store_true",
+        help="Output as JSON with events array and last_id",
+    )
     p_events.set_defaults(func=cmd_events)
 
     # notify
