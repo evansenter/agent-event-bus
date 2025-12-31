@@ -2,7 +2,7 @@
 """CLI wrapper for event bus - for use in shell scripts and hooks.
 
 Usage:
-    event-bus-cli register [--name NAME] [--pid PID]
+    event-bus-cli register [--name NAME] [--client-id ID]
     event-bus-cli unregister --session-id ID
     event-bus-cli sessions
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
@@ -12,7 +12,7 @@ Usage:
 
 Examples:
     # Register session (for SessionStart hook)
-    event-bus-cli register --name "my-feature" --pid $$
+    event-bus-cli register --name "my-feature" --client-id "abc123"
 
     # Unregister session (for SessionEnd hook)
     event-bus-cli unregister --session-id abc123
@@ -107,8 +107,8 @@ def cmd_register(args):
     else:
         # Default to current directory name
         arguments["name"] = os.path.basename(os.getcwd())
-    if args.pid:
-        arguments["pid"] = args.pid
+    if args.client_id:
+        arguments["client_id"] = args.client_id
     arguments["cwd"] = os.getcwd()
 
     result = call_tool("register_session", arguments, url=args.url)
@@ -136,7 +136,7 @@ def cmd_sessions(args):
     for s in result:
         print(f"  {s['session_id']}  {s['name']}")
         print(f"    repo: {s['repo']}, machine: {s['machine']}")
-        print(f"    age: {int(s['age_seconds'])}s, pid: {s.get('pid', 'N/A')}")
+        print(f"    age: {int(s['age_seconds'])}s, client_id: {s.get('client_id', 'N/A')}")
         print()
 
 
@@ -251,7 +251,9 @@ def main():
     # register
     p_register = subparsers.add_parser("register", help="Register a session")
     p_register.add_argument("--name", help="Session name (default: directory name)")
-    p_register.add_argument("--pid", type=int, help="Process ID for deduplication")
+    p_register.add_argument(
+        "--client-id", help="Client identifier for deduplication (e.g., CC session ID or PID)"
+    )
     p_register.set_defaults(func=cmd_register)
 
     # unregister

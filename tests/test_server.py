@@ -16,7 +16,7 @@ from event_bus import server  # noqa: E402
 from event_bus.helpers import (  # noqa: E402
     escape_applescript_string,
     extract_repo_from_cwd,
-    is_pid_alive,
+    is_client_alive,
 )
 from event_bus.storage import Session, SQLiteStorage  # noqa: E402
 
@@ -230,21 +230,36 @@ class TestSessionGetProjectName:
         assert session.get_project_name() == "project with newlines"
 
 
-class TestIsPidAlive:
-    """Tests for is_pid_alive helper."""
+class TestIsClientAlive:
+    """Tests for is_client_alive helper."""
 
     def test_current_process_is_alive(self):
-        """Test that current process is detected as alive."""
-        assert is_pid_alive(os.getpid()) is True
+        """Test that current process PID is detected as alive on local machine."""
+        assert is_client_alive(str(os.getpid()), is_local=True) is True
 
-    def test_none_pid(self):
-        """Test that None PID is treated as alive."""
-        assert is_pid_alive(None) is True
+    def test_none_client_id(self):
+        """Test that None client_id is treated as alive."""
+        assert is_client_alive(None, is_local=True) is True
 
     def test_nonexistent_pid(self):
-        """Test that nonexistent PID is detected as dead."""
+        """Test that nonexistent PID is detected as dead on local machine."""
         # Use a very high PID that's unlikely to exist
-        assert is_pid_alive(999999999) is False
+        assert is_client_alive("999999999", is_local=True) is False
+
+    def test_remote_session_always_alive(self):
+        """Test that remote sessions are always considered alive."""
+        # Even with dead PID, remote sessions can't be checked
+        assert is_client_alive("999999999", is_local=False) is True
+
+    def test_non_numeric_client_id_treated_as_alive(self):
+        """Test that non-numeric client_id is treated as alive."""
+        # Can't check liveness of non-PID client IDs
+        assert is_client_alive("abc-session-id", is_local=True) is True
+
+    def test_empty_string_client_id_treated_as_alive(self):
+        """Test that empty string client_id is treated as alive."""
+        # Empty string can't be parsed as PID, so treated as alive
+        assert is_client_alive("", is_local=True) is True
 
 
 class TestRegisterSession:
@@ -256,7 +271,7 @@ class TestRegisterSession:
             name="test-session",
             machine="test-machine",
             cwd="/home/user/project",
-            pid=12345,
+            client_id="12345",
         )
 
         assert "session_id" in result
@@ -275,46 +290,66 @@ class TestRegisterSession:
         assert "cwd" in result
 
     def test_resume_existing_session(self):
-        """Test resuming an existing session with same machine+cwd+pid."""
+        """Test resuming an existing session with same machine+client_id."""
         # Register first session
         result1 = register_session(
             name="original-name",
             machine="test-machine",
             cwd="/home/user/project",
-            pid=12345,
+            client_id="12345",
         )
         session_id = result1["session_id"]
 
-        # Register again with same key but different name
+        # Register again with same key but different name (and different cwd)
         result2 = register_session(
             name="new-name",
             machine="test-machine",
-            cwd="/home/user/project",
-            pid=12345,
+            cwd="/home/user/other-project",  # cwd is no longer part of dedup key
+            client_id="12345",
         )
 
         assert result2["session_id"] == session_id
         assert result2["name"] == "new-name"
         assert result2["resumed"] is True
 
-    def test_new_session_different_pid(self):
-        """Test that different PID creates new session."""
+    def test_new_session_different_client_id(self):
+        """Test that different client_id creates new session."""
         result1 = register_session(
             name="session1",
             machine="test-machine",
             cwd="/home/user/project",
-            pid=12345,
+            client_id="12345",
         )
 
         result2 = register_session(
             name="session2",
             machine="test-machine",
             cwd="/home/user/project",
-            pid=67890,
+            client_id="67890",
         )
 
         assert result1["session_id"] != result2["session_id"]
         assert result2["active_sessions"] == 2
+
+    def test_no_deduplication_without_client_id(self):
+        """Test that sessions without client_id are never deduplicated."""
+        result1 = register_session(
+            name="session1",
+            machine="test-machine",
+            cwd="/home/user/project",
+            client_id=None,
+        )
+
+        result2 = register_session(
+            name="session2",
+            machine="test-machine",  # Same machine
+            cwd="/home/user/project",  # Same cwd
+            client_id=None,  # Both None
+        )
+
+        # Should create two separate sessions (no deduplication without client_id)
+        assert result1["session_id"] != result2["session_id"]
+        assert result2["resumed"] is False
 
 
 class TestListSessions:
@@ -336,18 +371,18 @@ class TestListSessions:
         names = {s["name"] for s in result}
         assert names == {"session1", "session2"}
 
-    def test_list_sessions_includes_pid(self):
-        """Test that listed sessions include PID."""
-        # Use a remote machine name so PID liveness check is skipped
-        register_session(name="session1", machine="remote-host", pid=12345)
+    def test_list_sessions_includes_client_id(self):
+        """Test that listed sessions include client_id."""
+        # Use a remote machine name so liveness check is skipped
+        register_session(name="session1", machine="remote-host", client_id="abc123")
 
         result = list_sessions()
         assert len(result) == 1
-        assert result[0]["pid"] == 12345
+        assert result[0]["client_id"] == "abc123"
 
-    def test_list_sessions_cleans_dead_local_pids(self):
-        """Test that dead local PIDs are cleaned up."""
-        # Register a session with a dead PID
+    def test_list_sessions_cleans_dead_local_clients(self):
+        """Test that dead local clients (by PID) are cleaned up."""
+        # Register a session with a dead PID as client_id
         hostname = socket.gethostname()
         now = datetime.now()
         session = Session(
@@ -358,7 +393,7 @@ class TestListSessions:
             repo="test",
             registered_at=now,
             last_heartbeat=now,
-            pid=999999999,  # Nonexistent PID
+            client_id="999999999",  # Nonexistent PID as string
         )
         server.storage.add_session(session)
 
@@ -447,7 +482,7 @@ class TestPublishEvent:
     def test_publish_event_auto_heartbeat(self):
         """Test that publishing refreshes heartbeat."""
         # Register a session
-        reg_result = register_session(name="test", pid=os.getpid())
+        reg_result = register_session(name="test", client_id=str(os.getpid()))
         session_id = reg_result["session_id"]
 
         # Get original heartbeat
@@ -787,7 +822,7 @@ class TestAutoHeartbeat:
 
     def test_auto_heartbeat_updates_session(self):
         """Test that auto_heartbeat updates session."""
-        reg = register_session(name="test", pid=os.getpid())
+        reg = register_session(name="test", client_id=str(os.getpid()))
         session_id = reg["session_id"]
 
         original = server.storage.get_session(session_id).last_heartbeat
@@ -825,8 +860,8 @@ class TestRegisterSessionTip:
 
     def test_resumed_session_includes_tip(self):
         """Test that resumed session includes a tip."""
-        register_session(name="original", machine="test", cwd="/test", pid=12345)
-        result = register_session(name="resumed", machine="test", cwd="/test", pid=12345)
+        register_session(name="original", machine="test", cwd="/test", client_id="12345")
+        result = register_session(name="resumed", machine="test", cwd="/test", client_id="12345")
 
         assert "tip" in result
         assert result["session_id"] in result["tip"]
@@ -844,8 +879,8 @@ class TestRegisterSessionLastEventId:
 
     def test_resumed_session_includes_last_event_id(self):
         """Test that resumed session includes last_event_id."""
-        register_session(name="original", machine="test", cwd="/test", pid=12345)
-        result = register_session(name="resumed", machine="test", cwd="/test", pid=12345)
+        register_session(name="original", machine="test", cwd="/test", client_id="12345")
+        result = register_session(name="resumed", machine="test", cwd="/test", client_id="12345")
 
         assert "last_event_id" in result
         assert isinstance(result["last_event_id"], int)

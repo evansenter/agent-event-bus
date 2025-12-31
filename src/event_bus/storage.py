@@ -39,7 +39,7 @@ class Session:
     repo: str
     registered_at: datetime
     last_heartbeat: datetime
-    pid: int | None = None  # Client process ID for deduplication
+    client_id: str | None = None  # Client identifier for session deduplication
 
     def get_project_name(self) -> str:
         """Get the project name, preferring explicit repo over cwd basename.
@@ -79,7 +79,7 @@ DEFAULT_DB_PATH = Path.home() / ".claude" / "event-bus.db"
 
 # Session timeout in seconds (7 days without activity = dead)
 # Long timeout supports multi-day sessions; local crashed sessions are
-# cleaned up faster via PID liveness check in list_sessions()
+# cleaned up faster via client liveness check in list_sessions()
 SESSION_TIMEOUT = 604800  # 7 days
 
 
@@ -110,9 +110,26 @@ class SQLiteStorage:
         finally:
             conn.close()
 
+    def _migrate_sessions_schema(self, conn: sqlite3.Connection) -> None:
+        """Migrate from old pid-based schema to client_id schema.
+
+        This is a breaking change migration - we drop the old sessions table
+        and recreate with the new schema. Approved for clean break in RFC #29.
+        """
+        # Check if sessions table exists with old schema (pid column)
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if "pid" in columns and "client_id" not in columns:
+            logger.warning("Migrating sessions table: dropping old pid-based schema")
+            conn.execute("DROP TABLE sessions")
+
     def _init_db(self):
         """Create tables if they don't exist."""
         with self._connect() as conn:
+            # Check if we need to migrate from pid to client_id schema
+            self._migrate_sessions_schema(conn)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
@@ -122,14 +139,9 @@ class SQLiteStorage:
                     repo TEXT NOT NULL,
                     registered_at TIMESTAMP NOT NULL,
                     last_heartbeat TIMESTAMP NOT NULL,
-                    pid INTEGER
+                    client_id TEXT
                 )
             """)
-            # Add pid column if upgrading from older schema
-            try:
-                conn.execute("ALTER TABLE sessions ADD COLUMN pid INTEGER")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,7 +174,7 @@ class SQLiteStorage:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions
-                (id, name, machine, cwd, repo, registered_at, last_heartbeat, pid)
+                (id, name, machine, cwd, repo, registered_at, last_heartbeat, client_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -173,16 +185,20 @@ class SQLiteStorage:
                     session.repo,
                     session.registered_at,
                     session.last_heartbeat,
-                    session.pid,
+                    session.client_id,
                 ),
             )
 
-    def find_session_by_key(self, machine: str, cwd: str, pid: int) -> Session | None:
-        """Find an existing session by machine+cwd+pid key."""
+    def find_session_by_client(self, machine: str, client_id: str) -> Session | None:
+        """Find an existing session by machine+client_id key.
+
+        The dedup key is (machine, client_id) because client_ids (like PIDs) are
+        machine-local - the same value on different machines represents different clients.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM sessions WHERE machine = ? AND cwd = ? AND pid = ?",
-                (machine, cwd, pid),
+                "SELECT * FROM sessions WHERE machine = ? AND client_id = ?",
+                (machine, client_id),
             ).fetchone()
             if row:
                 return self._row_to_session(row)
@@ -198,7 +214,7 @@ class SQLiteStorage:
             repo=row["repo"],
             registered_at=row["registered_at"],
             last_heartbeat=row["last_heartbeat"],
-            pid=row["pid"],
+            client_id=row["client_id"],
         )
 
     def get_session(self, session_id: str) -> Session | None:

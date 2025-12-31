@@ -14,7 +14,7 @@ each session is isolated. This MCP server lets sessions:
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, machine?, cwd?, pid?)` | Register yourself, get a session_id |
+| `register_session(name, machine?, cwd?, client_id?)` | Register yourself, get a session_id |
 | `list_sessions()` | See all active sessions |
 | `publish_event(type, payload, channel?)` | Send event to a channel |
 | `get_events(since_id?, limit?, session_id?)` | Poll for new events |
@@ -178,10 +178,11 @@ The notification alerts the **human** who routes the message to the correct sess
 ## Tips
 
 - `register_session` returns `last_event_id` - use it to start polling from the right place
+- Pass `client_id` to enable session resumption across restarts (e.g., CC session ID or PID)
 - `get_events` and `publish_event` auto-refresh your heartbeat
 - `get_events()` with no since_id returns newest first; with since_id returns chronological
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 7 days of inactivity
-- Local sessions are cleaned immediately on PID death (remote sessions use 7-day timeout)
+- Local sessions with numeric client_ids (PIDs) are cleaned immediately on process death
 - The repo name is auto-detected from your working directory
 - SessionStart hooks can auto-register you on startup
