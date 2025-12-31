@@ -3,25 +3,13 @@
 import os
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from event_bus import server
-from event_bus.storage import SQLiteStorage
 
 # Access the underlying functions from FunctionTool wrappers
 register_session = server.register_session.fn
 publish_event = server.publish_event.fn
 get_events = server.get_events.fn
 notify = server.notify.fn
-
-
-@pytest.fixture(autouse=True)
-def clean_storage():
-    """Clean the storage before each test."""
-    for session in server.storage.list_sessions():
-        server.storage.delete_session(session.id)
-    server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
-    yield
 
 
 class TestNotify:

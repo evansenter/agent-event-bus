@@ -116,7 +116,7 @@ Use consistent event types for discoverability across sessions.
 ## Design Decisions
 
 - **Polling over push**: MCP is request/response, so sessions poll with `get_events(since_id)`
-- **Session cleanup**: 7-day heartbeat timeout + client liveness checks for local sessions
+- **Session cleanup**: 24-hour heartbeat timeout + client liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
 - **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
 - **Localhost binding**: Binds to 127.0.0.1 by default for security

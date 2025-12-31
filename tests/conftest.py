@@ -41,3 +41,39 @@ def storage(temp_db):
     from event_bus.storage import SQLiteStorage
 
     return SQLiteStorage(db_path=temp_db)
+
+
+@pytest.fixture(autouse=True)
+def clean_storage():
+    """Clean the storage before each test."""
+    from event_bus import server
+    from event_bus.storage import SQLiteStorage
+
+    # Clear all sessions and events
+    for session in server.storage.list_sessions():
+        server.storage.delete_session(session.id)
+    # Clear events by recreating storage
+    server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+    yield
+
+
+@pytest.fixture(autouse=True)
+def mock_dm_notifications(request):
+    """Prevent real notifications from DM events during tests.
+
+    DM events trigger _notify_dm_recipient() which calls send_notification(),
+    sending real macOS notifications during test runs. We mock at the DM level
+    so that TestNotify can still test send_notification behavior.
+
+    Tests in TestAutoNotifyOnDM are excluded because they specifically test
+    DM notification behavior (and mock send_notification directly).
+    """
+    from unittest.mock import patch
+
+    # Skip mocking for tests that explicitly test DM notification behavior
+    if request.node.cls and request.node.cls.__name__ == "TestAutoNotifyOnDM":
+        yield None
+        return
+
+    with patch("event_bus.server._notify_dm_recipient") as mock:
+        yield mock
