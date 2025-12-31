@@ -87,12 +87,13 @@ class TestCmdRegister:
         mock_getcwd.return_value = "/home/user/project"
         mock_call.return_value = {"session_id": "abc123", "name": "my-session"}
 
-        args = Namespace(name="my-session", pid=None)
+        args = Namespace(name="my-session", pid=None, url=None)
         cli.cmd_register(args)
 
         mock_call.assert_called_once_with(
             "register_session",
             {"name": "my-session", "cwd": "/home/user/project"},
+            url=None,
         )
 
     @patch("event_bus.cli.call_tool")
@@ -102,12 +103,13 @@ class TestCmdRegister:
         mock_getcwd.return_value = "/home/user/my-project"
         mock_call.return_value = {"session_id": "abc123", "name": "my-project"}
 
-        args = Namespace(name=None, pid=None)
+        args = Namespace(name=None, pid=None, url=None)
         cli.cmd_register(args)
 
         mock_call.assert_called_once_with(
             "register_session",
             {"name": "my-project", "cwd": "/home/user/my-project"},
+            url=None,
         )
 
     @patch("event_bus.cli.call_tool")
@@ -117,7 +119,7 @@ class TestCmdRegister:
         mock_getcwd.return_value = "/home/user/project"
         mock_call.return_value = {"session_id": "abc123"}
 
-        args = Namespace(name="test", pid=12345)
+        args = Namespace(name="test", pid=12345, url=None)
         cli.cmd_register(args)
 
         call_args = mock_call.call_args[0][1]
@@ -132,12 +134,13 @@ class TestCmdUnregister:
         """Test unregister session."""
         mock_call.return_value = {"success": True, "session_id": "abc123"}
 
-        args = Namespace(session_id="abc123")
+        args = Namespace(session_id="abc123", url=None)
         cli.cmd_unregister(args)
 
         mock_call.assert_called_once_with(
             "unregister_session",
             {"session_id": "abc123"},
+            url=None,
         )
 
 
@@ -149,7 +152,7 @@ class TestCmdSessions:
         """Test listing no sessions."""
         mock_call.return_value = []
 
-        args = Namespace()
+        args = Namespace(url=None)
         cli.cmd_sessions(args)
 
         captured = capsys.readouterr()
@@ -169,7 +172,7 @@ class TestCmdSessions:
             }
         ]
 
-        args = Namespace()
+        args = Namespace(url=None)
         cli.cmd_sessions(args)
 
         captured = capsys.readouterr()
@@ -187,12 +190,15 @@ class TestCmdPublish:
         """Test basic publish."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(type="test_event", payload="hello", channel=None, session_id=None)
+        args = Namespace(
+            type="test_event", payload="hello", channel=None, session_id=None, url=None
+        )
         cli.cmd_publish(args)
 
         mock_call.assert_called_once_with(
             "publish_event",
             {"event_type": "test_event", "payload": "hello"},
+            url=None,
         )
 
     @patch("event_bus.cli.call_tool")
@@ -201,7 +207,11 @@ class TestCmdPublish:
         mock_call.return_value = {"event_id": 1}
 
         args = Namespace(
-            type="test_event", payload="hello", channel="repo:my-repo", session_id="abc123"
+            type="test_event",
+            payload="hello",
+            channel="repo:my-repo",
+            session_id="abc123",
+            url=None,
         )
         cli.cmd_publish(args)
 
@@ -226,6 +236,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -254,6 +265,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -274,6 +286,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -305,6 +318,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=True,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -331,6 +345,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=True,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -377,6 +392,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=True,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -402,6 +418,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=None,
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -421,6 +438,7 @@ class TestCmdEvents:
             timeout=200,
             track_state=None,
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -453,6 +471,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=str(state_file),
             json=True,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -484,6 +503,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=str(state_file),
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -514,6 +534,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=str(state_file),
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -536,6 +557,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=str(state_file),
             json=False,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -568,6 +590,7 @@ class TestCmdEvents:
             timeout=10000,
             track_state=str(state_file),
             json=True,
+            url=None,
         )
         cli.cmd_events(args)
 
@@ -583,7 +606,7 @@ class TestCmdNotify:
         """Test successful notification."""
         mock_call.return_value = {"success": True}
 
-        args = Namespace(title="Test", message="Hello", sound=False)
+        args = Namespace(title="Test", message="Hello", sound=False, url=None)
         cli.cmd_notify(args)
 
         captured = capsys.readouterr()
@@ -594,7 +617,7 @@ class TestCmdNotify:
         """Test failed notification."""
         mock_call.return_value = {"success": False}
 
-        args = Namespace(title="Test", message="Hello", sound=False)
+        args = Namespace(title="Test", message="Hello", sound=False, url=None)
 
         with pytest.raises(SystemExit) as exc_info:
             cli.cmd_notify(args)
@@ -606,7 +629,7 @@ class TestCmdNotify:
         """Test notification with sound."""
         mock_call.return_value = {"success": True}
 
-        args = Namespace(title="Test", message="Hello", sound=True)
+        args = Namespace(title="Test", message="Hello", sound=True, url=None)
         cli.cmd_notify(args)
 
         call_args = mock_call.call_args[0][1]

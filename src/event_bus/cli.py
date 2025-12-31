@@ -111,7 +111,7 @@ def cmd_register(args):
         arguments["pid"] = args.pid
     arguments["cwd"] = os.getcwd()
 
-    result = call_tool("register_session", arguments)
+    result = call_tool("register_session", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
     # Also print just the session_id for easy capture in scripts
@@ -121,13 +121,13 @@ def cmd_register(args):
 
 def cmd_unregister(args):
     """Unregister a session."""
-    result = call_tool("unregister_session", {"session_id": args.session_id})
+    result = call_tool("unregister_session", {"session_id": args.session_id}, url=args.url)
     print(json.dumps(result, indent=2))
 
 
 def cmd_sessions(args):
     """List active sessions."""
-    result = call_tool("list_sessions", {})
+    result = call_tool("list_sessions", {}, url=args.url)
     if not result:
         print("No active sessions")
         return
@@ -151,7 +151,7 @@ def cmd_publish(args):
     if args.session_id:
         arguments["session_id"] = args.session_id
 
-    result = call_tool("publish_event", arguments)
+    result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
 
@@ -173,7 +173,7 @@ def cmd_events(args):
     if args.session_id:
         arguments["session_id"] = args.session_id
 
-    result = call_tool("get_events", arguments, timeout_ms=args.timeout)
+    result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
     if not result:
         if args.json:
             print(json.dumps({"events": [], "last_id": since_id}))
@@ -226,7 +226,7 @@ def cmd_notify(args):
     if args.sound:
         arguments["sound"] = True
 
-    result = call_tool("notify", arguments)
+    result = call_tool("notify", arguments, url=args.url)
     if result.get("success"):
         print("Notification sent")
     else:

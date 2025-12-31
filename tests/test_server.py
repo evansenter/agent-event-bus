@@ -40,6 +40,26 @@ def clean_storage():
     yield
 
 
+@pytest.fixture(autouse=True)
+def mock_dm_notifications(request):
+    """Prevent real notifications from DM events during tests.
+
+    DM events trigger _notify_dm_recipient() which calls send_notification(),
+    sending real macOS notifications during test runs. We mock at the DM level
+    so that TestNotify can still test send_notification behavior.
+
+    Tests in TestAutoNotifyOnDM are excluded because they specifically test
+    DM notification behavior (and mock send_notification directly).
+    """
+    # Skip mocking for tests that explicitly test DM notification behavior
+    if request.node.cls and request.node.cls.__name__ == "TestAutoNotifyOnDM":
+        yield None
+        return
+
+    with patch("event_bus.server._notify_dm_recipient") as mock:
+        yield mock
+
+
 class TestExtractRepoFromCwd:
     """Tests for extract_repo_from_cwd helper."""
 
