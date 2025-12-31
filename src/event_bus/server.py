@@ -12,6 +12,7 @@ import logging
 import os
 import socket
 from datetime import datetime
+from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -45,8 +46,6 @@ storage = SQLiteStorage()
 @mcp.resource("event-bus://guide", description="Usage guide and best practices")
 def usage_guide() -> str:
     """Return the event bus usage guide from external markdown file."""
-    from pathlib import Path
-
     guide_path = Path(__file__).parent / "guide.md"
     try:
         return guide_path.read_text()

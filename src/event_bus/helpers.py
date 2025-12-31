@@ -9,18 +9,26 @@ import subprocess
 logger = logging.getLogger("event-bus")
 
 
+def _sanitize_name(name: str) -> str:
+    """Sanitize a name by replacing problematic characters."""
+    return name.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+
+
 def extract_repo_from_cwd(cwd: str) -> str:
-    """Extract repo name from working directory."""
+    """Extract repo name from working directory.
+
+    Sanitizes the result to remove newlines/tabs that could cause display issues.
+    """
     # Try to get git repo name
     parts = cwd.rstrip("/").split("/")
     # Look for common patterns like .worktrees/branch-name
     if ".worktrees" in parts:
         idx = parts.index(".worktrees")
         if idx > 0:
-            return parts[idx - 1]
+            return _sanitize_name(parts[idx - 1])
     # Fall back to last directory component
     last = parts[-1] if parts else ""
-    return last if last else "unknown"
+    return _sanitize_name(last) if last else "unknown"
 
 
 def is_pid_alive(pid: int | None) -> bool:
@@ -36,7 +44,7 @@ def is_pid_alive(pid: int | None) -> bool:
         return True  # Process exists but we can't signal it
 
 
-def _escape_applescript_string(s: str) -> str:
+def escape_applescript_string(s: str) -> str:
     """Escape a string for safe inclusion in AppleScript double-quoted strings.
 
     Prevents command injection by escaping backslashes and double quotes.
@@ -80,8 +88,8 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
 
             # Fallback to osascript (no custom icon support)
             # Escape strings to prevent command injection
-            safe_title = _escape_applescript_string(title)
-            safe_message = _escape_applescript_string(message)
+            safe_title = escape_applescript_string(title)
+            safe_message = escape_applescript_string(message)
             script = f'display notification "{safe_message}" with title "{safe_title}"'
             if sound:
                 script += ' sound name "default"'

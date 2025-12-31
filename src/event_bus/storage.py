@@ -45,22 +45,21 @@ class Session:
         """Get the project name, preferring explicit repo over cwd basename.
 
         Returns:
-            Project name derived from repo field, or the last directory component of cwd
+            Project name derived from repo field, or the last directory component of cwd.
+            Note: repo field is already sanitized at registration time by extract_repo_from_cwd().
+            The fallback path also sanitizes for defense-in-depth.
         """
         if self.repo:
-            return self._sanitize_project_name(self.repo)
+            return self.repo
 
         if self.cwd:
             # Strip trailing slashes to handle paths like "/path/to/project/"
             basename = os.path.basename(self.cwd.rstrip("/"))
             if basename:
-                return self._sanitize_project_name(basename)
+                # Sanitize special chars (defense-in-depth, matches extract_repo_from_cwd)
+                return basename.replace("\n", " ").replace("\t", " ").replace("\r", " ")
 
         return "unknown"
-
-    def _sanitize_project_name(self, name: str) -> str:
-        """Sanitize project name by replacing special characters."""
-        return name.replace("\n", " ").replace("\t", " ").replace("\r", " ")
 
 
 @dataclass

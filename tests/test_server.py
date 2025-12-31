@@ -14,7 +14,7 @@ os.environ["EVENT_BUS_DB"] = _temp_db.name
 
 from event_bus import server  # noqa: E402
 from event_bus.helpers import (  # noqa: E402
-    _escape_applescript_string,
+    escape_applescript_string,
     extract_repo_from_cwd,
     is_pid_alive,
 )
@@ -61,45 +61,52 @@ class TestExtractRepoFromCwd:
         """Test empty path."""
         assert extract_repo_from_cwd("") == "unknown"
 
+    def test_sanitizes_special_chars(self):
+        """Test that special characters in path are sanitized."""
+        # Newlines, tabs, carriage returns should become spaces
+        assert extract_repo_from_cwd("/home/user/my\nproject") == "my project"
+        assert extract_repo_from_cwd("/home/user/my\tproject") == "my project"
+        assert extract_repo_from_cwd("/home/user/my\rproject") == "my project"
+
 
 class TestEscapeApplescriptString:
-    """Tests for _escape_applescript_string security helper."""
+    """Tests for escape_applescript_string security helper."""
 
     def test_backslash_escaping(self):
         """Test backslash characters are escaped."""
-        assert _escape_applescript_string("path\\to\\file") == "path\\\\to\\\\file"
+        assert escape_applescript_string("path\\to\\file") == "path\\\\to\\\\file"
 
     def test_quote_escaping(self):
         """Test double quote characters are escaped."""
-        assert _escape_applescript_string('say "hello"') == 'say \\"hello\\"'
+        assert escape_applescript_string('say "hello"') == 'say \\"hello\\"'
 
     def test_combined_escaping_order(self):
         """Test backslashes are escaped before quotes (order matters)."""
         # Input: test\"  (backslash then quote)
         # After backslash escape: test\\"
         # After quote escape: test\\"
-        assert _escape_applescript_string('test\\"') == 'test\\\\\\"'
+        assert escape_applescript_string('test\\"') == 'test\\\\\\"'
 
     def test_injection_attempt(self):
         """Test that command injection attempts are neutralized."""
         # Classic AppleScript injection: break out of string and execute shell
         malicious = '"; do shell script "rm -rf /"'
-        escaped = _escape_applescript_string(malicious)
+        escaped = escape_applescript_string(malicious)
         # Quotes should be escaped, preventing breakout
         assert '\\"' in escaped
         assert '" do shell script "' not in escaped
 
     def test_empty_string(self):
         """Test empty string passes through."""
-        assert _escape_applescript_string("") == ""
+        assert escape_applescript_string("") == ""
 
     def test_normal_text(self):
         """Test normal text without special chars passes through."""
-        assert _escape_applescript_string("Hello World") == "Hello World"
+        assert escape_applescript_string("Hello World") == "Hello World"
 
     def test_unicode_text(self):
         """Test Unicode characters pass through unchanged."""
-        assert _escape_applescript_string("Hello 世界 🎉") == "Hello 世界 🎉"
+        assert escape_applescript_string("Hello 世界 🎉") == "Hello 世界 🎉"
 
 
 class TestSessionGetProjectName:
@@ -170,18 +177,32 @@ class TestSessionGetProjectName:
         )
         assert session.get_project_name() == "myproject"
 
-    def test_get_project_name_sanitizes_special_chars(self):
-        """Test that special characters are sanitized."""
+    def test_get_project_name_returns_repo_directly(self):
+        """Test that repo field is returned directly (sanitization happens at write time)."""
         session = Session(
             id="test",
             name="test",
             machine="m",
             cwd="/home/user/project",
-            repo="my\nproject\twith\rchars",
+            repo="my-repo",
             registered_at=datetime.now(),
             last_heartbeat=datetime.now(),
         )
-        assert session.get_project_name() == "my project with chars"
+        assert session.get_project_name() == "my-repo"
+
+    def test_get_project_name_fallback_sanitizes(self):
+        """Test that fallback path sanitizes special characters (defense-in-depth)."""
+        session = Session(
+            id="test",
+            name="test",
+            machine="m",
+            cwd="/home/user/project\nwith\tnewlines",
+            repo="",  # Empty repo forces fallback to cwd
+            registered_at=datetime.now(),
+            last_heartbeat=datetime.now(),
+        )
+        # Newlines and tabs should be replaced with spaces
+        assert session.get_project_name() == "project with newlines"
 
 
 class TestIsPidAlive:

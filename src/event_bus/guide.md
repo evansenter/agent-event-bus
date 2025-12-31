@@ -14,10 +14,10 @@ each session is isolated. This MCP server lets sessions:
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, pid?)` | Register yourself, get a session_id |
+| `register_session(name, machine?, cwd?, pid?)` | Register yourself, get a session_id |
 | `list_sessions()` | See all active sessions |
 | `publish_event(type, payload, channel?)` | Send event to a channel |
-| `get_events(since_id?, session_id?)` | Poll for new events |
+| `get_events(since_id?, limit?, session_id?)` | Poll for new events |
 | `unregister_session(session_id)` | Clean up when exiting |
 | `notify(title, message, sound?)` | Send macOS notification to user |
 

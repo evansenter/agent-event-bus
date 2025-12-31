@@ -37,8 +37,17 @@ pytest tests/test_server.py::TestRegisterSession -v
 
 ## Architecture
 
-- `src/event_bus/server.py` - Main MCP server with all tools
-- `src/event_bus/storage.py` - SQLite storage backend
+```
+src/event_bus/
+├── server.py      # MCP tools and server entry point
+├── storage.py     # SQLite storage backend (Session, Event, SQLiteStorage)
+├── helpers.py     # Utility functions (notifications, repo extraction)
+├── middleware.py  # Request logging middleware for dev mode
+├── session_ids.py # Human-readable ID generation (Docker-style names)
+├── cli.py         # CLI wrapper for shell scripts/hooks
+└── guide.md       # Usage guide served as MCP resource
+```
+
 - FastMCP framework for MCP protocol handling
 - Uvicorn for HTTP transport
 
