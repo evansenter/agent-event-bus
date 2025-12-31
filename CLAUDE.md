@@ -94,6 +94,25 @@ publish_event("help", "Review auth.ts?", channel="session:abc123")
 publish_event("api_ready", "API merged", channel="repo:my-project")
 ```
 
+## Event Type Conventions
+
+Use consistent event types for discoverability across sessions.
+
+| Event Type | Description | Example Payload |
+|------------|-------------|-----------------|
+| `rfc_created` | New RFC issue created | `"RFC created: #48 - Event bus integration"` |
+| `rfc_responded` | Response posted to RFC | `"RFC response posted: #48"` |
+| `parallel_work_started` | New worktree/session started | `"Started parallel work: issue-48 - Implement event bus"` |
+| `ci_completed` | CI finished (pass or fail) | `"CI passed on PR #42"` |
+| `message` | Generic message/announcement | `"Auth feature done, you can integrate now"` |
+| `help_needed` | Request for assistance | `"Need review on auth.ts approach"` |
+| `task_completed` | Significant task finished | `"Feature X is done and merged"` |
+
+**Naming conventions:**
+- Use `snake_case` for event types
+- Be specific: `rfc_created` not just `created`
+- Include context in payload: what happened and relevant identifiers (PR#, issue#)
+
 ## Design Decisions
 
 - **Polling over push**: MCP is request/response, so sessions poll with `get_events(since_id)`

@@ -186,3 +186,38 @@ The notification alerts the **human** who routes the message to the correct sess
 - Local sessions with numeric client_ids (PIDs) are cleaned immediately on process death
 - The repo name is auto-detected from your working directory
 - SessionStart hooks can auto-register you on startup
+
+## Event Type Conventions
+
+Use consistent event types across commands and sessions for discoverability.
+
+### Standard Event Types
+
+| Event Type | Description | Example Payload |
+|------------|-------------|-----------------|
+| `rfc_created` | New RFC issue created | `"RFC created: #48 - Event bus integration"` |
+| `rfc_responded` | Response posted to RFC | `"RFC response posted: #48"` |
+| `parallel_work_started` | New worktree/session started | `"Started parallel work: issue-48 - Implement event bus"` |
+| `ci_completed` | CI finished (pass or fail) | `"CI passed on PR #42"` or `"CI failed on PR #42"` |
+| `message` | Generic message/announcement | `"Auth feature done, you can integrate now"` |
+| `help_needed` | Request for assistance | `"Need review on auth.ts approach"` |
+| `task_completed` | Significant task finished | `"Feature X is done and merged"` |
+
+### Naming Conventions
+
+- Use `snake_case` for event types
+- Be specific: `rfc_created` not just `created`
+- Include context in payload: what happened and any relevant identifiers (PR#, issue#)
+- Payloads are automatically JSON-escaped by the MCP layer - special characters are safe
+
+### Examples
+
+```python
+# Good: specific type with context in payload
+publish_event("ci_completed", "CI passed on PR #42", channel="repo:my-project")
+publish_event("rfc_created", "RFC created: #48 - Event bus integration")
+
+# Bad: vague type, no context
+publish_event("done", "finished")
+publish_event("update", "something happened")
+```
