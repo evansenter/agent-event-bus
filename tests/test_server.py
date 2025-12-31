@@ -178,17 +178,22 @@ class TestSessionGetProjectName:
         assert session.get_project_name() == "myproject"
 
     def test_get_project_name_returns_repo_directly(self):
-        """Test that repo field is returned directly (sanitization happens at write time)."""
+        """Test that repo field is returned directly without re-sanitization.
+
+        Uses a value with special chars to prove repo is returned as-is.
+        In practice, repo is sanitized at write time by extract_repo_from_cwd().
+        """
         session = Session(
             id="test",
             name="test",
             machine="m",
             cwd="/home/user/project",
-            repo="my-repo",
+            repo="my\nrepo",  # Special char to prove no re-sanitization
             registered_at=datetime.now(),
             last_heartbeat=datetime.now(),
         )
-        assert session.get_project_name() == "my-repo"
+        # Returns as-is (not "my repo") - sanitization happened at write time
+        assert session.get_project_name() == "my\nrepo"
 
     def test_get_project_name_fallback_sanitizes(self):
         """Test that fallback path sanitizes special characters (defense-in-depth)."""
