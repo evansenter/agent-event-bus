@@ -674,7 +674,6 @@ class TestSessionCursorTracking:
         # First poll
         publish_event("event1", "payload1")
         result1 = get_events(session_id=session_id)
-        cursor1 = server.storage.get_session(session_id).last_cursor
 
         # More events and second poll
         publish_event("event2", "payload2")
