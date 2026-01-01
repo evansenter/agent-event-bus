@@ -58,7 +58,7 @@ notify("Build Complete", "All tests passing", sound=True)
 ### 6. Unregister when done
 ```
 unregister_session(session_id="brave-tiger")
-# Or by client_id (simpler for hooks - no need to persist session_id)
+# Or by client_id (same ID you used when registering)
 unregister_session(client_id="my-unique-id")
 ```
 
@@ -200,15 +200,13 @@ The notification alerts the **human** who routes the message to the correct sess
 ## Tips
 
 - `register_session` returns `cursor` - use it to start polling from the right place
-- Pass `client_id` to enable session resumption across restarts (e.g., CC session ID or PID)
+- Pass `client_id` to enable session resumption across restarts
 - **Cursor auto-tracking**: When you pass `session_id` to `get_events()`, your cursor is auto-saved. On resume, you pick up where you left off!
 - `get_events` and `publish_event` auto-refresh your heartbeat
 - `get_events()` defaults to newest first (`order="desc"`); use `order="asc"` when polling with cursor
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 24 hours of inactivity
-- Local sessions with numeric client_ids (PIDs) are cleaned immediately on process death
 - The repo name is auto-detected from your working directory
-- SessionStart hooks can auto-register you on startup
 
 ## Event Type Conventions
 

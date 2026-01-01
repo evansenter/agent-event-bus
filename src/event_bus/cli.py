@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper for event bus - for use in shell scripts and hooks.
+"""CLI wrapper for event bus - for use in shell scripts and automation.
 
 Usage:
     event-bus-cli register [--name NAME] [--client-id ID]
@@ -11,13 +11,12 @@ Usage:
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
-    # Register session (for SessionStart hook)
+    # Register a session
     event-bus-cli register --name "my-feature" --client-id "abc123"
 
-    # Unregister session (for SessionEnd hook)
+    # Unregister by session_id or client_id
     event-bus-cli unregister --session-id abc123
-    # Or by client_id (simpler for hooks - no need to persist session_id)
-    event-bus-cli unregister --client-id my-client-123
+    event-bus-cli unregister --client-id abc123
 
     # List active sessions
     event-bus-cli sessions
@@ -30,9 +29,6 @@ Examples:
 
     # Get events with JSON output (for scripting)
     event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
-
-    # Use state file for incremental polling (ideal for hooks)
-    event-bus-cli events --track-state ~/.local/state/claude/cursor --json
 
     # Get events in chronological order (oldest first)
     event-bus-cli events --order asc

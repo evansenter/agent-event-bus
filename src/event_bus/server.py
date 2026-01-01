@@ -425,7 +425,7 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
     Returns:
         Success status
 
-    Note: Provide either session_id OR client_id, not both.
+    Note: If both are provided, session_id takes precedence.
     """
     # Look up session by client_id if provided
     if client_id and not session_id:
@@ -437,6 +437,7 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
             dev_notify("unregister_session", f"client_id {client_id} not found")
             return {"error": "Session not found", "client_id": client_id, "machine": machine}
     elif not session_id:
+        dev_notify("unregister_session", "no identifier provided")
         return {"error": "Must provide either session_id or client_id"}
 
     session = storage.get_session(session_id)
