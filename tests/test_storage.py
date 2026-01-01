@@ -335,6 +335,28 @@ class TestEventOperations:
 
         assert storage.get_cursor() == str(event.id)
 
+    def test_get_events_malformed_cursor(self, storage):
+        """Test that malformed cursor is handled gracefully."""
+        # Add some events
+        for i in range(3):
+            storage.add_event(
+                event_type=f"event_{i}",
+                payload=f"payload {i}",
+                session_id="session-123",
+            )
+
+        # Malformed cursor should reset to start (return all events)
+        events, _ = storage.get_events(cursor="not-a-number")
+        assert len(events) == 3
+
+        # Empty cursor works normally
+        events, _ = storage.get_events(cursor="")
+        assert len(events) == 3
+
+        # Valid cursor works normally
+        events, _ = storage.get_events(cursor="1", order="asc")
+        assert len(events) == 2  # Events after id=1
+
 
 class TestEventChannelFiltering:
     """Tests for event channel filtering."""

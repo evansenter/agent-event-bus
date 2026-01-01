@@ -324,7 +324,14 @@ class SQLiteStorage:
             effective_order = "DESC" if order == "desc" else "ASC"
 
             # Decode cursor to event ID (cursor is opaque string encoding an ID)
-            since_id = int(cursor) if cursor else 0
+            # Handle malformed cursors gracefully by resetting to start
+            since_id = 0
+            if cursor:
+                try:
+                    since_id = int(cursor)
+                except ValueError:
+                    logger.warning(f"Malformed cursor '{cursor}', resetting to start")
+                    since_id = 0
 
             # Build WHERE clause based on cursor
             if since_id == 0:
