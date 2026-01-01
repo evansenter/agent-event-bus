@@ -1,13 +1,17 @@
 """Tests for helper functions."""
 
 import os
+import subprocess
 from datetime import datetime
+from unittest.mock import patch
 
 from event_bus.helpers import (
+    dev_notify,
     escape_applescript_string,
     extract_repo_from_cwd,
     is_client_alive,
     sanitize_display_name,
+    send_notification,
 )
 from event_bus.storage import Session
 
@@ -248,3 +252,85 @@ class TestSanitizeDisplayName:
     def test_only_special_chars(self):
         """Test string with only special characters."""
         assert sanitize_display_name("\n\t\r") == "   "
+
+
+class TestDevNotify:
+    """Tests for dev_notify helper."""
+
+    @patch("event_bus.helpers.send_notification")
+    def test_dev_notify_calls_send_notification_in_dev_mode(self, mock_send):
+        """Test that dev_notify calls send_notification when DEV_MODE is set."""
+        with patch.dict(os.environ, {"DEV_MODE": "1"}):
+            dev_notify("test_tool", "test summary")
+            mock_send.assert_called_once_with("🔧 test_tool", "test summary")
+
+    @patch("event_bus.helpers.send_notification")
+    def test_dev_notify_does_not_call_when_not_dev_mode(self, mock_send):
+        """Test that dev_notify does nothing when DEV_MODE is not set."""
+        with patch.dict(os.environ, {}, clear=True):
+            # Ensure DEV_MODE is not set
+            os.environ.pop("DEV_MODE", None)
+            dev_notify("test_tool", "test summary")
+            mock_send.assert_not_called()
+
+
+class TestSendNotificationFailurePaths:
+    """Tests for send_notification failure paths."""
+
+    @patch("event_bus.helpers.platform.system", return_value="Darwin")
+    @patch("event_bus.helpers.shutil.which", return_value="/usr/bin/terminal-notifier")
+    @patch("event_bus.helpers.subprocess.run")
+    def test_subprocess_called_process_error_returns_false(
+        self, mock_run, mock_which, mock_system
+    ):
+        """Test that CalledProcessError is caught and returns False."""
+        error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["terminal-notifier", "-title", "test"],
+        )
+        error.stderr = b"error output"
+        error.stdout = b""
+        mock_run.side_effect = error
+        result = send_notification("Test", "Message")
+        assert result is False
+
+    @patch("event_bus.helpers.platform.system", return_value="Darwin")
+    @patch("event_bus.helpers.shutil.which", return_value="/usr/bin/terminal-notifier")
+    @patch("event_bus.helpers.subprocess.run")
+    @patch("event_bus.helpers.logger")
+    def test_subprocess_error_logs_details(
+        self, mock_logger, mock_run, mock_which, mock_system
+    ):
+        """Test that CalledProcessError logs stderr and stdout."""
+        error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["terminal-notifier"],
+        )
+        error.stderr = b"stderr content"
+        error.stdout = b"stdout content"
+        mock_run.side_effect = error
+        send_notification("Test", "Message")
+        # Verify logger.error was called with appropriate details
+        mock_logger.error.assert_called_once()
+        error_msg = mock_logger.error.call_args[0][0]
+        assert "stderr content" in error_msg
+        assert "stdout content" in error_msg
+
+    @patch("event_bus.helpers.platform.system", return_value="Linux")
+    @patch("event_bus.helpers.shutil.which", return_value=None)
+    @patch("event_bus.helpers.logger")
+    def test_linux_no_notify_send_returns_false(self, mock_logger, mock_which, mock_system):
+        """Test that missing notify-send on Linux returns False and warns."""
+        result = send_notification("Test", "Message")
+        assert result is False
+        mock_logger.warning.assert_called_once()
+        assert "notify-send not found" in mock_logger.warning.call_args[0][0]
+
+    @patch("event_bus.helpers.platform.system", return_value="Windows")
+    @patch("event_bus.helpers.logger")
+    def test_unsupported_platform_returns_false(self, mock_logger, mock_system):
+        """Test that unsupported platform returns False and warns."""
+        result = send_notification("Test", "Message")
+        assert result is False
+        mock_logger.warning.assert_called_once()
+        assert "not supported" in mock_logger.warning.call_args[0][0]

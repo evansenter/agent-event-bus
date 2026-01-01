@@ -974,3 +974,25 @@ class TestChannelValidation:
 
         # Should have logged a warning about invalid format
         assert any("Invalid" in record.message for record in caplog.records)
+
+
+class TestCreateApp:
+    """Tests for create_app factory function."""
+
+    def test_create_app_returns_middleware_wrapped_app(self):
+        """Test that create_app returns app wrapped with RequestLoggingMiddleware."""
+        from event_bus.middleware import RequestLoggingMiddleware
+        from event_bus.server import create_app
+
+        app = create_app()
+        assert isinstance(app, RequestLoggingMiddleware)
+
+    def test_create_app_middleware_wraps_mcp_app(self):
+        """Test that the middleware wraps the MCP http_app."""
+        from event_bus.server import create_app
+
+        app = create_app()
+        # The middleware has an inner 'app' attribute
+        assert hasattr(app, "app")
+        # The inner app should be callable (ASGI app)
+        assert callable(app.app)
