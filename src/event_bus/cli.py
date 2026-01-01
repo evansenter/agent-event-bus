@@ -5,9 +5,11 @@ Usage:
     event-bus-cli register [--name NAME] [--client-id ID]
     event-bus-cli unregister [--session-id ID | --client-id ID]
     event-bus-cli sessions
+    event-bus-cli channels
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
     event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--exclude-types T1,T2]
                          [--timeout MS] [--track-state FILE] [--json] [--order asc|desc]
+                         [--channel CHANNEL]
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -21,6 +23,9 @@ Examples:
     # List active sessions
     event-bus-cli sessions
 
+    # List active channels
+    event-bus-cli channels
+
     # Publish an event
     event-bus-cli publish --type "task_done" --payload "Finished API" --channel "repo:my-project"
 
@@ -32,6 +37,9 @@ Examples:
 
     # Get events in chronological order (oldest first)
     event-bus-cli events --order asc
+
+    # Get events from a specific channel
+    event-bus-cli events --channel "repo:my-project"
 
     # Send notification
     event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -148,7 +156,27 @@ def cmd_sessions(args):
         print(f"  {s['session_id']}  {s['name']}")
         print(f"    repo: {s['repo']}, machine: {s['machine']}")
         print(f"    age: {int(s['age_seconds'])}s, client_id: {s.get('client_id', 'N/A')}")
+        channels = s.get("subscribed_channels", [])
+        if channels:
+            print(f"    channels: {', '.join(channels)}")
         print()
+
+
+def cmd_channels(args):
+    """List active channels."""
+    result = call_tool("list_channels", {}, url=args.url)
+    if not result:
+        print("No active channels")
+        return
+
+    print(f"Active channels ({len(result)}):\n")
+    for ch in result:
+        channel_name = ch.get("channel", "<unknown>")
+        subscriber_count = ch.get("subscribers", 0)
+        print(
+            f"  {channel_name}  ({subscriber_count} subscriber{'s' if subscriber_count != 1 else ''})"
+        )
+    print()
 
 
 def cmd_publish(args):
@@ -185,6 +213,8 @@ def cmd_events(args):
         arguments["limit"] = args.limit
     if args.session_id:
         arguments["session_id"] = args.session_id
+    if args.channel:
+        arguments["channel"] = args.channel
 
     result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
 
@@ -274,6 +304,10 @@ def main():
     p_sessions = subparsers.add_parser("sessions", help="List active sessions")
     p_sessions.set_defaults(func=cmd_sessions)
 
+    # channels
+    p_channels = subparsers.add_parser("channels", help="List active channels")
+    p_channels.set_defaults(func=cmd_channels)
+
     # publish
     p_publish = subparsers.add_parser("publish", help="Publish an event")
     p_publish.add_argument("--type", required=True, help="Event type")
@@ -311,6 +345,10 @@ def main():
         choices=["asc", "desc"],
         default="desc",
         help="Ordering: 'desc' for newest first (default), 'asc' for oldest first",
+    )
+    p_events.add_argument(
+        "--channel",
+        help="Filter to a specific channel (e.g., 'repo:my-project', 'all')",
     )
     p_events.set_defaults(func=cmd_events)
 

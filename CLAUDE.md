@@ -72,9 +72,10 @@ src/event_bus/
 | Tool | Purpose |
 |------|---------|
 | `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + cursor for polling |
-| `list_sessions()` | List active sessions (most recently active first) |
+| `list_sessions()` | List active sessions with their subscribed channels |
+| `list_channels()` | List active channels with subscriber counts |
 | `publish_event(event_type, payload, session_id?, channel?)` | Publish event to channel |
-| `get_events(cursor?, limit?, session_id?, order?)` | Get events (order="desc" by default; use "asc" when polling) |
+| `get_events(cursor?, limit?, session_id?, order?, channel?)` | Get events (with optional channel filter) |
 | `unregister_session(session_id?, client_id?)` | Clean up session on exit (provide either identifier) |
 | `notify(title, message, sound?)` | Send system notification |
 
@@ -95,6 +96,7 @@ The CLI and MCP tools expose the same functionality with consistent naming:
 | `register` | `register_session` | CLI short form, MCP descriptive |
 | `unregister` | `unregister_session` | CLI short form, MCP descriptive |
 | `sessions` | `list_sessions` | Noun (CLI) = verb+noun (MCP) |
+| `channels` | `list_channels` | Noun (CLI) = verb+noun (MCP) |
 | `publish` | `publish_event` | CLI short form, MCP descriptive |
 | `events` | `get_events` | Noun (CLI) = verb+noun (MCP) |
 | `notify` | `notify` | Identical |
@@ -219,8 +221,11 @@ event-bus-cli register --name "my-feature" --client-id "my-client-123"
 event-bus-cli unregister --session-id abc123
 event-bus-cli unregister --client-id "my-client-123"  # Simpler for hooks
 
-# List sessions
+# List sessions (shows subscribed channels)
 event-bus-cli sessions
+
+# List active channels
+event-bus-cli channels
 
 # Publish event
 event-bus-cli publish --type "task_done" --payload "Finished" --channel "repo:my-project"
@@ -240,6 +245,9 @@ event-bus-cli events --track-state ~/.local/state/claude/cursor --json --timeout
 # Poll for new events chronologically (use with cursor)
 event-bus-cli events --cursor abc123 --order asc --session-id mysession
 
+# Filter events to a specific channel
+event-bus-cli events --channel "repo:my-project"
+
 # Send notification
 event-bus-cli notify --title "Done" --message "Build complete"
 ```
@@ -250,6 +258,7 @@ event-bus-cli notify --title "Done" --message "Build complete"
 |--------|-------------|
 | `--cursor ID` | Get events after this cursor (opaque string) |
 | `--session-id ID` | Your session ID for channel filtering |
+| `--channel CHANNEL` | Filter to a specific channel (e.g., `repo:my-project`) |
 | `--limit N` | Maximum events to return |
 | `--exclude-types T1,T2` | Comma-separated event types to filter out |
 | `--timeout MS` | Request timeout in milliseconds (default: 10000) |
