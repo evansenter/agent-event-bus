@@ -261,6 +261,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -294,6 +295,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -316,6 +318,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -352,6 +355,7 @@ class TestCmdEvents:
             json=True,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -380,6 +384,7 @@ class TestCmdEvents:
             json=True,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -431,6 +436,7 @@ class TestCmdEvents:
             json=True,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -458,6 +464,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -479,6 +486,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -516,6 +524,7 @@ class TestCmdEvents:
             json=True,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -552,6 +561,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -587,6 +597,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -611,6 +622,7 @@ class TestCmdEvents:
             json=False,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -648,6 +660,7 @@ class TestCmdEvents:
             json=True,
             url=None,
             order="desc",
+            channel=None,
         )
         cli.cmd_events(args)
 
@@ -776,3 +789,165 @@ class TestMainArgumentParsing:
                 cli.main()
                 # URL is passed to argument parser, verified it doesn't error
                 assert mock_cmd.called
+
+
+class TestCmdChannels:
+    """Tests for channels command."""
+
+    @patch("event_bus.cli.call_tool")
+    def test_channels_empty(self, mock_call, capsys):
+        """Test listing no channels."""
+        mock_call.return_value = []
+
+        args = Namespace(url=None)
+        cli.cmd_channels(args)
+
+        captured = capsys.readouterr()
+        assert "No active channels" in captured.out
+
+    @patch("event_bus.cli.call_tool")
+    def test_channels_list(self, mock_call, capsys):
+        """Test listing channels."""
+        mock_call.return_value = [
+            {"channel": "all", "subscribers": 2},
+            {"channel": "repo:my-repo", "subscribers": 2},
+            {"channel": "session:abc123", "subscribers": 1},
+        ]
+
+        args = Namespace(url=None)
+        cli.cmd_channels(args)
+
+        captured = capsys.readouterr()
+        assert "Active channels (3)" in captured.out
+        assert "all" in captured.out
+        assert "2 subscribers" in captured.out
+        assert "repo:my-repo" in captured.out
+        assert "session:abc123" in captured.out
+        assert "1 subscriber)" in captured.out  # Singular form
+
+    @patch("event_bus.cli.call_tool")
+    def test_channels_calls_list_channels_tool(self, mock_call):
+        """Test that channels command calls list_channels tool."""
+        mock_call.return_value = []
+
+        args = Namespace(url=None)
+        cli.cmd_channels(args)
+
+        mock_call.assert_called_once_with("list_channels", {}, url=None)
+
+
+class TestCmdSessionsWithChannels:
+    """Tests for sessions command with subscribed_channels."""
+
+    @patch("event_bus.cli.call_tool")
+    def test_sessions_shows_channels(self, mock_call, capsys):
+        """Test that sessions command shows subscribed_channels."""
+        mock_call.return_value = [
+            {
+                "session_id": "abc123",
+                "name": "test-session",
+                "repo": "my-repo",
+                "machine": "my-machine",
+                "age_seconds": 120,
+                "client_id": "xyz789",
+                "subscribed_channels": [
+                    "all",
+                    "session:abc123",
+                    "repo:my-repo",
+                    "machine:my-machine",
+                ],
+            }
+        ]
+
+        args = Namespace(url=None)
+        cli.cmd_sessions(args)
+
+        captured = capsys.readouterr()
+        assert "channels: all, session:abc123, repo:my-repo, machine:my-machine" in captured.out
+
+    @patch("event_bus.cli.call_tool")
+    def test_sessions_handles_missing_channels(self, mock_call, capsys):
+        """Test that sessions command handles missing subscribed_channels gracefully."""
+        mock_call.return_value = [
+            {
+                "session_id": "abc123",
+                "name": "test-session",
+                "repo": "my-repo",
+                "machine": "my-machine",
+                "age_seconds": 120,
+                "client_id": "xyz789",
+                # No subscribed_channels field
+            }
+        ]
+
+        args = Namespace(url=None)
+        cli.cmd_sessions(args)
+
+        captured = capsys.readouterr()
+        # Should not crash, just not show channels line
+        assert "abc123" in captured.out
+        assert "channels:" not in captured.out
+
+
+class TestCmdEventsWithChannel:
+    """Tests for events command with channel filter."""
+
+    @patch("event_bus.cli.call_tool")
+    def test_events_with_channel_filter(self, mock_call):
+        """Test events with channel filter."""
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        args = Namespace(
+            cursor=None,
+            session_id=None,
+            limit=None,
+            exclude_types=None,
+            timeout=10000,
+            track_state=None,
+            json=False,
+            url=None,
+            order="desc",
+            channel="repo:my-repo",
+        )
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["channel"] == "repo:my-repo"
+
+    @patch("event_bus.cli.call_tool")
+    def test_events_without_channel_filter(self, mock_call):
+        """Test events without channel filter (default behavior)."""
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        args = Namespace(
+            cursor=None,
+            session_id=None,
+            limit=None,
+            exclude_types=None,
+            timeout=10000,
+            track_state=None,
+            json=False,
+            url=None,
+            order="desc",
+            channel=None,
+        )
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert "channel" not in call_args
+
+    def test_events_channel_parser(self):
+        """Test events --channel argument parsing."""
+        import sys
+
+        with patch.object(
+            sys,
+            "argv",
+            ["cli", "events", "--channel", "repo:my-repo"],
+        ):
+            with patch("event_bus.cli.cmd_events") as mock_cmd:
+                mock_cmd.return_value = None
+                cli.main()
+
+                args = mock_cmd.call_args[0][0]
+                assert args.channel == "repo:my-repo"

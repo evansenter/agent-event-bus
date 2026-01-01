@@ -742,3 +742,151 @@ class TestUnregisterByClientId:
 
         assert result["success"] is True
         assert result["session_id"] == session_id
+
+
+# Access list_channels from FunctionTool wrapper
+list_channels = server.list_channels.fn
+
+
+class TestListChannels:
+    """Tests for list_channels tool."""
+
+    def test_list_channels_empty(self):
+        """Test listing channels when no sessions exist."""
+        result = list_channels()
+        assert result == []
+
+    def test_list_channels_with_sessions(self):
+        """Test listing channels with active sessions."""
+        # Register a session (use remote machine to skip liveness check)
+        register_session(name="test", machine="remote-host", cwd="/test/myrepo")
+
+        result = list_channels()
+
+        # Should have channels: all, session:X, repo:myrepo, machine:remote-host
+        channels = {ch["channel"] for ch in result}
+        assert "all" in channels
+        assert "repo:myrepo" in channels
+        assert "machine:remote-host" in channels
+        # session channel should exist
+        assert any(ch.startswith("session:") for ch in channels)
+
+    def test_list_channels_subscriber_count(self):
+        """Test that subscriber counts are accurate."""
+        # Register two sessions in the same repo
+        register_session(name="s1", machine="remote-host-1", cwd="/test/shared-repo")
+        register_session(name="s2", machine="remote-host-2", cwd="/test/shared-repo")
+
+        result = list_channels()
+        channel_dict = {ch["channel"]: ch["subscribers"] for ch in result}
+
+        # 'all' should have 2 subscribers
+        assert channel_dict["all"] == 2
+        # 'repo:shared-repo' should have 2 subscribers
+        assert channel_dict["repo:shared-repo"] == 2
+        # Each machine channel should have 1 subscriber
+        assert channel_dict["machine:remote-host-1"] == 1
+        assert channel_dict["machine:remote-host-2"] == 1
+
+
+class TestListSessionsSubscribedChannels:
+    """Tests for subscribed_channels in list_sessions response."""
+
+    def test_list_sessions_includes_subscribed_channels(self):
+        """Test that list_sessions includes subscribed_channels field."""
+        reg = register_session(name="test", machine="remote-host", cwd="/test/myrepo")
+        session_id = reg["session_id"]
+
+        result = list_sessions()
+        assert len(result) == 1
+
+        session = result[0]
+        assert "subscribed_channels" in session
+
+        channels = session["subscribed_channels"]
+        assert "all" in channels
+        assert f"session:{session_id}" in channels
+        assert "repo:myrepo" in channels
+        assert "machine:remote-host" in channels
+
+
+class TestGetEventsChannelFilter:
+    """Tests for channel filter in get_events."""
+
+    def test_channel_filter_single_channel(self):
+        """Test filtering events to a specific channel."""
+        # Publish events to different channels
+        publish_event("broadcast", "msg1", channel="all")
+        publish_event("repo_event", "msg2", channel="repo:myrepo")
+        publish_event("other_repo", "msg3", channel="repo:otherrepo")
+
+        # Filter to only repo:myrepo
+        result = get_events(channel="repo:myrepo")
+
+        types = {e["event_type"] for e in result["events"]}
+        assert "repo_event" in types
+        assert "broadcast" not in types
+        assert "other_repo" not in types
+
+    def test_channel_filter_overrides_session_filtering(self):
+        """Test that explicit channel filter overrides session-based filtering."""
+        # Register session with its own repo
+        reg = register_session(name="test", machine="remote-host", cwd="/test/myrepo")
+        session_id = reg["session_id"]
+
+        # Publish to a different repo
+        publish_event("other_repo_event", "msg", channel="repo:different-repo")
+
+        # Without channel filter, shouldn't see it (session filter)
+        result = get_events(session_id=session_id)
+        types = {e["event_type"] for e in result["events"]}
+        assert "other_repo_event" not in types
+
+        # With explicit channel filter, should see it
+        result = get_events(session_id=session_id, channel="repo:different-repo")
+        types = {e["event_type"] for e in result["events"]}
+        assert "other_repo_event" in types
+
+    def test_channel_filter_all(self):
+        """Test filtering to 'all' channel."""
+        # Publish to different channels
+        publish_event("broadcast", "msg1", channel="all")
+        publish_event("targeted", "msg2", channel="repo:somerepo")
+
+        # Filter to only 'all'
+        result = get_events(channel="all")
+
+        types = {e["event_type"] for e in result["events"]}
+        assert "broadcast" in types
+        assert "targeted" not in types
+
+    def test_channel_filter_with_cursor_pagination(self):
+        """Test channel filtering works correctly with cursor pagination."""
+        # Get cursor before publishing to isolate from previous tests
+        initial = get_events()
+        start_cursor = initial["next_cursor"]
+
+        # Publish interleaved events to different channels
+        publish_event("e1", "msg1", channel="repo:pagination-test")
+        publish_event("e2", "msg2", channel="repo:otherrepo")  # Should be filtered
+        publish_event("e3", "msg3", channel="repo:pagination-test")
+        publish_event("e4", "msg4", channel="repo:otherrepo")  # Should be filtered
+        publish_event("e5", "msg5", channel="repo:pagination-test")
+
+        # Get first page with filter, ascending order for predictable pagination
+        result = get_events(
+            channel="repo:pagination-test", cursor=start_cursor, limit=2, order="asc"
+        )
+        types = [e["event_type"] for e in result["events"]]
+        assert types == ["e1", "e3"]
+        assert result["next_cursor"] is not None
+
+        # Continue with cursor - should get remaining filtered events
+        result2 = get_events(
+            channel="repo:pagination-test", cursor=result["next_cursor"], order="asc"
+        )
+        types2 = [e["event_type"] for e in result2["events"]]
+        assert "e5" in types2
+        # Verify filtered events are not present
+        assert "e2" not in types2
+        assert "e4" not in types2

@@ -61,6 +61,43 @@ def _auto_heartbeat(session_id: str | None) -> None:
         storage.update_heartbeat(session_id, datetime.now())
 
 
+def _get_session_channels(session: Session) -> list[str]:
+    """Compute implicit channel subscriptions for a session.
+
+    Sessions are auto-subscribed to channels based on their attributes.
+    """
+    return [
+        "all",  # Broadcasts
+        f"session:{session.id}",  # Direct messages to this session
+        f"repo:{session.repo}",  # Same repo
+        f"machine:{session.machine}",  # Same machine
+    ]
+
+
+def _get_live_sessions() -> list[Session]:
+    """Get live sessions, cleaning up dead ones.
+
+    For local sessions, checks if the client process is still alive.
+    Remote sessions and sessions without client_id are assumed alive.
+
+    Returns:
+        List of sessions that are still alive
+    """
+    storage.cleanup_stale_sessions()
+    local_hostname = socket.gethostname()
+    live = []
+
+    for s in storage.list_sessions():
+        is_local = s.machine == local_hostname
+        if not is_client_alive(s.client_id, is_local):
+            storage.delete_session(s.id)
+            logger.info(f"Cleaned up dead session {s.id} (client_id {s.client_id} not running)")
+            continue
+        live.append(s)
+
+    return live
+
+
 def _notify_dm_recipient(
     channel: str,
     payload: str,
@@ -230,22 +267,9 @@ def list_sessions() -> list[dict]:
     Returns:
         List of active sessions with their info
     """
-    storage.cleanup_stale_sessions()
-
-    local_hostname = socket.gethostname()
     results = []
 
-    for s in storage.list_sessions():
-        # For local sessions, check if client is still alive
-        is_local = s.machine == local_hostname
-        client_alive = is_client_alive(s.client_id, is_local)
-
-        if not client_alive:
-            # Clean up dead session
-            storage.delete_session(s.id)
-            logger.info(f"Cleaned up dead session {s.id} (client_id {s.client_id} not running)")
-            continue
-
+    for s in _get_live_sessions():
         results.append(
             {
                 "session_id": s.id,
@@ -257,10 +281,36 @@ def list_sessions() -> list[dict]:
                 "registered_at": s.registered_at.isoformat(),
                 "last_heartbeat": s.last_heartbeat.isoformat(),
                 "age_seconds": (datetime.now() - s.registered_at).total_seconds(),
+                "subscribed_channels": _get_session_channels(s),
             }
         )
 
     dev_notify("list_sessions", f"{len(results)} active")
+    return results
+
+
+@mcp.tool()
+def list_channels() -> list[dict]:
+    """List active channels on the event bus.
+
+    Shows channels that have at least one current subscriber.
+    Channels are implicit based on session attributes (repo, machine, session_id).
+
+    Returns:
+        List of channels with subscriber counts
+    """
+    channel_subscribers: dict[str, int] = {}
+
+    for s in _get_live_sessions():
+        for ch in _get_session_channels(s):
+            channel_subscribers[ch] = channel_subscribers.get(ch, 0) + 1
+
+    # Build result - only channels with >0 subscribers (all of them at this point)
+    results = [
+        {"channel": ch, "subscribers": count} for ch, count in sorted(channel_subscribers.items())
+    ]
+
+    dev_notify("list_channels", f"{len(results)} active channels")
     return results
 
 
@@ -332,13 +382,7 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     if not session:
         return None  # Session not found, return all events
 
-    # Implicit subscriptions based on session attributes
-    return [
-        "all",  # Broadcasts
-        f"session:{session_id}",  # Direct messages to this session
-        f"repo:{session.repo}",  # Same repo
-        f"machine:{session.machine}",  # Same machine
-    ]
+    return _get_session_channels(session)
 
 
 @mcp.tool()
@@ -347,6 +391,7 @@ def get_events(
     limit: int = 50,
     session_id: str | None = None,
     order: Literal["asc", "desc"] = "desc",
+    channel: str | None = None,
 ) -> dict:
     """Get events from the event bus.
 
@@ -355,6 +400,7 @@ def get_events(
         limit: Maximum number of events to return (default: 50).
         session_id: Your session ID (for auto-heartbeat and channel filtering).
         order: "desc" (newest first, default) or "asc" (oldest first).
+        channel: Filter to a specific channel (overrides session-based filtering).
 
     Returns:
         Dict with "events" list and "next_cursor" for pagination.
@@ -370,14 +416,21 @@ def get_events(
     - "session:{your_id}": Direct messages to you
     - "repo:{your_repo}": Events for your repo
     - "machine:{your_machine}": Events for your machine
+
+    Use the channel parameter to filter to a specific channel instead.
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
 
     storage.cleanup_stale_sessions()
 
-    # Get channels this session is subscribed to
-    channels = _get_implicit_channels(session_id)
+    # Determine channel filtering:
+    # - If explicit channel provided, use only that
+    # - Otherwise, use session's implicit subscriptions
+    if channel:
+        channels = [channel]
+    else:
+        channels = _get_implicit_channels(session_id)
 
     raw_events, next_cursor = storage.get_events(
         cursor=cursor, limit=limit, channels=channels, order=order

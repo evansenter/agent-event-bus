@@ -15,9 +15,10 @@ each session is isolated. This MCP server lets sessions:
 | Tool | Purpose |
 |------|---------|
 | `register_session(name, machine?, cwd?, client_id?)` | Register yourself, get a session_id |
-| `list_sessions()` | See all active sessions |
+| `list_sessions()` | See all active sessions with their subscribed channels |
+| `list_channels()` | See active channels and subscriber counts |
 | `publish_event(type, payload, channel?)` | Send event to a channel |
-| `get_events(cursor?, limit?, session_id?, order?)` | Poll for new events |
+| `get_events(cursor?, limit?, session_id?, order?, channel?)` | Poll for new events |
 | `unregister_session(session_id?, client_id?)` | Clean up when exiting |
 | `notify(title, message, sound?)` | Send macOS notification to user |
 
@@ -33,9 +34,16 @@ Save `session_id` - the cursor is tracked automatically when you pass session_id
 ### 2. Check who else is working
 ```
 list_sessions()
-→ [{name: "auth-feature", ...}, {name: "api-refactor", ...}]
+→ [{name: "auth-feature", subscribed_channels: ["all", "session:brave-tiger", ...], ...}]
 ```
-Sessions are ordered by most recently active first.
+Sessions are ordered by most recently active first. Each session shows its subscribed channels.
+
+### 2b. See active channels
+```
+list_channels()
+→ [{channel: "all", subscribers: 3}, {channel: "repo:my-project", subscribers: 2}, ...]
+```
+Shows all channels with at least one subscriber.
 
 ### 3. Publish events to coordinate
 ```
@@ -75,6 +83,20 @@ Events are published to channels. Sessions auto-subscribe based on their attribu
 
 **Default is `all`**, but prefer `repo:` for most coordination to avoid noise.
 
+### Discovering Channels
+
+Use `list_channels()` to see what channels are active:
+```
+list_channels()
+→ [{channel: "all", subscribers: 2}, {channel: "repo:my-project", subscribers: 2}, ...]
+```
+
+Use `list_sessions()` to see what channels each session is subscribed to:
+```
+list_sessions()
+→ [{name: "auth-feature", subscribed_channels: ["all", "session:abc", "repo:my-project", "machine:laptop"], ...}]
+```
+
 ## Event Polling
 
 `get_events` returns a dict with `events` list and `next_cursor` for pagination:
@@ -111,6 +133,14 @@ Returns events after the cursor, **in chronological order**. Use this for catchi
 ### Order parameter
 - `order="desc"` (default): Newest first - good for "what's happening?"
 - `order="asc"`: Oldest first - good for polling/catching up
+
+### Channel filtering
+Filter events to a specific channel:
+```
+get_events(channel="repo:my-project")
+→ {events: [...], next_cursor: "50"}
+```
+Without `channel`, events are filtered to your session's implicit subscriptions (if `session_id` provided) or all events.
 
 ### Recommended Pattern
 ```python
