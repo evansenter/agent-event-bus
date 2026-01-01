@@ -75,7 +75,7 @@ src/event_bus/
 | `list_sessions()` | List active sessions (most recently active first) |
 | `publish_event(event_type, payload, session_id?, channel?)` | Publish event to channel |
 | `get_events(cursor?, limit?, session_id?, order?)` | Get events (order="desc" by default; use "asc" when polling) |
-| `unregister_session(session_id)` | Clean up session on exit |
+| `unregister_session(session_id?, client_id?)` | Clean up session on exit (provide either identifier) |
 | `notify(title, message, sound?)` | Send system notification |
 
 ## MCP Resources
@@ -215,8 +215,9 @@ For shell scripts and hooks (e.g., CC SessionStart/SessionEnd hooks):
 # Register session
 event-bus-cli register --name "my-feature" --client-id "my-client-123"
 
-# Unregister session
+# Unregister session (by session_id or client_id)
 event-bus-cli unregister --session-id abc123
+event-bus-cli unregister --client-id "my-client-123"  # Simpler for hooks
 
 # List sessions
 event-bus-cli sessions
@@ -230,7 +231,10 @@ event-bus-cli events --session-id abc123
 # Get events with JSON output (for scripting)
 event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
 
-# Get events with automatic state tracking (ideal for hooks)
+# Get events with session_id (cursor auto-tracked in DB - preferred)
+event-bus-cli events --session-id abc123 --cursor "$CURSOR" --order asc
+
+# Legacy: file-based state tracking (use DB tracking instead)
 event-bus-cli events --track-state ~/.local/state/claude/cursor --json --timeout 200
 
 # Poll for new events chronologically (use with cursor)

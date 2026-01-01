@@ -130,11 +130,11 @@ class TestCmdUnregister:
     """Tests for unregister command."""
 
     @patch("event_bus.cli.call_tool")
-    def test_unregister(self, mock_call):
-        """Test unregister session."""
+    def test_unregister_by_session_id(self, mock_call):
+        """Test unregister session by session_id."""
         mock_call.return_value = {"success": True, "session_id": "abc123"}
 
-        args = Namespace(session_id="abc123", url=None)
+        args = Namespace(session_id="abc123", client_id=None, url=None)
         cli.cmd_unregister(args)
 
         mock_call.assert_called_once_with(
@@ -142,6 +142,29 @@ class TestCmdUnregister:
             {"session_id": "abc123"},
             url=None,
         )
+
+    @patch("event_bus.cli.call_tool")
+    def test_unregister_by_client_id(self, mock_call):
+        """Test unregister session by client_id."""
+        mock_call.return_value = {"success": True, "session_id": "abc123"}
+
+        args = Namespace(session_id=None, client_id="my-client-123", url=None)
+        cli.cmd_unregister(args)
+
+        mock_call.assert_called_once_with(
+            "unregister_session",
+            {"client_id": "my-client-123"},
+            url=None,
+        )
+
+    def test_unregister_requires_identifier(self):
+        """Test unregister fails without session_id or client_id."""
+        args = Namespace(session_id=None, client_id=None, url=None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_unregister(args)
+
+        assert exc_info.value.code == 1
 
 
 class TestCmdSessions:

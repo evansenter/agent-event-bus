@@ -3,7 +3,7 @@
 
 Usage:
     event-bus-cli register [--name NAME] [--client-id ID]
-    event-bus-cli unregister --session-id ID
+    event-bus-cli unregister [--session-id ID | --client-id ID]
     event-bus-cli sessions
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
     event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--exclude-types T1,T2]
@@ -16,6 +16,8 @@ Examples:
 
     # Unregister session (for SessionEnd hook)
     event-bus-cli unregister --session-id abc123
+    # Or by client_id (simpler for hooks - no need to persist session_id)
+    event-bus-cli unregister --client-id my-client-123
 
     # List active sessions
     event-bus-cli sessions
@@ -124,7 +126,17 @@ def cmd_register(args):
 
 def cmd_unregister(args):
     """Unregister a session."""
-    result = call_tool("unregister_session", {"session_id": args.session_id}, url=args.url)
+    arguments = {}
+    if args.session_id:
+        arguments["session_id"] = args.session_id
+    if args.client_id:
+        arguments["client_id"] = args.client_id
+
+    if not arguments:
+        print("Error: Must provide --session-id or --client-id", file=sys.stderr)
+        sys.exit(1)
+
+    result = call_tool("unregister_session", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
 
@@ -255,7 +267,11 @@ def main():
 
     # unregister
     p_unregister = subparsers.add_parser("unregister", help="Unregister a session")
-    p_unregister.add_argument("--session-id", required=True, help="Session ID")
+    p_unregister.add_argument("--session-id", help="Session ID")
+    p_unregister.add_argument(
+        "--client-id",
+        help="Client ID (alternative to --session-id, looks up by machine + client_id)",
+    )
     p_unregister.set_defaults(func=cmd_unregister)
 
     # sessions

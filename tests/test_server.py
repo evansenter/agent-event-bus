@@ -694,3 +694,51 @@ class TestSessionCursorTracking:
         # No session should have cursor updated (we can't verify this directly,
         # but we can verify the call doesn't raise)
         # This test mainly ensures the None check works correctly
+
+
+class TestUnregisterByClientId:
+    """Tests for unregister_session with client_id lookup."""
+
+    def test_unregister_by_client_id(self):
+        """Test that sessions can be unregistered by client_id."""
+        # Register a session with client_id
+        reg = register_session(name="test", client_id="test-unregister-123")
+        session_id = reg["session_id"]
+
+        # Verify session exists
+        assert server.storage.get_session(session_id) is not None
+
+        # Unregister by client_id (not session_id)
+        result = unregister_session(client_id="test-unregister-123")
+
+        assert result["success"] is True
+        assert result["session_id"] == session_id
+
+        # Verify session is gone
+        assert server.storage.get_session(session_id) is None
+
+    def test_unregister_by_client_id_not_found(self):
+        """Test error when client_id doesn't match any session."""
+        result = unregister_session(client_id="nonexistent-client")
+
+        assert "error" in result
+        assert result["client_id"] == "nonexistent-client"
+
+    def test_unregister_requires_session_id_or_client_id(self):
+        """Test that unregister requires at least one identifier."""
+        result = unregister_session()
+
+        assert "error" in result
+        assert "Must provide" in result["error"]
+
+    def test_unregister_session_id_takes_precedence(self):
+        """Test that session_id is used if both are provided."""
+        # Register a session
+        reg = register_session(name="test", client_id="test-precedence-123")
+        session_id = reg["session_id"]
+
+        # Unregister with session_id (should work even if client_id is wrong)
+        result = unregister_session(session_id=session_id, client_id="wrong-client")
+
+        assert result["success"] is True
+        assert result["session_id"] == session_id
