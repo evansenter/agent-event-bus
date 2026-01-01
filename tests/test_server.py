@@ -594,3 +594,104 @@ class TestRegisterSessionCursor:
 
         assert "cursor" in result["tip"]
         assert "get_events(cursor=" in result["tip"]
+
+
+class TestSessionCursorTracking:
+    """Tests for session-based cursor tracking (RFC #37)."""
+
+    def test_get_events_persists_cursor(self):
+        """Test that get_events persists cursor when session_id provided."""
+        # Register a session
+        reg = register_session(name="test", machine="remote-host", client_id="test-123")
+        session_id = reg["session_id"]
+
+        # Publish some events
+        publish_event("event1", "payload1")
+        publish_event("event2", "payload2")
+
+        # Get events with session_id - should persist cursor
+        result = get_events(session_id=session_id)
+
+        # Check cursor was persisted
+        session = server.storage.get_session(session_id)
+        assert session.last_cursor is not None
+        assert session.last_cursor == result["next_cursor"]
+
+    def test_resumed_session_gets_last_cursor(self):
+        """Test that resumed sessions get their last_cursor for seamless resume."""
+        # Register initial session
+        reg1 = register_session(name="test", machine="remote-host", client_id="test-456")
+        session_id = reg1["session_id"]
+
+        # Publish events and poll to establish cursor
+        publish_event("event1", "payload1")
+        publish_event("event2", "payload2")
+        get_events(session_id=session_id)
+
+        # Get the saved cursor
+        session = server.storage.get_session(session_id)
+        saved_cursor = session.last_cursor
+
+        # Publish more events
+        publish_event("event3", "payload3")
+        publish_event("event4", "payload4")
+
+        # Resume session (same machine + client_id)
+        reg2 = register_session(name="test-resumed", machine="remote-host", client_id="test-456")
+
+        # Should be same session
+        assert reg2["session_id"] == session_id
+        assert reg2["resumed"] is True
+
+        # Should get the saved cursor, not current position
+        assert reg2["cursor"] == saved_cursor
+
+    def test_resumed_session_without_cursor_falls_back(self):
+        """Test that resumed sessions without last_cursor get current position."""
+        # Register initial session
+        reg1 = register_session(name="test", machine="remote-host", client_id="test-789")
+        session_id = reg1["session_id"]
+
+        # Don't poll (no cursor saved)
+        session = server.storage.get_session(session_id)
+        assert session.last_cursor is None
+
+        # Publish more events
+        publish_event("new_event", "payload")
+
+        # Resume session
+        reg2 = register_session(name="test-resumed", machine="remote-host", client_id="test-789")
+
+        # Should fall back to current position (not None)
+        assert reg2["cursor"] is not None
+
+    def test_cursor_updated_on_each_poll(self):
+        """Test that cursor is updated on each poll."""
+        # Register session
+        reg = register_session(name="test", machine="remote-host", client_id="test-poll")
+        session_id = reg["session_id"]
+
+        # First poll
+        publish_event("event1", "payload1")
+        result1 = get_events(session_id=session_id)
+        cursor1 = server.storage.get_session(session_id).last_cursor
+
+        # More events and second poll
+        publish_event("event2", "payload2")
+        result2 = get_events(session_id=session_id, cursor=result1["next_cursor"], order="asc")
+        cursor2 = server.storage.get_session(session_id).last_cursor
+
+        # Cursor should have been updated
+        assert cursor2 == result2["next_cursor"]
+
+    def test_cursor_not_persisted_without_session_id(self):
+        """Test that cursor is not persisted when no session_id provided."""
+        # Publish events
+        publish_event("event1", "payload1")
+
+        # Get events without session_id
+        get_events()
+
+        # No session should have cursor updated (we can't verify this directly,
+        # but we can verify the call doesn't raise)
+        # This test mainly ensures the None check works correctly

@@ -200,6 +200,7 @@ Use consistent event types for discoverability across sessions.
 - **Polling over push**: MCP is request/response, so sessions poll with `get_events(cursor)`
 - **Session cleanup**: 24-hour heartbeat timeout + client liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
+- **Cursor auto-tracking**: When `session_id` is passed to `get_events()`, the cursor is persisted. On session resume, `register_session()` returns the last cursor - no missed events!
 - **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels

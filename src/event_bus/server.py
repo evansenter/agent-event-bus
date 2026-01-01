@@ -167,6 +167,10 @@ def register_session(
         existing.last_heartbeat = now
         storage.add_session(existing)  # INSERT OR REPLACE
         dev_notify("register_session", f"{name} resumed → {existing.id}")
+
+        # Use session's last_cursor if available (resume where they left off)
+        # Otherwise fall back to current position
+        resume_cursor = existing.last_cursor or storage.get_cursor()
         return {
             "session_id": existing.id,
             "name": name,
@@ -174,9 +178,9 @@ def register_session(
             "cwd": cwd,
             "repo": repo,
             "active_sessions": storage.session_count(),
-            "cursor": storage.get_cursor(),
+            "cursor": resume_cursor,
             "resumed": True,
-            "tip": f"You are '{name}' ({existing.id}). Use cursor to start polling: get_events(cursor=cursor).",
+            "tip": f"You are '{name}' ({existing.id}). Resuming from last seen cursor.",
         }
 
     # Create new session with human-readable ID
@@ -378,6 +382,10 @@ def get_events(
     raw_events, next_cursor = storage.get_events(
         cursor=cursor, limit=limit, channels=channels, order=order
     )
+
+    # Persist cursor for session-based tracking (enables seamless resume)
+    if session_id and next_cursor:
+        storage.update_session_cursor(session_id, next_cursor)
 
     events = [
         {

@@ -28,7 +28,7 @@ each session is isolated. This MCP server lets sessions:
 register_session(name="auth-feature")
 → {session_id: "brave-tiger", cursor: "42", repo: "my-project", ...}
 ```
-Save `session_id` and `cursor` - you'll need them for polling.
+Save `session_id` - the cursor is tracked automatically when you pass session_id to get_events().
 
 ### 2. Check who else is working
 ```
@@ -88,6 +88,10 @@ get_events()
 
 The cursor is an opaque string - don't parse it, just pass the value from `next_cursor` or `register_session`.
 
+### Automatic cursor tracking
+
+When you pass `session_id` to `get_events()`, your cursor position is automatically saved. On session resume (same `client_id`), you get the last cursor you polled with - no missed events!
+
 ### Default order (newest first)
 ```
 get_events()
@@ -108,20 +112,20 @@ Returns events after the cursor, **in chronological order**. Use this for catchi
 
 ### Recommended Pattern
 ```python
-# 1. On session start, get your starting point
-result = register_session(name="my-feature")
+# 1. On session start (or resume), register with client_id
+result = register_session(name="my-feature", client_id="my-unique-id")
 session_id = result["session_id"]
-cursor = result["cursor"]  # Start from here
+cursor = result["cursor"]  # Resume point (auto-tracked on resume)
 
 # 2. Poll periodically for new events (oldest first to process in order)
 result = get_events(cursor=cursor, session_id=session_id, order="asc")
 for event in result["events"]:
     # Process each event
     pass
-cursor = result["next_cursor"]  # Track progress for next poll
+cursor = result["next_cursor"]  # For next poll (also auto-saved!)
 
-# 3. To just peek at recent activity (one-off check)
-recent = get_events()  # Default order is newest first
+# 3. On session resume, your last position is preserved
+# Just call register_session with same client_id - cursor picks up where you left off
 ```
 
 ## Common Patterns
@@ -195,6 +199,7 @@ The notification alerts the **human** who routes the message to the correct sess
 
 - `register_session` returns `cursor` - use it to start polling from the right place
 - Pass `client_id` to enable session resumption across restarts (e.g., CC session ID or PID)
+- **Cursor auto-tracking**: When you pass `session_id` to `get_events()`, your cursor is auto-saved. On resume, you pick up where you left off!
 - `get_events` and `publish_event` auto-refresh your heartbeat
 - `get_events()` defaults to newest first (`order="desc"`); use `order="asc"` when polling with cursor
 - `list_sessions()` returns most recently active sessions first

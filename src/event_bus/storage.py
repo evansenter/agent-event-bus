@@ -41,6 +41,7 @@ class Session:
     registered_at: datetime
     last_heartbeat: datetime
     client_id: str | None = None  # Client identifier for session deduplication
+    last_cursor: str | None = None  # Last seen event cursor for this session
 
     def get_project_name(self) -> str:
         """Get the project name, preferring explicit repo over cwd basename.
@@ -140,9 +141,15 @@ class SQLiteStorage:
                     repo TEXT NOT NULL,
                     registered_at TIMESTAMP NOT NULL,
                     last_heartbeat TIMESTAMP NOT NULL,
-                    client_id TEXT
+                    client_id TEXT,
+                    last_cursor TEXT
                 )
             """)
+            # Add last_cursor column if upgrading from older schema
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN last_cursor TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,8 +186,8 @@ class SQLiteStorage:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions
-                (id, name, machine, cwd, repo, registered_at, last_heartbeat, client_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, machine, cwd, repo, registered_at, last_heartbeat, client_id, last_cursor)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
@@ -191,6 +198,7 @@ class SQLiteStorage:
                     session.registered_at,
                     session.last_heartbeat,
                     session.client_id,
+                    session.last_cursor,
                 ),
             )
 
@@ -220,6 +228,7 @@ class SQLiteStorage:
             registered_at=row["registered_at"],
             last_heartbeat=row["last_heartbeat"],
             client_id=row["client_id"],
+            last_cursor=row["last_cursor"] if "last_cursor" in row.keys() else None,
         )
 
     def get_session(self, session_id: str) -> Session | None:
@@ -247,6 +256,15 @@ class SQLiteStorage:
                 (timestamp, session_id),
             )
             return cursor.rowcount > 0
+
+    def update_session_cursor(self, session_id: str, cursor: str) -> bool:
+        """Update session's last seen cursor. Returns True if session exists."""
+        with self._connect() as conn:
+            result = conn.execute(
+                "UPDATE sessions SET last_cursor = ? WHERE id = ?",
+                (cursor, session_id),
+            )
+            return result.rowcount > 0
 
     def list_sessions(self) -> list[Session]:
         """List all sessions, ordered by most recently active first."""
