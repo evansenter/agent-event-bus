@@ -41,6 +41,7 @@ Code changes require a server restart to take effect:
 
 ```bash
 make restart   # Restarts the LaunchAgent
+make reinstall # Full reinstall + restart (useful after updating dependencies)
 ```
 
 | Change | Restart Needed? |
