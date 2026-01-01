@@ -412,7 +412,7 @@ def get_events(
 
 
 @mcp.tool()
-def unregister_session(session_id: str) -> dict:
+def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
     """Unregister a session from the event bus.
 
     Call this when a Claude session is ending to clean up immediately
@@ -420,10 +420,26 @@ def unregister_session(session_id: str) -> dict:
 
     Args:
         session_id: Your session ID from register_session
+        client_id: Alternative: your client_id (will look up session by machine + client_id)
 
     Returns:
         Success status
+
+    Note: If both are provided, session_id takes precedence.
     """
+    # Look up session by client_id if provided
+    if client_id and not session_id:
+        machine = socket.gethostname()
+        session = storage.find_session_by_client(machine, client_id)
+        if session:
+            session_id = session.id
+        else:
+            dev_notify("unregister_session", f"client_id {client_id} not found")
+            return {"error": "Session not found", "client_id": client_id, "machine": machine}
+    elif not session_id:
+        dev_notify("unregister_session", "no identifier provided")
+        return {"error": "Must provide either session_id or client_id"}
+
     session = storage.get_session(session_id)
     if not session:
         dev_notify("unregister_session", f"{session_id} not found")
