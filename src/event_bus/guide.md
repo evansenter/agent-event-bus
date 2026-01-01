@@ -253,6 +253,14 @@ Use consistent event types across commands and sessions for discoverability.
 | `message` | Generic message/announcement | `"Auth feature done, you can integrate now"` |
 | `help_needed` | Request for assistance | `"Need review on auth.ts approach"` |
 | `task_completed` | Significant task finished | `"Feature X is done and merged"` |
+| `task_started` | Work begun on issue/task | `"Started work on #42 - Add dark mode"` |
+| `gotcha_discovered` | Non-obvious issue found | `"SQLite needs datetime adapters in Python 3.12+"` |
+| `pattern_found` | Useful pattern discovered | `"Use (machine, client_id) as dedup key"` |
+| `test_flaky` | Flaky test identified | `"test_concurrent_writes sometimes fails, safe to retry"` |
+| `workaround_needed` | Temporary fix for known issue | `"Rate limit workaround: batch requests"` |
+| `feedback_addressed` | PR feedback processed | `"Addressed feedback on PR #108: 2 implemented, 1 skipped"` |
+| `error_broadcast` | Repeated failures or rate limits | `"API rate limited - wait 10min"` |
+| `blocker_found` | Blocking issue discovered | `"Main branch CI broken"` |
 
 ### Naming Conventions
 
@@ -261,12 +269,35 @@ Use consistent event types across commands and sessions for discoverability.
 - Include context in payload: what happened and any relevant identifiers (PR#, issue#)
 - Payloads are automatically JSON-escaped by the MCP layer - special characters are safe
 
+### Proactive Publishing
+
+Beyond command-triggered events, proactively publish when you discover something useful:
+
+| When | Event Type | Example |
+|------|------------|---------|
+| Find non-obvious issue | `gotcha_discovered` | `"SQLite needs datetime adapters in Python 3.12+"` |
+| Discover useful pattern | `pattern_found` | `"Use (machine, client_id) as dedup key"` |
+| Identify flaky test | `test_flaky` | `"test_concurrent_writes sometimes fails, safe to retry"` |
+| Use temporary workaround | `workaround_needed` | `"Rate limit workaround: batch requests"` |
+| Complete significant task | `task_completed` | `"Auth refactor done, safe to integrate"` |
+| Hit repeated failures | `error_broadcast` | `"API rate limited - wait 10min before retrying"` |
+| Discover blocking issue | `blocker_found` | `"Main branch broken - CI failing on unrelated commit"` |
+
+**Channel choice:** Use `repo:<name>` for repo-specific discoveries, `machine:<host>` for environment issues.
+
+**When to broadcast errors:**
+- Rate limits - warn others before they hit the same limit
+- Service outages - CI, GitHub API, external services down
+- Main branch broken - tests failing on main, blocking all PRs
+
+**When NOT to publish:** Don't emit events for routine work or one-off errors. Reserve for discoveries that would save another session time.
+
 ### Examples
 
 ```python
 # Good: specific type with context in payload
 publish_event("ci_completed", "CI passed on PR #42", channel="repo:my-project")
-publish_event("rfc_created", "RFC created: #48 - Event bus integration")
+publish_event("gotcha_discovered", "Python 3.12 removed SQLite datetime adapters", channel="repo:my-project")
 
 # Bad: vague type, no context
 publish_event("done", "finished")

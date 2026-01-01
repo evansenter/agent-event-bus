@@ -188,15 +188,26 @@ Use consistent event types for discoverability across sessions.
 | `rfc_created` | New RFC issue created | `"RFC created: #48 - Event bus integration"` |
 | `rfc_responded` | Response posted to RFC | `"RFC response posted: #48"` |
 | `parallel_work_started` | New worktree/session started | `"Started parallel work: issue-48 - Implement event bus"` |
-| `ci_completed` | CI finished (pass or fail) | `"CI passed on PR #42"` |
+| `ci_completed` | CI finished (pass or fail) | `"CI passed on PR #42"` or `"CI failed on PR #42"` |
 | `message` | Generic message/announcement | `"Auth feature done, you can integrate now"` |
 | `help_needed` | Request for assistance | `"Need review on auth.ts approach"` |
 | `task_completed` | Significant task finished | `"Feature X is done and merged"` |
+| `task_started` | Work begun on issue/task | `"Started work on #42 - Add dark mode"` |
+| `gotcha_discovered` | Non-obvious issue found | `"SQLite needs datetime adapters in Python 3.12+"` |
+| `pattern_found` | Useful pattern discovered | `"Use (machine, client_id) as dedup key"` |
+| `test_flaky` | Flaky test identified | `"test_concurrent_writes sometimes fails, safe to retry"` |
+| `workaround_needed` | Temporary fix for known issue | `"Rate limit workaround: batch requests"` |
+| `feedback_addressed` | PR feedback processed | `"Addressed feedback on PR #108: 2 implemented, 1 skipped"` |
+| `error_broadcast` | Repeated failures or rate limits | `"API rate limited - wait 10min"` |
+| `blocker_found` | Blocking issue discovered | `"Main branch CI broken"` |
 
 **Naming conventions:**
 - Use `snake_case` for event types
 - Be specific: `rfc_created` not just `created`
 - Include context in payload: what happened and relevant identifiers (PR#, issue#)
+- Payloads are automatically JSON-escaped by the MCP layer - special characters are safe
+
+**Proactive publishing:** Emit `gotcha_discovered`, `pattern_found`, `test_flaky`, or `workaround_needed` when you find something that would save other sessions time. Use `error_broadcast` or `blocker_found` for issues affecting multiple sessions.
 
 ## Design Decisions
 
