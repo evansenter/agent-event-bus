@@ -394,6 +394,65 @@ class TestGetEventsOrdering:
         # Should return empty list
         assert events == []
 
+    def test_explicit_order_desc_overrides_since_id(self):
+        """Test that order='desc' returns newest first even with since_id>0."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        result1 = publish_event("first", "1")
+        start_id = result1["event_id"]
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # With since_id>0, normally would be ASC, but order='desc' overrides
+        events = get_events(since_id=start_id, order="desc")
+
+        # Should be newest first: third, second (first excluded by since_id)
+        types = [e["event_type"] for e in events]
+        assert "first" not in types
+        assert types.index("third") < types.index("second")
+
+    def test_explicit_order_asc_overrides_since_id_zero(self):
+        """Test that order='asc' returns chronological even with since_id=0."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Get starting point before adding test events
+        start_id = server.storage.get_last_event_id()
+
+        publish_event("first", "1")
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Use since_id to filter to only our test events, with order='asc'
+        events = get_events(since_id=start_id, order="asc")
+
+        # Should be chronological: first, second, third
+        types = [e["event_type"] for e in events]
+        assert types.index("first") < types.index("second")
+        assert types.index("second") < types.index("third")
+
+    def test_order_case_insensitive(self):
+        """Test that order parameter is case insensitive."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Get starting point
+        start_id = server.storage.get_last_event_id()
+
+        publish_event("first", "1")
+        publish_event("second", "2")
+
+        # Test uppercase DESC (using since_id to filter to test events)
+        events = get_events(since_id=start_id, order="DESC")
+        types = [e["event_type"] for e in events]
+        assert types.index("second") < types.index("first")
+
+        # Test mixed case Asc
+        events = get_events(since_id=start_id, order="Asc")
+        types = [e["event_type"] for e in events]
+        assert types.index("first") < types.index("second")
+
 
 class TestUnregisterSession:
     """Tests for unregister_session tool."""

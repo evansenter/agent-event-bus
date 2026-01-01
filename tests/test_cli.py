@@ -237,6 +237,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -266,6 +267,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -287,6 +289,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -319,6 +322,7 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -346,6 +350,7 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -393,6 +398,7 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -419,6 +425,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -439,6 +446,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -472,6 +480,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=True,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -504,6 +513,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -535,6 +545,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -558,6 +569,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 
@@ -591,6 +603,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=True,
             url=None,
+            order=None,
         )
         cli.cmd_events(args)
 

@@ -17,7 +17,7 @@ each session is isolated. This MCP server lets sessions:
 | `register_session(name, machine?, cwd?, client_id?)` | Register yourself, get a session_id |
 | `list_sessions()` | See all active sessions |
 | `publish_event(type, payload, channel?)` | Send event to a channel |
-| `get_events(since_id?, limit?, session_id?)` | Poll for new events |
+| `get_events(since_id?, limit?, session_id?, order?)` | Poll for new events |
 | `unregister_session(session_id)` | Clean up when exiting |
 | `notify(title, message, sound?)` | Send macOS notification to user |
 
@@ -90,6 +90,18 @@ get_events(since_id=42)
 → [{id: 43, ...}, {id: 44, ...}, {id: 45, ...}]  # Chronological (ASC)
 ```
 Returns events after the given ID, **in order**. Use this for catching up.
+
+### Explicit ordering (order parameter)
+```
+# Always get newest first, regardless of since_id
+get_events(since_id=42, order="desc")
+→ [{id: 50, ...}, {id: 49, ...}, {id: 48, ...}]  # Newest first
+
+# Always get chronological order, regardless of since_id
+get_events(order="asc")
+→ [{id: 1, ...}, {id: 2, ...}, {id: 3, ...}]  # Chronological
+```
+Use `order` to override the default behavior when you need consistent ordering.
 
 ### Recommended Pattern
 ```python
@@ -180,7 +192,7 @@ The notification alerts the **human** who routes the message to the correct sess
 - `register_session` returns `last_event_id` - use it to start polling from the right place
 - Pass `client_id` to enable session resumption across restarts (e.g., CC session ID or PID)
 - `get_events` and `publish_event` auto-refresh your heartbeat
-- `get_events()` with no since_id returns newest first; with since_id returns chronological
+- `get_events()` with no since_id returns newest first; with since_id returns chronological; use `order` to override
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 24 hours of inactivity
 - Local sessions with numeric client_ids (PIDs) are cleaned immediately on process death

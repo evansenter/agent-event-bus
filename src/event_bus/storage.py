@@ -305,28 +305,37 @@ class SQLiteStorage:
         since_id: int = 0,
         limit: int = 50,
         channels: list[str] | None = None,
+        order: str | None = None,
     ) -> list[Event]:
-        """Get events, with ordering based on since_id.
+        """Get events, with ordering based on since_id or explicit order parameter.
 
-        Ordering behavior:
+        Ordering behavior (when order is None):
         - since_id=0: Returns newest events first (DESC) - for "what's new?" queries
         - since_id>0: Returns events after that ID in order (ASC) - for polling
+
+        When order is explicitly set to "asc" or "desc", that ordering is used
+        regardless of since_id value.
 
         Args:
             since_id: Return events with ID greater than this (0 = recent activity)
             limit: Maximum number of events to return
             channels: Optional list of channels to filter by (None = all events)
+            order: Explicit ordering ("asc" or "desc"). If None, inferred from since_id.
         """
         with self._connect() as conn:
-            # Determine ordering based on use case:
-            # - since_id=0: "What's happening?" → newest first (DESC)
-            # - since_id>0: "Catch me up from X" → in order (ASC)
+            # Determine ordering: explicit order takes precedence, otherwise infer from since_id
+            if order is not None:
+                effective_order = "DESC" if order.lower() == "desc" else "ASC"
+            elif since_id == 0:
+                effective_order = "DESC"
+            else:
+                effective_order = "ASC"
+
+            # Build WHERE clause based on since_id
             if since_id == 0:
-                order = "DESC"
                 where_clause = ""
                 params_base: tuple = ()
             else:
-                order = "ASC"
                 where_clause = "WHERE id > ?"
                 params_base = (since_id,)
 
@@ -344,7 +353,7 @@ class SQLiteStorage:
             query = f"""
                 SELECT * FROM events
                 {where_clause}
-                ORDER BY id {order}
+                ORDER BY id {effective_order}
                 LIMIT ?
             """
             rows = conn.execute(query, params).fetchall()

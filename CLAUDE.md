@@ -58,7 +58,7 @@ src/event_bus/
 | `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + last_event_id for polling |
 | `list_sessions()` | List active sessions (most recently active first) |
 | `publish_event(type, payload, session_id?, channel?)` | Publish event to channel |
-| `get_events(since_id?, limit?, session_id?)` | Get events (since_id=0: newest first; >0: chronological) |
+| `get_events(since_id?, limit?, session_id?, order?)` | Get events (since_id=0: newest first; >0: chronological; order overrides) |
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
 
@@ -150,6 +150,10 @@ event-bus-cli events --json --limit 10 --exclude-types session_registered,sessio
 # Get events with automatic state tracking (ideal for hooks)
 event-bus-cli events --track-state ~/.local/state/claude/last_event_id --json --timeout 200
 
+# Explicit ordering control (overrides since_id behavior)
+event-bus-cli events --order desc --limit 10  # Always newest first
+event-bus-cli events --order asc --since 42   # Always chronological
+
 # Send notification
 event-bus-cli notify --title "Done" --message "Build complete"
 ```
@@ -165,6 +169,7 @@ event-bus-cli notify --title "Done" --message "Build complete"
 | `--timeout MS` | Request timeout in milliseconds (default: 10000) |
 | `--track-state FILE` | Read/write last event ID for incremental polling |
 | `--json` | Output as JSON with `events` array and `last_id` |
+| `--order asc\|desc` | Explicit ordering (overrides since_id behavior) |
 
 ## Configuration
 

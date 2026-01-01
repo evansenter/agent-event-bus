@@ -337,17 +337,27 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
 
 
 @mcp.tool()
-def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None) -> list[dict]:
+def get_events(
+    since_id: int = 0,
+    limit: int = 50,
+    session_id: str | None = None,
+    order: str | None = None,
+) -> list[dict]:
     """Get events from the event bus.
 
-    Ordering behavior (important!):
+    Ordering behavior (when order is not specified):
     - since_id=0: Returns newest events first (DESC) - "What's happening?"
     - since_id>0: Returns events after that ID in order (ASC) - for polling
+
+    Use the order parameter to override this behavior:
+    - order="desc": Always return newest events first (useful for "recent activity")
+    - order="asc": Always return oldest events first (useful for chronological processing)
 
     Typical usage:
     1. On session start, get last_event_id from register_session()
     2. Poll with get_events(since_id=last_event_id) to get new events in order
     3. Use get_events() (no since_id) to see recent activity
+    4. Use get_events(order="desc") to always get newest first regardless of since_id
 
     Events are filtered to channels the session is subscribed to:
     - "all": Broadcasts (everyone receives)
@@ -359,9 +369,10 @@ def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None
         since_id: Event ID to start from (0 = recent activity, >0 = poll from that point)
         limit: Maximum number of events to return (default: 50)
         session_id: Your session ID (for auto-heartbeat and channel filtering)
+        order: Explicit ordering ("asc" or "desc"). If not set, inferred from since_id.
 
     Returns:
-        List of events (newest first if since_id=0, chronological if since_id>0)
+        List of events (newest first if since_id=0 or order="desc", chronological otherwise)
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
@@ -380,7 +391,7 @@ def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None
             "timestamp": e.timestamp.isoformat(),
             "channel": e.channel,
         }
-        for e in storage.get_events(since_id=since_id, limit=limit, channels=channels)
+        for e in storage.get_events(since_id=since_id, limit=limit, channels=channels, order=order)
     ]
     dev_notify("get_events", f"{len(events)} events (since {since_id})")
     return events

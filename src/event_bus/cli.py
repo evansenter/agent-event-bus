@@ -7,7 +7,7 @@ Usage:
     event-bus-cli sessions
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
     event-bus-cli events [--since ID] [--session-id ID] [--limit N] [--exclude-types T1,T2]
-                         [--timeout MS] [--track-state FILE] [--json]
+                         [--timeout MS] [--track-state FILE] [--json] [--order asc|desc]
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -173,6 +173,10 @@ def cmd_events(args):
     if args.session_id:
         arguments["session_id"] = args.session_id
 
+    # Handle explicit --order parameter
+    if args.order:
+        arguments["order"] = args.order
+
     result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
     if not result:
         if args.json:
@@ -296,6 +300,11 @@ def main():
         "--json",
         action="store_true",
         help="Output as JSON with events array and last_id",
+    )
+    p_events.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        help="Explicit ordering: 'desc' for newest first, 'asc' for oldest first",
     )
     p_events.set_defaults(func=cmd_events)
 
