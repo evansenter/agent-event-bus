@@ -454,10 +454,11 @@ def get_events(
     # Note: Updates on any poll, not just when cursor is provided. This is intentional -
     # any poll means the session has "seen" events up to this point, regardless of
     # whether they started from a specific cursor or checked recent activity.
-    # Silently ignore unknown session_ids - callers may pass external session IDs
+    # Log at DEBUG level for unknown session_ids - callers may pass external session IDs
     # (like Claude Code's own UUIDs) that aren't registered with us.
     if session_id and next_cursor:
-        storage.update_session_cursor(session_id, next_cursor)
+        if not storage.update_session_cursor(session_id, next_cursor):
+            logger.debug(f"Cursor update skipped for unregistered session: {session_id}")
 
     events = [
         {

@@ -46,11 +46,15 @@ def _format_result(result: dict, colorize: bool = True) -> str:
         result: The MCP result dict to format
         colorize: Whether to add ANSI color codes (default: True)
     """
-    c = (
-        Colors
-        if colorize
-        else type("NoColors", (), {k: "" for k in dir(Colors) if not k.startswith("_")})()
-    )
+    # Use Colors for ANSI output, or NoColors (empty strings) for plain text
+    class NoColors:
+        """Empty color codes for non-colorized output."""
+
+        RESET = BOLD = DIM = ""
+        GREEN = YELLOW = BLUE = MAGENTA = CYAN = RED = ""
+        BRIGHT_GREEN = BRIGHT_YELLOW = BRIGHT_RED = ""
+
+    c = Colors if colorize else NoColors
 
     # Extract just the useful part from MCP result structure
     # FastMCP returns: {"content": [...], "structuredContent": {...}, "isError": ...}

@@ -908,29 +908,6 @@ class TestUsageGuide:
         # Should contain markdown-like content (headers, etc.)
         assert "#" in content
 
-    def test_usage_guide_fallback_on_missing_file(self, tmp_path, monkeypatch):
-        """Test that usage_guide returns fallback when guide.md is missing."""
-        from pathlib import Path
-
-        # Make the guide path point to a non-existent file
-        fake_parent = tmp_path / "nonexistent"
-        monkeypatch.setattr(
-            "event_bus.server.Path",
-            lambda x: fake_parent / "guide.md" if "guide.md" in str(x) else Path(x),
-        )
-
-        # Test the fallback logic by simulating what happens when guide.md is missing
-        def patched_usage_guide():
-            guide_path = tmp_path / "nonexistent" / "guide.md"
-            try:
-                return guide_path.read_text()
-            except FileNotFoundError:
-                return "# Event Bus Usage Guide\n\nGuide file not found. See CLAUDE.md for usage."
-
-        content = patched_usage_guide()
-        assert "Guide file not found" in content
-        assert "CLAUDE.md" in content
-
 
 class TestChannelValidation:
     """Tests for channel format validation in publish_event."""
