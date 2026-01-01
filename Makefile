@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test clean install uninstall dev venv restart
+.PHONY: check fmt lint test clean install uninstall dev venv restart reinstall
 
 # Run all quality gates (format check, lint, tests)
 check: fmt lint test
@@ -78,3 +78,6 @@ restart:
 	@sleep 1
 	@launchctl start com.evansenter.claude-event-bus
 	@echo "Done. Server restarted."
+
+# Reinstall and restart (install + restart in one command)
+reinstall: install restart
