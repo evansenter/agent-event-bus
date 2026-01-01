@@ -259,8 +259,10 @@ class TestGetEvents:
     def test_get_events_empty(self):
         """Test getting events when none exist."""
         result = get_events()
-        # May have session_registered event from other tests, so just check it returns a list
-        assert isinstance(result, list)
+        # Returns dict with events and next_cursor
+        assert isinstance(result, dict)
+        assert "events" in result
+        assert "next_cursor" in result
 
     def test_get_events(self):
         """Test getting events."""
@@ -271,19 +273,19 @@ class TestGetEvents:
         publish_event("event2", "payload2")
 
         result = get_events()
-        assert len(result) >= 2
+        assert len(result["events"]) >= 2
 
-    def test_get_events_since_id(self):
-        """Test getting events since a given ID."""
+    def test_get_events_with_cursor(self):
+        """Test getting events after a given cursor."""
         # Publish some events
         result1 = publish_event("event1", "payload1")
         publish_event("event2", "payload2")
         publish_event("event3", "payload3")
 
-        # Get events since event1
-        events = get_events(since_id=result1["event_id"])
+        # Get events after event1 (using cursor, oldest first)
+        result = get_events(cursor=str(result1["event_id"]), order="asc")
 
-        types = [e["event_type"] for e in events]
+        types = [e["event_type"] for e in result["events"]]
         assert "event2" in types
         assert "event3" in types
 
@@ -301,9 +303,9 @@ class TestGetEvents:
         publish_event("other_repo", "msg5", channel="repo:other-repo")
 
         # Get events for this session
-        events = get_events(session_id=session_id)
+        result = get_events(session_id=session_id)
 
-        types = {e["event_type"] for e in events}
+        types = {e["event_type"] for e in result["events"]}
         assert "broadcast" in types
         assert "for_me" in types
         assert "my_repo" in types
@@ -314,42 +316,51 @@ class TestGetEvents:
 class TestGetEventsOrdering:
     """Tests for get_events ordering behavior."""
 
-    def test_since_id_zero_returns_newest_first(self):
-        """Test that since_id=0 returns events newest first (DESC)."""
-        # Clear storage and publish events in order
+    def test_default_order_is_desc(self):
+        """Test that default order is DESC (newest first)."""
+        # Clear storage
         server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
 
         publish_event("first", "1")
         publish_event("second", "2")
         publish_event("third", "3")
 
-        # Get events with since_id=0 (default)
-        events = get_events(since_id=0)
-
-        # Should be newest first: third, second, first
-        types = [e["event_type"] for e in events]
+        # Default order should be DESC (newest first)
+        result = get_events()
+        types = [e["event_type"] for e in result["events"]]
         assert types.index("third") < types.index("second")
         assert types.index("second") < types.index("first")
 
-    def test_since_id_positive_returns_chronological(self):
-        """Test that since_id>0 returns events in chronological order (ASC)."""
+    def test_explicit_order_desc(self):
+        """Test that order='desc' returns newest first."""
         # Clear storage
         server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
 
-        # Publish first event to get a starting point
-        result1 = publish_event("first", "1")
-        start_id = result1["event_id"]
-
-        # Publish more events
+        publish_event("first", "1")
         publish_event("second", "2")
         publish_event("third", "3")
 
-        # Get events since start_id
-        events = get_events(since_id=start_id)
+        result = get_events(order="desc")
+        types = [e["event_type"] for e in result["events"]]
+        assert types.index("third") < types.index("second")
+        assert types.index("second") < types.index("first")
 
-        # Should be chronological: second, third (first is excluded by since_id)
-        types = [e["event_type"] for e in events]
-        assert "first" not in types  # Excluded by since_id
+    def test_explicit_order_asc(self):
+        """Test that order='asc' returns oldest first."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Get cursor before our test events
+        cursor = server.storage.get_cursor()
+
+        publish_event("first", "1")
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Use cursor to filter to only our test events
+        result = get_events(cursor=cursor, order="asc") if cursor else get_events(order="asc")
+        types = [e["event_type"] for e in result["events"]]
+        assert types.index("first") < types.index("second")
         assert types.index("second") < types.index("third")
 
     def test_polling_pattern_works(self):
@@ -362,37 +373,73 @@ class TestGetEventsOrdering:
 
         # Register session (simulates session start)
         reg = register_session(name="test", machine="test", cwd="/test")
-        last_seen = reg["last_event_id"]
+        cursor = reg["cursor"]
 
         # Publish new events after registration
         publish_event("after_registration_1", "1")
         publish_event("after_registration_2", "2")
 
-        # Poll for new events using last_event_id from registration
-        events = get_events(since_id=last_seen)
+        # Poll for new events using cursor from registration (oldest first for polling)
+        result = get_events(cursor=cursor, order="asc")
 
         # Should only get events AFTER registration, in chronological order
-        types = [e["event_type"] for e in events]
+        types = [e["event_type"] for e in result["events"]]
         assert "before_registration" not in types
         assert "after_registration_1" in types
         assert "after_registration_2" in types
         # Chronological order
         assert types.index("after_registration_1") < types.index("after_registration_2")
 
-    def test_since_id_future_returns_empty(self):
-        """Test that since_id beyond current events returns empty list."""
+    def test_cursor_with_order_desc(self):
+        """Test using cursor with order='desc'."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        result1 = publish_event("first", "1")
+        cursor = str(result1["event_id"])
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Get events after cursor, newest first
+        result = get_events(cursor=cursor, order="desc")
+        types = [e["event_type"] for e in result["events"]]
+
+        # Should only have events after cursor, in DESC order
+        assert "first" not in types
+        assert types.index("third") < types.index("second")
+
+    def test_cursor_with_order_asc(self):
+        """Test using cursor with order='asc'."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        result1 = publish_event("first", "1")
+        cursor = str(result1["event_id"])
+        publish_event("second", "2")
+        publish_event("third", "3")
+
+        # Get events after cursor, oldest first
+        result = get_events(cursor=cursor, order="asc")
+        types = [e["event_type"] for e in result["events"]]
+
+        # Should only have events after cursor, in ASC order
+        assert "first" not in types
+        assert types.index("second") < types.index("third")
+
+    def test_future_cursor_returns_empty(self):
+        """Test that cursor beyond current events returns empty list."""
         # Clear storage
         server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
 
         # Publish some events
         result = publish_event("test", "payload")
-        last_id = result["event_id"]
+        future_cursor = str(result["event_id"] + 1000)
 
-        # Query with a future ID that doesn't exist yet
-        events = get_events(since_id=last_id + 1000)
+        # Query with a future cursor
+        result = get_events(cursor=future_cursor)
 
         # Should return empty list
-        assert events == []
+        assert result["events"] == []
 
 
 class TestUnregisterSession:
@@ -420,12 +467,12 @@ class TestUnregisterSession:
         """Test that unregistering publishes an event."""
         reg = register_session(name="test-session")
         session_id = reg["session_id"]
-        last_event_id = server.storage.get_last_event_id()
+        cursor = server.storage.get_cursor()
 
         unregister_session(session_id)
 
         # Check for unregister event
-        events = server.storage.get_events(since_id=last_event_id)
+        events, _ = server.storage.get_events(cursor=cursor, order="asc")
         event_types = [e.event_type for e in events]
         assert "session_unregistered" in event_types
 
@@ -508,26 +555,26 @@ class TestRegisterSessionTip:
         assert result["session_id"] in result["tip"]
 
 
-class TestRegisterSessionLastEventId:
-    """Tests for last_event_id in register_session response."""
+class TestRegisterSessionCursor:
+    """Tests for cursor in register_session response."""
 
-    def test_new_session_includes_last_event_id(self):
-        """Test that new session registration includes last_event_id."""
+    def test_new_session_includes_cursor(self):
+        """Test that new session registration includes cursor."""
         result = register_session(name="test-session", machine="test-machine", cwd="/test")
 
-        assert "last_event_id" in result
-        assert isinstance(result["last_event_id"], int)
+        assert "cursor" in result
+        assert isinstance(result["cursor"], str)
 
-    def test_resumed_session_includes_last_event_id(self):
-        """Test that resumed session includes last_event_id."""
+    def test_resumed_session_includes_cursor(self):
+        """Test that resumed session includes cursor."""
         register_session(name="original", machine="test", cwd="/test", client_id="12345")
         result = register_session(name="resumed", machine="test", cwd="/test", client_id="12345")
 
-        assert "last_event_id" in result
-        assert isinstance(result["last_event_id"], int)
+        assert "cursor" in result
+        assert isinstance(result["cursor"], str)
 
-    def test_last_event_id_reflects_current_state(self):
-        """Test that last_event_id reflects current event state."""
+    def test_cursor_reflects_current_state(self):
+        """Test that cursor reflects current event state."""
         # Publish some events before registration
         publish_event("pre_event1", "payload1")
         result1 = publish_event("pre_event2", "payload2")
@@ -536,14 +583,14 @@ class TestRegisterSessionLastEventId:
         # Register session - note that registration itself publishes a session_registered event
         reg_result = register_session(name="test", machine="test", cwd="/test")
 
-        # last_event_id should be >= the pre-registration event (registration adds one more event)
-        assert reg_result["last_event_id"] > before_registration_id
+        # cursor should be > the pre-registration event (registration adds one more event)
+        assert int(reg_result["cursor"]) > before_registration_id
         # And specifically, it should be exactly 1 more (the session_registered event)
-        assert reg_result["last_event_id"] == before_registration_id + 1
+        assert int(reg_result["cursor"]) == before_registration_id + 1
 
-    def test_last_event_id_in_tip(self):
-        """Test that tip mentions last_event_id for polling."""
+    def test_cursor_in_tip(self):
+        """Test that tip mentions cursor for polling."""
         result = register_session(name="test", machine="test", cwd="/test")
 
-        assert "last_event_id" in result["tip"]
-        assert "since_id" in result["tip"]
+        assert "cursor" in result["tip"]
+        assert "get_events(cursor=" in result["tip"]

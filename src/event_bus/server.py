@@ -14,6 +14,7 @@ import os
 import socket
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 
@@ -144,7 +145,7 @@ def register_session(
         client_id: Client identifier for session deduplication (e.g., CC session ID or PID)
 
     Returns:
-        Session info including assigned session_id and last_event_id for polling
+        Session info including assigned session_id and cursor for polling
 
     Tip: Read the resource at event-bus://guide for usage patterns and best practices.
     """
@@ -173,9 +174,9 @@ def register_session(
             "cwd": cwd,
             "repo": repo,
             "active_sessions": storage.session_count(),
-            "last_event_id": storage.get_last_event_id(),
+            "cursor": storage.get_cursor(),
             "resumed": True,
-            "tip": f"You are '{name}' ({existing.id}). Use last_event_id to start polling: get_events(since_id=last_event_id).",
+            "tip": f"You are '{name}' ({existing.id}). Use cursor to start polling: get_events(cursor=cursor).",
         }
 
     # Create new session with human-readable ID
@@ -207,9 +208,9 @@ def register_session(
         "cwd": cwd,
         "repo": repo,
         "active_sessions": storage.session_count(),
-        "last_event_id": registration_event.id,
+        "cursor": str(registration_event.id),
         "resumed": False,
-        "tip": f"You are '{name}' ({session_id}). Use last_event_id to start polling: get_events(since_id=last_event_id).",
+        "tip": f"You are '{name}' ({session_id}). Use cursor to start polling: get_events(cursor=cursor).",
     }
     dev_notify("register_session", f"{name} → {session_id}")
     return result
@@ -337,31 +338,34 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
 
 
 @mcp.tool()
-def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None) -> list[dict]:
+def get_events(
+    cursor: str | None = None,
+    limit: int = 50,
+    session_id: str | None = None,
+    order: Literal["asc", "desc"] = "desc",
+) -> dict:
     """Get events from the event bus.
 
-    Ordering behavior (important!):
-    - since_id=0: Returns newest events first (DESC) - "What's happening?"
-    - since_id>0: Returns events after that ID in order (ASC) - for polling
+    Args:
+        cursor: Position from previous call or register_session. None = recent activity.
+        limit: Maximum number of events to return (default: 50).
+        session_id: Your session ID (for auto-heartbeat and channel filtering).
+        order: "desc" (newest first, default) or "asc" (oldest first).
+
+    Returns:
+        Dict with "events" list and "next_cursor" for pagination.
 
     Typical usage:
-    1. On session start, get last_event_id from register_session()
-    2. Poll with get_events(since_id=last_event_id) to get new events in order
-    3. Use get_events() (no since_id) to see recent activity
+    1. On session start, get cursor from register_session()
+    2. Poll with get_events(cursor=cursor) to get events
+    3. Use next_cursor from response for subsequent calls
+    4. Use get_events() (no cursor) to see recent activity
 
     Events are filtered to channels the session is subscribed to:
     - "all": Broadcasts (everyone receives)
     - "session:{your_id}": Direct messages to you
     - "repo:{your_repo}": Events for your repo
     - "machine:{your_machine}": Events for your machine
-
-    Args:
-        since_id: Event ID to start from (0 = recent activity, >0 = poll from that point)
-        limit: Maximum number of events to return (default: 50)
-        session_id: Your session ID (for auto-heartbeat and channel filtering)
-
-    Returns:
-        List of events (newest first if since_id=0, chronological if since_id>0)
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
@@ -370,6 +374,10 @@ def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None
 
     # Get channels this session is subscribed to
     channels = _get_implicit_channels(session_id)
+
+    raw_events, next_cursor = storage.get_events(
+        cursor=cursor, limit=limit, channels=channels, order=order
+    )
 
     events = [
         {
@@ -380,10 +388,15 @@ def get_events(since_id: int = 0, limit: int = 50, session_id: str | None = None
             "timestamp": e.timestamp.isoformat(),
             "channel": e.channel,
         }
-        for e in storage.get_events(since_id=since_id, limit=limit, channels=channels)
+        for e in raw_events
     ]
-    dev_notify("get_events", f"{len(events)} events (since {since_id})")
-    return events
+
+    dev_notify("get_events", f"{len(events)} events (cursor={cursor})")
+
+    return {
+        "events": events,
+        "next_cursor": next_cursor,
+    }
 
 
 @mcp.tool()

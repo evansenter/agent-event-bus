@@ -289,11 +289,12 @@ class TestEventOperations:
                 session_id="session-123",
             )
 
-        events = storage.get_events()
+        events, next_cursor = storage.get_events()
         assert len(events) == 5
+        assert next_cursor is not None
 
-    def test_get_events_since_id(self, storage):
-        """Test retrieving events since a given ID."""
+    def test_get_events_with_cursor(self, storage):
+        """Test retrieving events after a given cursor."""
         event_ids = []
         for i in range(5):
             event = storage.add_event(
@@ -303,8 +304,8 @@ class TestEventOperations:
             )
             event_ids.append(event.id)
 
-        # Get events after the third one
-        events = storage.get_events(since_id=event_ids[2])
+        # Get events after the third one (cursor is string)
+        events, next_cursor = storage.get_events(cursor=str(event_ids[2]), order="asc")
         assert len(events) == 2
         assert events[0].event_type == "event_3"
         assert events[1].event_type == "event_4"
@@ -318,12 +319,12 @@ class TestEventOperations:
                 session_id="session-123",
             )
 
-        events = storage.get_events(limit=3)
+        events, next_cursor = storage.get_events(limit=3)
         assert len(events) == 3
 
-    def test_get_last_event_id(self, storage):
-        """Test getting the last event ID."""
-        assert storage.get_last_event_id() == 0
+    def test_get_cursor(self, storage):
+        """Test getting the cursor for the most recent event."""
+        assert storage.get_cursor() is None
 
         for i in range(3):
             event = storage.add_event(
@@ -332,7 +333,29 @@ class TestEventOperations:
                 session_id="session-123",
             )
 
-        assert storage.get_last_event_id() == event.id
+        assert storage.get_cursor() == str(event.id)
+
+    def test_get_events_malformed_cursor(self, storage):
+        """Test that malformed cursor is handled gracefully."""
+        # Add some events
+        for i in range(3):
+            storage.add_event(
+                event_type=f"event_{i}",
+                payload=f"payload {i}",
+                session_id="session-123",
+            )
+
+        # Malformed cursor should reset to start (return all events)
+        events, _ = storage.get_events(cursor="not-a-number")
+        assert len(events) == 3
+
+        # Empty cursor works normally
+        events, _ = storage.get_events(cursor="")
+        assert len(events) == 3
+
+        # Valid cursor works normally
+        events, _ = storage.get_events(cursor="1", order="asc")
+        assert len(events) == 2  # Events after id=1
 
 
 class TestEventChannelFiltering:
@@ -348,7 +371,7 @@ class TestEventChannelFiltering:
         storage.add_event("other", "msg5", "s1", channel="session:xyz")
 
         # Filter for specific channels
-        events = storage.get_events(channels=["all", "session:abc", "repo:myrepo"])
+        events, _ = storage.get_events(channels=["all", "session:abc", "repo:myrepo"])
         assert len(events) == 3
         types = {e.event_type for e in events}
         assert types == {"broadcast", "direct", "repo"}
@@ -360,7 +383,7 @@ class TestEventChannelFiltering:
         storage.add_event("e3", "msg3", "s1", channel="repo:myrepo")
 
         # No channel filter = all events
-        events = storage.get_events(channels=None)
+        events, _ = storage.get_events(channels=None)
         assert len(events) == 3
 
 
@@ -409,7 +432,7 @@ class TestDatabaseInitialization:
             channel="repo:myrepo",
         )
 
-        events = storage.get_events()
+        events, _ = storage.get_events()
         assert len(events) == 1
         assert events[0].channel == "repo:myrepo"
 

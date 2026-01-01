@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test clean install uninstall dev venv
+.PHONY: check fmt lint test clean install uninstall dev venv restart
 
 # Run all quality gates (format check, lint, tests)
 check: fmt lint test
@@ -70,3 +70,11 @@ uninstall:
 	@echo ""
 	@echo "Uninstall complete!"
 	@echo "Note: venv and source code remain in place."
+
+# Restart the server (reload code changes)
+restart:
+	@echo "Restarting event-bus..."
+	@launchctl stop com.evansenter.claude-event-bus 2>/dev/null || true
+	@sleep 1
+	@launchctl start com.evansenter.claude-event-bus
+	@echo "Done. Server restarted."

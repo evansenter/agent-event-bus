@@ -17,7 +17,7 @@ each session is isolated. This MCP server lets sessions:
 | `register_session(name, machine?, cwd?, client_id?)` | Register yourself, get a session_id |
 | `list_sessions()` | See all active sessions |
 | `publish_event(type, payload, channel?)` | Send event to a channel |
-| `get_events(since_id?, limit?, session_id?)` | Poll for new events |
+| `get_events(cursor?, limit?, session_id?, order?)` | Poll for new events |
 | `unregister_session(session_id)` | Clean up when exiting |
 | `notify(title, message, sound?)` | Send macOS notification to user |
 
@@ -26,9 +26,9 @@ each session is isolated. This MCP server lets sessions:
 ### 1. Register on startup
 ```
 register_session(name="auth-feature")
-→ {session_id: "brave-tiger", last_event_id: 42, repo: "my-project", ...}
+→ {session_id: "brave-tiger", cursor: "42", repo: "my-project", ...}
 ```
-Save `session_id` and `last_event_id` - you'll need them for polling.
+Save `session_id` and `cursor` - you'll need them for polling.
 
 ### 2. Check who else is working
 ```
@@ -44,11 +44,11 @@ publish_event("api_ready", "Auth endpoints merged", channel="repo:my-project")
 
 ### 4. Poll for events
 ```
-# Use last_event_id from registration to start polling
-get_events(since_id=42, session_id="brave-tiger")
-→ [{id: 43, event_type: "api_ready", ...}, {id: 44, ...}]
+# Use cursor from registration to start polling
+get_events(cursor="42", session_id="brave-tiger", order="asc")
+→ {events: [{id: 43, event_type: "api_ready", ...}], next_cursor: "43"}
 ```
-Events come back in chronological order when using since_id.
+Use `order="asc"` for chronological order when polling, `order="desc"` (default) for newest first.
 
 ### 5. Notify the user
 ```
@@ -75,37 +75,53 @@ Events are published to channels. Sessions auto-subscribe based on their attribu
 
 ## Event Polling
 
-`get_events` has two distinct behaviors based on `since_id`:
-
-### "What's happening?" (since_id=0 or omitted)
+`get_events` returns a dict with `events` list and `next_cursor` for pagination:
 ```
 get_events()
-→ [{id: 50, ...}, {id: 49, ...}, {id: 48, ...}]  # Newest first (DESC)
+→ {events: [...], next_cursor: "50"}
 ```
-Returns recent events, **newest first**. Use this for a quick check of recent activity.
 
-### Polling loop (since_id > 0)
+### Cursor behavior
+
+- **`cursor=None`** (default): Returns recent events, newest first. Use for quick "what's happening?" checks.
+- **`cursor="<id>"`**: Returns events after that position. Use with `order="asc"` for chronological polling.
+
+The cursor is an opaque string - don't parse it, just pass the value from `next_cursor` or `register_session`.
+
+### Default order (newest first)
 ```
-get_events(since_id=42)
-→ [{id: 43, ...}, {id: 44, ...}, {id: 45, ...}]  # Chronological (ASC)
+get_events()
+→ {events: [{id: 50, ...}, {id: 49, ...}], next_cursor: "49"}
 ```
-Returns events after the given ID, **in order**. Use this for catching up.
+Returns recent events, **newest first** (DESC). Use this for a quick check of recent activity.
+
+### Polling loop (cursor + order="asc")
+```
+get_events(cursor="42", order="asc")
+→ {events: [{id: 43, ...}, {id: 44, ...}], next_cursor: "44"}
+```
+Returns events after the cursor, **in chronological order**. Use this for catching up.
+
+### Order parameter
+- `order="desc"` (default): Newest first - good for "what's happening?"
+- `order="asc"`: Oldest first - good for polling/catching up
 
 ### Recommended Pattern
 ```python
 # 1. On session start, get your starting point
 result = register_session(name="my-feature")
 session_id = result["session_id"]
-last_seen = result["last_event_id"]  # Start from here
+cursor = result["cursor"]  # Start from here
 
-# 2. Poll periodically for new events
-events = get_events(since_id=last_seen, session_id=session_id)
-for event in events:
+# 2. Poll periodically for new events (oldest first to process in order)
+result = get_events(cursor=cursor, session_id=session_id, order="asc")
+for event in result["events"]:
     # Process each event
-    last_seen = event["id"]  # Track progress
+    pass
+cursor = result["next_cursor"]  # Track progress for next poll
 
 # 3. To just peek at recent activity (one-off check)
-recent = get_events()  # No since_id = newest first
+recent = get_events()  # Default order is newest first
 ```
 
 ## Common Patterns
@@ -118,12 +134,12 @@ publish_event("api_ready", "Auth API merged to main", channel="repo:my-project")
 
 ### Wait for another session's work
 ```
-# Use last_event_id from register_session as starting point
-events = get_events(since_id=last_event_id, session_id=my_session_id)
-for e in events:
+# Use cursor from register_session as starting point
+result = get_events(cursor=cursor, session_id=my_session_id, order="asc")
+for e in result["events"]:
     if e["event_type"] == "api_ready":
         # Now safe to integrate
-    last_event_id = e["id"]  # Track for next poll
+cursor = result["next_cursor"]  # Track for next poll
 ```
 
 ### Ask another session for help
@@ -147,7 +163,7 @@ notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
 
 ### Session Registration
 1. **Register on session start** - Makes you discoverable; enables DMs
-2. **Save session_id and last_event_id** - You'll need both for polling
+2. **Save session_id and cursor** - You'll need both for polling
 3. **Include session_id in get_events** - Enables filtering and auto-heartbeat
 4. **Poll at natural breakpoints** - Check for messages before/after major tasks
 5. **Unregister on exit** - Keeps the session list clean
@@ -171,16 +187,16 @@ When you send a DM, here's what happens:
    (Uses terminal-notifier if installed, falls back to osascript)
 3. Human sees notification, switches to that terminal
 4. Human tells Claude: "check the event bus"
-5. Claude polls: `get_events(since_id=last_seen_id, session_id=my_id)` and sees the message
+5. Claude polls: `get_events(cursor=last_cursor, session_id=my_id)` and sees the message
 
 The notification alerts the **human** who routes the message to the correct session.
 
 ## Tips
 
-- `register_session` returns `last_event_id` - use it to start polling from the right place
+- `register_session` returns `cursor` - use it to start polling from the right place
 - Pass `client_id` to enable session resumption across restarts (e.g., CC session ID or PID)
 - `get_events` and `publish_event` auto-refresh your heartbeat
-- `get_events()` with no since_id returns newest first; with since_id returns chronological
+- `get_events()` defaults to newest first (`order="desc"`); use `order="asc"` when polling with cursor
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 24 hours of inactivity
 - Local sessions with numeric client_ids (PIDs) are cleaned immediately on process death

@@ -6,8 +6,8 @@ Usage:
     event-bus-cli unregister --session-id ID
     event-bus-cli sessions
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
-    event-bus-cli events [--since ID] [--session-id ID] [--limit N] [--exclude-types T1,T2]
-                         [--timeout MS] [--track-state FILE] [--json]
+    event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--exclude-types T1,T2]
+                         [--timeout MS] [--track-state FILE] [--json] [--order asc|desc]
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -23,14 +23,17 @@ Examples:
     # Publish an event
     event-bus-cli publish --type "task_done" --payload "Finished API" --channel "repo:my-project"
 
-    # Get recent events
-    event-bus-cli events --since 0 --session-id abc123
+    # Get recent events (newest first by default)
+    event-bus-cli events --session-id abc123
 
     # Get events with JSON output (for scripting)
     event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
 
     # Use state file for incremental polling (ideal for hooks)
-    event-bus-cli events --track-state ~/.local/state/claude/last_event_id --json
+    event-bus-cli events --track-state ~/.local/state/claude/cursor --json
+
+    # Get events in chronological order (oldest first)
+    event-bus-cli events --order asc
 
     # Send notification
     event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -157,60 +160,54 @@ def cmd_publish(args):
 
 def cmd_events(args):
     """Get recent events."""
-    # Handle --track-state: read since_id from file
-    since_id = args.since
+    # Handle --track-state: read cursor from file
+    cursor = args.cursor
     if args.track_state:
         state_path = os.path.expanduser(args.track_state)
         try:
             with open(state_path) as f:
-                since_id = int(f.read().strip())
-        except (FileNotFoundError, ValueError):
-            since_id = 0  # Start from beginning if file doesn't exist or is invalid
+                cursor = f.read().strip() or None
+        except FileNotFoundError:
+            cursor = None  # Start from beginning if file doesn't exist
 
-    arguments = {"since_id": since_id}
+    arguments = {"order": args.order}
+    if cursor is not None:
+        arguments["cursor"] = cursor
     if args.limit is not None:
         arguments["limit"] = args.limit
     if args.session_id:
         arguments["session_id"] = args.session_id
 
     result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
-    if not result:
-        if args.json:
-            print(json.dumps({"events": [], "last_id": since_id}))
-        else:
-            print("No events")
-        return
 
-    # Determine last_id for state tracking BEFORE filtering
-    # This ensures we track the actual highest ID from the server, not filtered results.
-    # Otherwise, excluded events would be re-fetched on every poll.
-    last_id = max((e["id"] for e in result), default=since_id)
+    # Result is now a dict with "events" and "next_cursor"
+    events = result.get("events", [])
+    next_cursor = result.get("next_cursor")
 
-    # Apply --exclude-types filter (after computing last_id)
+    # Apply --exclude-types filter
     if args.exclude_types:
         exclude_set = {t.strip() for t in args.exclude_types.split(",")}
-        result = [e for e in result if e["event_type"] not in exclude_set]
+        events = [e for e in events if e["event_type"] not in exclude_set]
 
-    # Handle --track-state: write new last_id to file
-    # Always write if we got events from server (last_id is already computed before filtering)
-    if args.track_state:
+    # Handle --track-state: write next_cursor to file
+    if args.track_state and next_cursor:
         state_path = os.path.expanduser(args.track_state)
         # Ensure parent directory exists
         state_dir = os.path.dirname(state_path)
         if state_dir:
             os.makedirs(state_dir, exist_ok=True)
         with open(state_path, "w") as f:
-            f.write(str(last_id))
+            f.write(next_cursor)
 
     # Output format
     if args.json:
-        output = {"events": result, "last_id": last_id}
+        output = {"events": events, "next_cursor": next_cursor}
         print(json.dumps(output))
     else:
-        if not result:
+        if not events:
             print("No events")
             return
-        for e in result:
+        for e in events:
             print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
             print(f"    {e['payload']}")
             print(f"    from: {e['session_id']} at {e['timestamp']}")
@@ -275,7 +272,7 @@ def main():
 
     # events
     p_events = subparsers.add_parser("events", help="Get recent events")
-    p_events.add_argument("--since", type=int, default=0, help="Get events after this ID")
+    p_events.add_argument("--cursor", help="Cursor from previous call (for pagination)")
     p_events.add_argument("--session-id", help="Your session ID (for filtering)")
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
@@ -290,12 +287,18 @@ def main():
     )
     p_events.add_argument(
         "--track-state",
-        help="File to read/write last event ID for incremental polling",
+        help="File to read/write cursor for incremental polling",
     )
     p_events.add_argument(
         "--json",
         action="store_true",
-        help="Output as JSON with events array and last_id",
+        help="Output as JSON with events array and next_cursor",
+    )
+    p_events.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="desc",
+        help="Ordering: 'desc' for newest first (default), 'asc' for oldest first",
     )
     p_events.set_defaults(func=cmd_events)
 

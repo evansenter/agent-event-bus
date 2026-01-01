@@ -35,6 +35,22 @@ pytest tests/test_server.py::TestRegisterSession -v
 
 **Note**: `make install` and `make uninstall` are idempotent - safe to run multiple times.
 
+### When to Restart
+
+Code changes require a server restart to take effect:
+
+```bash
+make restart   # Restarts the LaunchAgent
+```
+
+| Change | Restart Needed? |
+|--------|-----------------|
+| `server.py`, `storage.py`, `helpers.py`, `cli.py` | **Yes** |
+| `guide.md` | No (read fresh each request) |
+| `CLAUDE.md`, tests, docs | No |
+
+In dev mode (`./scripts/dev.sh`), the server auto-reloads on file changes.
+
 ## Architecture
 
 ```
@@ -55,10 +71,10 @@ src/event_bus/
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + last_event_id for polling |
+| `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + cursor for polling |
 | `list_sessions()` | List active sessions (most recently active first) |
-| `publish_event(type, payload, session_id?, channel?)` | Publish event to channel |
-| `get_events(since_id?, limit?, session_id?)` | Get events (since_id=0: newest first; >0: chronological) |
+| `publish_event(event_type, payload, session_id?, channel?)` | Publish event to channel |
+| `get_events(cursor?, limit?, session_id?, order?)` | Get events (order="desc" by default; use "asc" when polling) |
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
 
@@ -69,6 +85,72 @@ src/event_bus/
 | `event-bus://guide` | Usage guide and best practices for CC sessions |
 
 **Important**: Keep `usage_guide()` in `server.py` up to date when changing APIs. This is how CC sessions learn to use the event bus effectively.
+
+## API Consistency (CLI ↔ MCP)
+
+The CLI and MCP tools expose the same functionality with consistent naming:
+
+| CLI Command | MCP Tool | Notes |
+|-------------|----------|-------|
+| `register` | `register_session` | CLI short form, MCP descriptive |
+| `unregister` | `unregister_session` | CLI short form, MCP descriptive |
+| `sessions` | `list_sessions` | Noun (CLI) = verb+noun (MCP) |
+| `publish` | `publish_event` | CLI short form, MCP descriptive |
+| `events` | `get_events` | Noun (CLI) = verb+noun (MCP) |
+| `notify` | `notify` | Identical |
+
+**Conventions:**
+- CLI uses kebab-case args (`--session-id`), MCP uses snake_case params (`session_id`)
+- CLI uses short forms for commands, MCP uses descriptive `verb_noun` pattern
+- CLI query commands use nouns (`sessions`, `events`); action commands use verbs (`publish`, `notify`)
+
+**CLI-only features** (not in MCP):
+- `--timeout` - HTTP request timeout
+- `--track-state` - File-based cursor persistence
+- `--json` - JSON output format
+- `--exclude-types` - Event type filtering
+
+**When modifying the API**: Update all discovery surfaces together:
+1. **CLI help text** - argparse descriptions in `cli.py` (visible via `event-bus-cli --help`)
+2. **MCP tool docstrings** - in `server.py` (visible to CC via tool inspection)
+3. **Usage guide** - `guide.md` (served as `event-bus://guide` resource)
+4. **CLAUDE.md** - This file, for codebase context
+
+Ensure parameter names match (kebab ↔ snake conversion) across CLI and MCP.
+
+## MCP API Naming Conventions
+
+Standard conventions for MCP tool and argument naming across related projects (session-analytics, event-bus).
+
+### Tool Names
+
+| Prefix | When to use | Example |
+|--------|-------------|---------|
+| `list_*` | Enumerate items (no complex filtering) | `list_sessions()` |
+| `get_*` | Retrieve data with parameters/filters | `get_events(cursor=...)` |
+| `search_*` | Full-text/fuzzy search | `search_messages(query=...)` |
+| `analyze_*` | Compute derived insights | `analyze_trends(...)` |
+| `ingest_*` | Load/import data | `ingest_logs(...)` |
+| `verb_noun` | Perform actions | `register_session`, `publish_event` |
+
+### Argument Names
+
+| Concept | Standard Name | Notes |
+|---------|---------------|-------|
+| Session identifier | `session_id` | Not `session` or `sid` |
+| Max results | `limit` | Not `count` or `max` |
+| Pagination position | `cursor` | Opaque string, not `offset` or `since_id` |
+| Sort direction | `order` | Values: `"asc"`, `"desc"` |
+| Time window | `days` | Use fractional for hours: `days=0.5` = 12h |
+| Project filter | `project` | Not `project_path` |
+| Minimum threshold | `min_count` | Not `threshold` or `min_events` |
+
+### CLI ↔ MCP Mapping
+
+- CLI uses kebab-case: `--session-id`
+- MCP uses snake_case: `session_id`
+- CLI commands are short nouns/verbs: `sessions`, `publish`
+- MCP tools are descriptive: `list_sessions`, `publish_event`
 
 ## Channel-Based Messaging
 
@@ -115,7 +197,7 @@ Use consistent event types for discoverability across sessions.
 
 ## Design Decisions
 
-- **Polling over push**: MCP is request/response, so sessions poll with `get_events(since_id)`
+- **Polling over push**: MCP is request/response, so sessions poll with `get_events(cursor)`
 - **Session cleanup**: 24-hour heartbeat timeout + client liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
 - **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
@@ -141,14 +223,17 @@ event-bus-cli sessions
 # Publish event
 event-bus-cli publish --type "task_done" --payload "Finished" --channel "repo:my-project"
 
-# Get events (basic)
-event-bus-cli events --since 0 --session-id abc123
+# Get events (basic - newest first by default)
+event-bus-cli events --session-id abc123
 
 # Get events with JSON output (for scripting)
 event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
 
 # Get events with automatic state tracking (ideal for hooks)
-event-bus-cli events --track-state ~/.local/state/claude/last_event_id --json --timeout 200
+event-bus-cli events --track-state ~/.local/state/claude/cursor --json --timeout 200
+
+# Poll for new events chronologically (use with cursor)
+event-bus-cli events --cursor abc123 --order asc --session-id mysession
 
 # Send notification
 event-bus-cli notify --title "Done" --message "Build complete"
@@ -158,13 +243,14 @@ event-bus-cli notify --title "Done" --message "Build complete"
 
 | Option | Description |
 |--------|-------------|
-| `--since ID` | Get events after this ID (default: 0) |
+| `--cursor ID` | Get events after this cursor (opaque string) |
 | `--session-id ID` | Your session ID for channel filtering |
 | `--limit N` | Maximum events to return |
 | `--exclude-types T1,T2` | Comma-separated event types to filter out |
 | `--timeout MS` | Request timeout in milliseconds (default: 10000) |
-| `--track-state FILE` | Read/write last event ID for incremental polling |
-| `--json` | Output as JSON with `events` array and `last_id` |
+| `--track-state FILE` | Read/write cursor for incremental polling |
+| `--json` | Output as JSON with `events` array and `next_cursor` |
+| `--order asc\|desc` | Event ordering: desc (default, newest first) or asc (oldest first) |
 
 ## Configuration
 

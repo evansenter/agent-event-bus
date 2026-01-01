@@ -222,8 +222,8 @@ class TestAutoNotifyOnDM:
 
         assert "event_id" in result
         # Verify event was stored despite notification failure
-        events = get_events(session_id=target_id)
-        event_types = [e["event_type"] for e in events]
+        result = get_events(session_id=target_id)
+        event_types = [e["event_type"] for e in result["events"]]
         assert "test" in event_types
 
     @patch("event_bus.server.send_notification")

@@ -226,10 +226,10 @@ class TestCmdEvents:
     @patch("event_bus.cli.call_tool")
     def test_events_empty(self, mock_call, capsys):
         """Test getting no events."""
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": None}
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -237,6 +237,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -246,19 +247,22 @@ class TestCmdEvents:
     @patch("event_bus.cli.call_tool")
     def test_events_list(self, mock_call, capsys):
         """Test getting events."""
-        mock_call.return_value = [
-            {
-                "id": 1,
-                "event_type": "test_event",
-                "channel": "all",
-                "payload": "hello world",
-                "session_id": "abc123",
-                "timestamp": "2024-01-01T12:00:00",
-            }
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 1,
+                    "event_type": "test_event",
+                    "channel": "all",
+                    "payload": "hello world",
+                    "session_id": "abc123",
+                    "timestamp": "2024-01-01T12:00:00",
+                }
+            ],
+            "next_cursor": "1",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -266,6 +270,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -276,10 +281,10 @@ class TestCmdEvents:
     @patch("event_bus.cli.call_tool")
     def test_events_with_filtering(self, mock_call):
         """Test events with session filtering."""
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": "5"}
 
         args = Namespace(
-            since=5,
+            cursor="5",
             session_id="abc123",
             limit=None,
             exclude_types=None,
@@ -287,11 +292,12 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
         call_args = mock_call.call_args[0][1]
-        assert call_args["since_id"] == 5
+        assert call_args["cursor"] == "5"
         assert call_args["session_id"] == "abc123"
 
     @patch("event_bus.cli.call_tool")
@@ -299,19 +305,22 @@ class TestCmdEvents:
         """Test JSON output format."""
         import json
 
-        mock_call.return_value = [
-            {
-                "id": 42,
-                "event_type": "test_event",
-                "channel": "all",
-                "payload": "hello",
-                "session_id": "abc123",
-                "timestamp": "2024-01-01T12:00:00",
-            }
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 42,
+                    "event_type": "test_event",
+                    "channel": "all",
+                    "payload": "hello",
+                    "session_id": "abc123",
+                    "timestamp": "2024-01-01T12:00:00",
+                }
+            ],
+            "next_cursor": "42",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -319,14 +328,15 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
         captured = capsys.readouterr()
         output = json.loads(captured.out)
         assert "events" in output
-        assert "last_id" in output
-        assert output["last_id"] == 42
+        assert "next_cursor" in output
+        assert output["next_cursor"] == "42"
         assert len(output["events"]) == 1
         assert output["events"][0]["event_type"] == "test_event"
 
@@ -335,10 +345,10 @@ class TestCmdEvents:
         """Test JSON output with no events."""
         import json
 
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": "10"}
 
         args = Namespace(
-            since=10,
+            cursor="10",
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -346,46 +356,50 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
         captured = capsys.readouterr()
         output = json.loads(captured.out)
         assert output["events"] == []
-        assert output["last_id"] == 10  # Preserves since_id when no events
+        assert output["next_cursor"] == "10"  # Preserves cursor when no events
 
     @patch("event_bus.cli.call_tool")
     def test_events_exclude_types(self, mock_call, capsys):
         """Test excluding event types."""
-        mock_call.return_value = [
-            {
-                "id": 1,
-                "event_type": "session_registered",
-                "channel": "all",
-                "payload": "noise",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:00",
-            },
-            {
-                "id": 2,
-                "event_type": "message",
-                "channel": "all",
-                "payload": "important",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:01",
-            },
-            {
-                "id": 3,
-                "event_type": "session_unregistered",
-                "channel": "all",
-                "payload": "noise",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:02",
-            },
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 1,
+                    "event_type": "session_registered",
+                    "channel": "all",
+                    "payload": "noise",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:00",
+                },
+                {
+                    "id": 2,
+                    "event_type": "message",
+                    "channel": "all",
+                    "payload": "important",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:01",
+                },
+                {
+                    "id": 3,
+                    "event_type": "session_unregistered",
+                    "channel": "all",
+                    "payload": "noise",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:02",
+                },
+            ],
+            "next_cursor": "1",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types="session_registered,session_unregistered",
@@ -393,6 +407,7 @@ class TestCmdEvents:
             track_state=None,
             json=True,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -402,16 +417,16 @@ class TestCmdEvents:
         output = json.loads(captured.out)
         assert len(output["events"]) == 1
         assert output["events"][0]["event_type"] == "message"
-        # last_id is computed BEFORE filtering to avoid re-polling excluded events
-        assert output["last_id"] == 3
+        # next_cursor comes from the API, filtering happens client-side
+        assert output["next_cursor"] == "1"
 
     @patch("event_bus.cli.call_tool")
     def test_events_limit(self, mock_call):
         """Test limit parameter is passed through."""
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": None}
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=5,
             exclude_types=None,
@@ -419,6 +434,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -428,10 +444,10 @@ class TestCmdEvents:
     @patch("event_bus.cli.call_tool")
     def test_events_timeout(self, mock_call):
         """Test timeout parameter is passed to call_tool."""
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": None}
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -439,6 +455,7 @@ class TestCmdEvents:
             track_state=None,
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -448,23 +465,26 @@ class TestCmdEvents:
 
     @patch("event_bus.cli.call_tool")
     def test_events_track_state_read(self, mock_call, tmp_path, capsys):
-        """Test reading since_id from state file."""
-        state_file = tmp_path / "last_event_id"
+        """Test reading cursor from state file."""
+        state_file = tmp_path / "cursor"
         state_file.write_text("50")
 
-        mock_call.return_value = [
-            {
-                "id": 51,
-                "event_type": "test",
-                "channel": "all",
-                "payload": "data",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:00",
-            }
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 51,
+                    "event_type": "test",
+                    "channel": "all",
+                    "payload": "data",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:00",
+                }
+            ],
+            "next_cursor": "51",
+        }
 
         args = Namespace(
-            since=0,  # This should be ignored
+            cursor=None,  # This should be ignored when track_state is set
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -472,31 +492,35 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=True,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
-        # Should have used 50 from file, not 0
+        # Should have used "50" from file
         call_args = mock_call.call_args[0][1]
-        assert call_args["since_id"] == 50
+        assert call_args["cursor"] == "50"
 
     @patch("event_bus.cli.call_tool")
     def test_events_track_state_write(self, mock_call, tmp_path, capsys):
-        """Test writing last_id to state file."""
-        state_file = tmp_path / "last_event_id"
+        """Test writing next_cursor to state file."""
+        state_file = tmp_path / "cursor"
 
-        mock_call.return_value = [
-            {
-                "id": 100,
-                "event_type": "test",
-                "channel": "all",
-                "payload": "data",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:00",
-            }
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 100,
+                    "event_type": "test",
+                    "channel": "all",
+                    "payload": "data",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:00",
+                }
+            ],
+            "next_cursor": "100",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -504,30 +528,34 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
-        # State file should have been updated with last event ID
+        # State file should have been updated with next_cursor
         assert state_file.read_text() == "100"
 
     @patch("event_bus.cli.call_tool")
     def test_events_track_state_creates_dir(self, mock_call, tmp_path, capsys):
         """Test that track_state creates parent directories."""
-        state_file = tmp_path / "subdir" / "deep" / "last_event_id"
+        state_file = tmp_path / "subdir" / "deep" / "cursor"
 
-        mock_call.return_value = [
-            {
-                "id": 42,
-                "event_type": "test",
-                "channel": "all",
-                "payload": "data",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:00",
-            }
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 42,
+                    "event_type": "test",
+                    "channel": "all",
+                    "payload": "data",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:00",
+                }
+            ],
+            "next_cursor": "42",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -535,6 +563,7 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
@@ -544,13 +573,13 @@ class TestCmdEvents:
 
     @patch("event_bus.cli.call_tool")
     def test_events_track_state_missing_file(self, mock_call, tmp_path, capsys):
-        """Test track_state with missing file starts from 0."""
+        """Test track_state with missing file starts from None."""
         state_file = tmp_path / "nonexistent"
 
-        mock_call.return_value = []
+        mock_call.return_value = {"events": [], "next_cursor": None}
 
         args = Namespace(
-            since=999,  # Should be ignored when track_state is set
+            cursor="999",  # Should be ignored when track_state is set
             session_id=None,
             limit=None,
             exclude_types=None,
@@ -558,32 +587,36 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=False,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
-        # Should have used 0, not 999
+        # Should not have passed cursor (file doesn't exist)
         call_args = mock_call.call_args[0][1]
-        assert call_args["since_id"] == 0
+        assert "cursor" not in call_args
 
     @patch("event_bus.cli.call_tool")
     def test_events_exclude_types_writes_state_even_when_all_filtered(self, mock_call, tmp_path):
         """Test that state file is updated even when all events are filtered out."""
-        state_file = tmp_path / "last_event_id"
+        state_file = tmp_path / "cursor"
 
         # All events will be filtered out
-        mock_call.return_value = [
-            {
-                "id": 10,
-                "event_type": "session_registered",
-                "channel": "all",
-                "payload": "noise",
-                "session_id": "abc",
-                "timestamp": "2024-01-01T12:00:00",
-            },
-        ]
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 10,
+                    "event_type": "session_registered",
+                    "channel": "all",
+                    "payload": "noise",
+                    "session_id": "abc",
+                    "timestamp": "2024-01-01T12:00:00",
+                },
+            ],
+            "next_cursor": "10",
+        }
 
         args = Namespace(
-            since=0,
+            cursor=None,
             session_id=None,
             limit=None,
             exclude_types="session_registered",
@@ -591,10 +624,11 @@ class TestCmdEvents:
             track_state=str(state_file),
             json=True,
             url=None,
+            order="desc",
         )
         cli.cmd_events(args)
 
-        # State file should be written with last_id=10, even though events list is empty
+        # State file should be written with next_cursor, even though events list is empty
         assert state_file.read_text() == "10"
 
 
