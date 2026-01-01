@@ -57,7 +57,7 @@ src/event_bus/
 |------|---------|
 | `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + cursor for polling |
 | `list_sessions()` | List active sessions (most recently active first) |
-| `publish_event(type, payload, session_id?, channel?)` | Publish event to channel |
+| `publish_event(event_type, payload, session_id?, channel?)` | Publish event to channel |
 | `get_events(cursor?, limit?, session_id?, order?)` | Get events (order="desc" by default; use "asc" when polling) |
 | `unregister_session(session_id)` | Clean up session on exit |
 | `notify(title, message, sound?)` | Send system notification |
@@ -69,6 +69,32 @@ src/event_bus/
 | `event-bus://guide` | Usage guide and best practices for CC sessions |
 
 **Important**: Keep `usage_guide()` in `server.py` up to date when changing APIs. This is how CC sessions learn to use the event bus effectively.
+
+## API Consistency (CLI ↔ MCP)
+
+The CLI and MCP tools expose the same functionality with consistent naming:
+
+| CLI Command | MCP Tool | Notes |
+|-------------|----------|-------|
+| `register` | `register_session` | CLI short form, MCP descriptive |
+| `unregister` | `unregister_session` | CLI short form, MCP descriptive |
+| `sessions` | `list_sessions` | Noun (CLI) = verb+noun (MCP) |
+| `publish` | `publish_event` | CLI short form, MCP descriptive |
+| `events` | `get_events` | Noun (CLI) = verb+noun (MCP) |
+| `notify` | `notify` | Identical |
+
+**Conventions:**
+- CLI uses kebab-case args (`--session-id`), MCP uses snake_case params (`session_id`)
+- CLI uses short forms for commands, MCP uses descriptive `verb_noun` pattern
+- CLI query commands use nouns (`sessions`, `events`); action commands use verbs (`publish`, `notify`)
+
+**CLI-only features** (not in MCP):
+- `--timeout` - HTTP request timeout
+- `--track-state` - File-based cursor persistence
+- `--json` - JSON output format
+- `--exclude-types` - Event type filtering
+
+**When modifying the API**: Update both CLI (`cli.py`) and MCP (`server.py`) together. Ensure parameter names match (kebab ↔ snake conversion) and document changes in both `guide.md` and this file.
 
 ## Channel-Based Messaging
 
