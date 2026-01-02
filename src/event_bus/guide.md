@@ -27,16 +27,18 @@ each session is isolated. This MCP server lets sessions:
 ### 1. Register on startup
 ```
 register_session(name="auth-feature")
-→ {session_id: "brave-tiger", cursor: "42", repo: "my-project", ...}
+→ {session_id: "uuid-or-client-id", display_id: "brave-tiger", cursor: "42", repo: "my-project", ...}
 ```
-Save `session_id` - the cursor is tracked automatically when you pass session_id to get_events().
+- `session_id` is your unique identifier (UUID, or `client_id` if you provided one)
+- `display_id` is a human-readable name for display (e.g., "brave-tiger")
+- Save `session_id` for API calls - the cursor is tracked automatically when you pass session_id to get_events().
 
 ### 2. Check who else is working
 ```
 list_sessions()
-→ [{name: "auth-feature", subscribed_channels: ["all", "session:brave-tiger", ...], ...}]
+→ [{session_id: "...", display_id: "brave-tiger", name: "auth-feature", subscribed_channels: ["all", ...], ...}]
 ```
-Sessions are ordered by most recently active first. Each session shows its subscribed channels.
+Sessions are ordered by most recently active first. Use `display_id` for display, `session_id` for API calls.
 
 ### 2b. See active channels
 ```
@@ -184,9 +186,10 @@ cursor = result["next_cursor"]  # Track for next poll
 sessions = list_sessions()
 auth_session = next(s for s in sessions if "auth" in s["name"])
 
-# Send them a direct message
+# Send them a direct message using session_id
 publish_event("help_needed", "How do I call the new auth endpoint?",
               channel=f"session:{auth_session['session_id']}")
+# (display_id is for humans, session_id is for API calls)
 ```
 
 ### Notify user when task completes
@@ -231,12 +234,14 @@ The notification alerts the **human** who routes the message to the correct sess
 
 - `register_session` returns `cursor` - use it to start polling from the right place
 - Pass `client_id` to enable session resumption across restarts
+- **Session IDs**: `session_id` is for API calls (UUID or your client_id), `display_id` is human-readable (e.g., "brave-tiger")
 - **Cursor auto-tracking**: When you pass `session_id` to `get_events()`, your cursor is auto-saved. On resume, you pick up where you left off!
 - `get_events` and `publish_event` auto-refresh your heartbeat
 - `get_events()` defaults to newest first (`order="desc"`); use `order="asc"` when polling with cursor
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 24 hours of inactivity
 - The repo name is auto-detected from your working directory
+- **Historical events**: Events from before schema v2 may show human-readable session IDs (e.g., "brave-tiger") that don't match current sessions - this is expected and handled gracefully in display
 
 ## Event Type Conventions
 

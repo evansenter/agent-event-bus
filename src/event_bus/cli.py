@@ -123,9 +123,13 @@ def cmd_register(args):
     result = call_tool("register_session", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
-    # Also print just the session_id for easy capture in scripts
+    # Print session info for easy capture in scripts
     if "session_id" in result:
-        print(f"\nSession ID: {result['session_id']}", file=sys.stderr)
+        display_id = result.get("display_id") or result.get("session_id")
+        print(f"\nRegistered as: {display_id}", file=sys.stderr)
+        # Only show session_id if different from display_id (UUID case)
+        if result.get("session_id") != display_id:
+            print(f"Session ID: {result['session_id']}", file=sys.stderr)
 
 
 def cmd_unregister(args):
@@ -153,9 +157,22 @@ def cmd_sessions(args):
 
     print(f"Active sessions ({len(result)}):\n")
     for s in result:
-        print(f"  {s['session_id']}  {s['name']}")
+        # Show display_id (human-readable) prominently, with name
+        display_id = s.get("display_id") or s.get("session_id", "?")
+        print(f"  {display_id}  {s['name']}")
         print(f"    repo: {s['repo']}, machine: {s['machine']}")
-        print(f"    age: {int(s['age_seconds'])}s, client_id: {s.get('client_id', 'N/A')}")
+        # Show client_id if present (needed for statusline lookup)
+        client_id = s.get("client_id")
+        if client_id:
+            print(f"    client_id: {client_id}")
+        print(f"    age: {int(s['age_seconds'])}s")
+        # Show session_id (UUID) separately if different from display_id
+        session_id = s.get("session_id", "")
+        if session_id and session_id != display_id:
+            # Truncate long UUIDs for display
+            if len(session_id) > 16:
+                session_id = session_id[:8] + "…"
+            print(f"    session_id: {session_id}")
         channels = s.get("subscribed_channels", [])
         if channels:
             print(f"    channels: {', '.join(channels)}")

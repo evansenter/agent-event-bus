@@ -19,34 +19,33 @@ def _get_storage() -> SQLiteStorage:
     return _storage
 
 
-def _lookup_session_name(session_id: str) -> str | None:
-    """Look up human-readable session name from a client_id or session_id.
+def _lookup_session_display_id(session_id: str) -> str | None:
+    """Look up human-readable display_id from a session_id.
 
-    Returns the human-readable name if found, None otherwise.
+    Session IDs are now UUIDs (or client_ids). This resolves them to
+    human-readable display names like "brave-tiger".
+
+    Returns the display_id if found, None otherwise.
     """
     try:
         storage = _get_storage()
-        # First check if it's already a registered session_id
         session = storage.get_session(session_id)
-        if session:
-            return session.id  # Already human-readable
-
-        # Try to find by client_id (search all sessions)
-        for s in storage.list_sessions():
-            if s.client_id == session_id:
-                return s.id
-        return None
+        return session.display_id if session else None
     except Exception:
         return None
 
 
-def _get_active_session_ids() -> set[str]:
-    """Get set of currently active session IDs."""
+def _get_active_sessions_map() -> dict[str, str]:
+    """Get mapping of session_id → display_id for active sessions.
+
+    Returns a dict where keys are session IDs (UUIDs) and values are
+    human-readable display_ids (like "brave-tiger").
+    """
     try:
         storage = _get_storage()
-        return {s.id for s in storage.list_sessions()}
+        return {s.id: s.display_id for s in storage.list_sessions()}
     except Exception:
-        return set()
+        return {}
 
 
 # ANSI color codes for tail -f viewing
@@ -133,8 +132,9 @@ def _format_list(items: list) -> str:
     first = items[0] if isinstance(items[0], dict) else None
     if first:
         if "session_id" in first:
-            # Show session names: tender-hawk, brave-tiger, ...
-            names = [item.get("session_id", "?") for item in items]
+            # Show session display_ids (human-readable names): tender-hawk, brave-tiger, ...
+            # Prefer display_id if available, fall back to session_id
+            names = [item.get("display_id") or item.get("session_id", "?") for item in items]
             return f"{_CYAN}{', '.join(names)}{_RESET}"
         if "channel" in first and "subscribers" in first:
             # Show channel names: all, repo:foo, machine:bar, ...
@@ -177,29 +177,46 @@ def _format_result(result) -> str:
 
         extra_info = []
 
-        # Show unique publishers (only human-readable session names)
+        # Show unique publishers with display names
         # Inactive sessions are shown in red, active in cyan
         if count > 0:
-            publishers = set()
+            # Get active session mapping: session_id → display_id
+            active_sessions = _get_active_sessions_map()
+
+            # Collect unique publishers and resolve to display_ids
+            publisher_display_ids: dict[str, bool] = {}  # display_id → is_active
             for e in events:
                 sid = e.get("session_id", "")
-                if _is_human_readable_id(sid):
-                    publishers.add(sid)
-            if publishers:
-                active_sessions = _get_active_session_ids()
+                if sid and sid != "anonymous":
+                    if sid in active_sessions:
+                        # Active session - use its display_id
+                        display_id = active_sessions[sid]
+                        publisher_display_ids[display_id] = True
+                    else:
+                        # Inactive session - try to resolve display_id, or use human-readable if already
+                        display_id = _lookup_session_display_id(sid)
+                        if display_id:
+                            publisher_display_ids[display_id] = False
+                        elif _is_human_readable_id(sid):
+                            # Legacy: old-style human-readable ID that's not in our DB
+                            publisher_display_ids[sid] = False
+
+            if publisher_display_ids:
                 # Sort: active first (alphabetically), then inactive (alphabetically)
-                active = sorted(p for p in publishers if p in active_sessions)
-                inactive = sorted(p for p in publishers if p not in active_sessions)
+                active = sorted(d for d, is_active in publisher_display_ids.items() if is_active)
+                inactive = sorted(
+                    d for d, is_active in publisher_display_ids.items() if not is_active
+                )
                 sorted_publishers = (active + inactive)[:5]
                 colored_names = []
                 for name in sorted_publishers:
-                    if name in active_sessions:
+                    if publisher_display_ids.get(name, False):
                         colored_names.append(f"{_CYAN}{name}{_RESET}")
                     else:
                         colored_names.append(f"{_RED}{name}{_RESET}")
                 names_str = ", ".join(colored_names)
-                if len(publishers) > 5:
-                    names_str += f" +{len(publishers) - 5}"
+                if len(publisher_display_ids) > 5:
+                    names_str += f" +{len(publisher_display_ids) - 5}"
                 extra_info.append(f"from: {names_str}")
 
         # Show timespan if we have events with timestamps
@@ -305,12 +322,12 @@ class RequestLoggingMiddleware:
             caller_prefix = ""
             raw_session_id = tool_args.get("session_id")
             if raw_session_id and isinstance(raw_session_id, str):
-                # Try to resolve to human-readable name
-                resolved_name = _lookup_session_name(raw_session_id)
-                if resolved_name:
-                    caller_prefix = f"{_CYAN}[{resolved_name}]{_RESET} "
+                # Try to resolve to human-readable display_id
+                display_id = _lookup_session_display_id(raw_session_id)
+                if display_id:
+                    caller_prefix = f"{_CYAN}[{display_id}]{_RESET} "
                 elif _is_human_readable_id(raw_session_id):
-                    # Already human-readable but not found (shouldn't happen)
+                    # Legacy: already human-readable but not in DB
                     caller_prefix = f"{_CYAN}[{raw_session_id}]{_RESET} "
                 else:
                     # UUID we couldn't resolve - show truncated

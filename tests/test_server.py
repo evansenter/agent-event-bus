@@ -140,6 +140,7 @@ class TestListSessions:
         now = datetime.now()
         session = Session(
             id="dead-session",
+            display_id="dead-display",
             name="dead",
             machine=hostname,
             cwd="/test",
@@ -542,7 +543,7 @@ class TestRegisterSessionTip:
         result = register_session(name="test-session", machine="test-machine", cwd="/test")
 
         assert "tip" in result
-        assert result["session_id"] in result["tip"]
+        assert result["display_id"] in result["tip"]
         assert "test-session" in result["tip"]
         assert "get_events(" in result["tip"]
 
@@ -552,7 +553,7 @@ class TestRegisterSessionTip:
         result = register_session(name="resumed", machine="test", cwd="/test", client_id="12345")
 
         assert "tip" in result
-        assert result["session_id"] in result["tip"]
+        assert result["display_id"] in result["tip"]
 
 
 class TestRegisterSessionCursor:

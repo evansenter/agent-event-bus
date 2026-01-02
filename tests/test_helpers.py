@@ -87,6 +87,7 @@ class TestSessionGetProjectName:
         """Test that repo field takes precedence."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/home/user/myproject",
@@ -100,6 +101,7 @@ class TestSessionGetProjectName:
         """Test fallback to cwd basename when repo is empty."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/home/user/fallback-proj",
@@ -113,6 +115,7 @@ class TestSessionGetProjectName:
         """Test fallback to 'unknown' when cwd is None."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd=None,
@@ -126,6 +129,7 @@ class TestSessionGetProjectName:
         """Test that root directory returns 'unknown' not empty string."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/",
@@ -139,6 +143,7 @@ class TestSessionGetProjectName:
         """Test that trailing slashes are handled correctly."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/home/user/myproject/",
@@ -156,6 +161,7 @@ class TestSessionGetProjectName:
         """
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/home/user/project",
@@ -170,6 +176,7 @@ class TestSessionGetProjectName:
         """Test that fallback path sanitizes special characters (defense-in-depth)."""
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="m",
             cwd="/home/user/project\nwith\tnewlines",

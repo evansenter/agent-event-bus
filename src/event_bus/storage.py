@@ -15,7 +15,7 @@ logger = logging.getLogger("event-bus")
 
 # Schema version for migrations
 # Increment this when adding new migrations
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Migration function type: takes a connection, returns nothing
 MigrationFunc = Callable[[sqlite3.Connection], None]
@@ -40,10 +40,59 @@ def migration(version: int, name: str):
     return decorator
 
 
-# Future migrations go here:
-# @migration(2, "add_new_feature")
-# def migrate_v2(conn):
-#     conn.execute("ALTER TABLE sessions ADD COLUMN new_column TEXT")
+# Migration for UUID-based session IDs and soft-delete
+@migration(2, "uuid_session_ids_and_soft_delete")
+def migrate_v2(conn: sqlite3.Connection) -> None:
+    """Add display_id and deleted_at columns to sessions table.
+
+    This migration:
+    1. Adds display_id column (human-readable name like "brave-tiger")
+    2. Adds deleted_at column (for soft-delete)
+    3. Copies existing id → display_id
+    4. Changes id to use client_id (if available) or generates UUID
+
+    Note on historical data: Existing events retain their old session_id references
+    (human-readable names like "brave-tiger"). These become orphaned - they no longer
+    match any session's primary key. This is expected: the middleware handles display
+    of historical events via _is_human_readable_id() fallback. New events will use
+    the new UUID-based session_id.
+    """
+    import uuid
+
+    # Check which columns already exist (fresh DB vs upgrade)
+    cursor = conn.execute("PRAGMA table_info(sessions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Add new columns only if they don't exist
+    if "display_id" not in existing_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN display_id TEXT")
+    if "deleted_at" not in existing_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at TIMESTAMP")
+
+    # Copy existing id to display_id
+    conn.execute("UPDATE sessions SET display_id = id")
+
+    # For sessions with client_id, update id to use client_id
+    # For sessions without client_id, generate a UUID
+    rows = conn.execute("SELECT id, client_id FROM sessions").fetchall()
+    for row in rows:
+        old_id = row[0]
+        client_id = row[1]
+
+        if client_id:
+            new_id = client_id
+        else:
+            new_id = str(uuid.uuid4())
+
+        # Update the session id (SQLite allows this even for PK)
+        conn.execute(
+            "UPDATE sessions SET id = ? WHERE id = ?",
+            (new_id, old_id),
+        )
+
+    # Make display_id NOT NULL now that all rows have values
+    # SQLite doesn't support ALTER COLUMN, so we'll enforce in application
+
 
 # Register datetime adapters/converters (required for Python 3.12+)
 # See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
@@ -67,7 +116,8 @@ sqlite3.register_converter("TIMESTAMP", _convert_datetime)
 class Session:
     """Represents an active Claude Code session."""
 
-    id: str
+    id: str  # UUID or client_id (stable identifier for API use)
+    display_id: str  # Human-readable name like "brave-tiger" (for display only)
     name: str
     machine: str
     cwd: str
@@ -76,6 +126,7 @@ class Session:
     last_heartbeat: datetime
     client_id: str | None = None  # Client identifier for session deduplication
     last_cursor: str | None = None  # Last seen event cursor for this session
+    deleted_at: datetime | None = None  # Soft-delete timestamp (None = active)
 
     def get_project_name(self) -> str:
         """Get the project name, preferring explicit repo over cwd basename.
@@ -221,6 +272,7 @@ class SQLiteStorage:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY,
+                    display_id TEXT NOT NULL,
                     name TEXT NOT NULL,
                     machine TEXT NOT NULL,
                     cwd TEXT NOT NULL,
@@ -228,7 +280,8 @@ class SQLiteStorage:
                     registered_at TIMESTAMP NOT NULL,
                     last_heartbeat TIMESTAMP NOT NULL,
                     client_id TEXT,
-                    last_cursor TEXT
+                    last_cursor TEXT,
+                    deleted_at TIMESTAMP
                 )
             """)
             # Add last_cursor column if upgrading from older schema
@@ -277,11 +330,13 @@ class SQLiteStorage:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions
-                (id, name, machine, cwd, repo, registered_at, last_heartbeat, client_id, last_cursor)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, display_id, name, machine, cwd, repo, registered_at, last_heartbeat,
+                 client_id, last_cursor, deleted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
+                    session.display_id,
                     session.name,
                     session.machine,
                     session.cwd,
@@ -290,18 +345,21 @@ class SQLiteStorage:
                     session.last_heartbeat,
                     session.client_id,
                     session.last_cursor,
+                    session.deleted_at,
                 ),
             )
 
     def find_session_by_client(self, machine: str, client_id: str) -> Session | None:
-        """Find an existing session by machine+client_id key.
+        """Find an existing active session by machine+client_id key.
 
         The dedup key is (machine, client_id) because client_ids (like PIDs) are
         machine-local - the same value on different machines represents different clients.
+
+        Only returns active (non-deleted) sessions.
         """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM sessions WHERE machine = ? AND client_id = ?",
+                "SELECT * FROM sessions WHERE machine = ? AND client_id = ? AND deleted_at IS NULL",
                 (machine, client_id),
             ).fetchone()
             if row:
@@ -312,6 +370,7 @@ class SQLiteStorage:
         """Convert a database row to a Session object."""
         return Session(
             id=row["id"],
+            display_id=row["display_id"] if "display_id" in row.keys() else row["id"],
             name=row["name"],
             machine=row["machine"],
             cwd=row["cwd"],
@@ -320,65 +379,87 @@ class SQLiteStorage:
             last_heartbeat=row["last_heartbeat"],
             client_id=row["client_id"],
             last_cursor=row["last_cursor"] if "last_cursor" in row.keys() else None,
+            deleted_at=row["deleted_at"] if "deleted_at" in row.keys() else None,
         )
 
     def get_session(self, session_id: str) -> Session | None:
-        """Get a session by ID."""
+        """Get an active session by ID.
+
+        Only returns active (non-deleted) sessions.
+        """
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ? AND deleted_at IS NULL",
+                (session_id,),
+            ).fetchone()
             if row:
                 return self._row_to_session(row)
             return None
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session by ID.
+        """Soft-delete a session by ID.
 
+        Sets deleted_at timestamp instead of removing the row.
         Returns True if the session was deleted, False if not found.
         """
         with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            cursor = conn.execute(
+                "UPDATE sessions SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+                (datetime.now(), session_id),
+            )
             return cursor.rowcount > 0
 
     def update_heartbeat(self, session_id: str, timestamp: datetime) -> bool:
-        """Update session heartbeat. Returns True if session exists."""
+        """Update session heartbeat. Returns True if active session exists."""
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE sessions SET last_heartbeat = ? WHERE id = ?",
+                "UPDATE sessions SET last_heartbeat = ? WHERE id = ? AND deleted_at IS NULL",
                 (timestamp, session_id),
             )
             return cursor.rowcount > 0
 
     def update_session_cursor(self, session_id: str, cursor: str) -> bool:
-        """Update session's last seen cursor. Returns True if session exists."""
+        """Update session's last seen cursor. Returns True if active session exists."""
         with self._connect() as conn:
             result = conn.execute(
-                "UPDATE sessions SET last_cursor = ? WHERE id = ?",
+                "UPDATE sessions SET last_cursor = ? WHERE id = ? AND deleted_at IS NULL",
                 (cursor, session_id),
             )
             return result.rowcount > 0
 
     def list_sessions(self) -> list[Session]:
-        """List all sessions, ordered by most recently active first."""
+        """List all active sessions, ordered by most recently active first.
+
+        Only returns active (non-deleted) sessions.
+        """
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM sessions ORDER BY last_heartbeat DESC").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE deleted_at IS NULL ORDER BY last_heartbeat DESC"
+            ).fetchall()
             return [self._row_to_session(row) for row in rows]
 
     def cleanup_stale_sessions(self, timeout_seconds: int = SESSION_TIMEOUT) -> int:
-        """Remove sessions that haven't sent a heartbeat recently.
+        """Soft-delete sessions that haven't sent a heartbeat recently.
 
-        Returns the number of sessions removed.
+        Returns the number of sessions marked as deleted.
         """
         cutoff = datetime.now().timestamp() - timeout_seconds
         cutoff_dt = datetime.fromtimestamp(cutoff)
+        now = datetime.now()
 
         with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM sessions WHERE last_heartbeat < ?", (cutoff_dt,))
+            cursor = conn.execute(
+                "UPDATE sessions SET deleted_at = ? WHERE last_heartbeat < ? AND deleted_at IS NULL",
+                (now, cutoff_dt),
+            )
             return cursor.rowcount
 
     def session_count(self) -> int:
-        """Get count of active sessions."""
+        """Get count of active (non-deleted) sessions."""
         with self._connect() as conn:
-            row = conn.execute("SELECT COUNT(*) as count FROM sessions").fetchone()
+            row = conn.execute(
+                "SELECT COUNT(*) as count FROM sessions WHERE deleted_at IS NULL"
+            ).fetchone()
             return row["count"]
 
     # Event operations

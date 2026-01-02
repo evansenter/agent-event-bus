@@ -13,7 +13,7 @@ from event_bus.middleware import (
     _format_list,
     _format_result,
     _format_session_id_value,
-    _get_active_session_ids,
+    _get_active_sessions_map,
     _is_human_readable_id,
     _parse_sse_response,
 )
@@ -137,10 +137,10 @@ class TestFormatResult:
             {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
             {"id": 2, "session_id": "happy-falcon", "timestamp": "2026-01-01T12:05:00"},
         ]
-        # Mock active sessions so we get consistent coloring
+        # Mock active sessions map (session_id → display_id)
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value={"brave-tiger", "happy-falcon"},
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={"brave-tiger": "brave-tiger", "happy-falcon": "happy-falcon"},
         ):
             result = _format_result({"events": events, "next_cursor": "2"})
             assert "from:" in result
@@ -175,10 +175,10 @@ class TestFormatResult:
             {"id": 2, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:30:00"},
             {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
         ]
-        # Mock active sessions for consistent behavior
+        # Mock active sessions map for consistent behavior
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value={"brave-tiger"},
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={"brave-tiger": "brave-tiger"},
         ):
             result = _format_result({"events": events, "next_cursor": "2"})
             # Should show oldest→newest: 12:00→12:30
@@ -335,13 +335,13 @@ class TestFormatSessionIdValue:
         assert "…" not in result
 
 
-class TestGetActiveSessionIds:
-    """Tests for _get_active_session_ids function."""
+class TestGetActiveSessionsMap:
+    """Tests for _get_active_sessions_map function."""
 
-    def test_returns_set(self):
-        """Returns a set (possibly empty)."""
-        result = _get_active_session_ids()
-        assert isinstance(result, set)
+    def test_returns_dict(self):
+        """Returns a dict (possibly empty)."""
+        result = _get_active_sessions_map()
+        assert isinstance(result, dict)
 
 
 class TestInactiveSessionHighlighting:
@@ -352,10 +352,10 @@ class TestInactiveSessionHighlighting:
         events = [
             {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
         ]
-        # Mock _get_active_session_ids to return our session as active
+        # Mock _get_active_sessions_map to return our session as active
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value={"brave-tiger"},
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={"brave-tiger": "brave-tiger"},
         ):
             result = _format_result({"events": events, "next_cursor": "1"})
             assert "brave-tiger" in result
@@ -373,10 +373,10 @@ class TestInactiveSessionHighlighting:
         events = [
             {"id": 1, "session_id": "stale-falcon", "timestamp": "2026-01-01T12:00:00"},
         ]
-        # Mock _get_active_session_ids to return empty (no active sessions)
+        # Mock _get_active_sessions_map to return empty (no active sessions)
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value=set(),
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={},
         ):
             result = _format_result({"events": events, "next_cursor": "1"})
             assert "stale-falcon" in result
@@ -390,8 +390,8 @@ class TestInactiveSessionHighlighting:
         ]
         # Mock to mark only active-tiger as active
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value={"active-tiger"},
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={"active-tiger": "active-tiger"},
         ):
             result = _format_result({"events": events, "next_cursor": "2"})
             assert "active-tiger" in result
@@ -410,8 +410,8 @@ class TestInactiveSessionHighlighting:
         # zebra-active and beta-active are active, alpha-gone is not
         # Despite alpha-gone being first alphabetically, active sessions come first
         with patch(
-            "event_bus.middleware._get_active_session_ids",
-            return_value={"zebra-active", "beta-active"},
+            "event_bus.middleware._get_active_sessions_map",
+            return_value={"zebra-active": "zebra-active", "beta-active": "beta-active"},
         ):
             result = _format_result({"events": events, "next_cursor": "3"})
             # Active sessions should appear before inactive

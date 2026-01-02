@@ -12,6 +12,7 @@ Provides tools for cross-session Claude Code communication:
 import logging
 import os
 import socket
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -199,13 +200,14 @@ def register_session(
         existing.name = name
         existing.last_heartbeat = now
         storage.add_session(existing)  # INSERT OR REPLACE
-        dev_notify("register_session", f"{name} resumed → {existing.id}")
+        dev_notify("register_session", f"{name} resumed → {existing.display_id}")
 
         # Use session's last_cursor if available (resume where they left off)
         # Otherwise fall back to current position
         resume_cursor = existing.last_cursor or storage.get_cursor()
         return {
             "session_id": existing.id,
+            "display_id": existing.display_id,
             "name": name,
             "machine": machine,
             "cwd": cwd,
@@ -213,13 +215,18 @@ def register_session(
             "active_sessions": storage.session_count(),
             "cursor": resume_cursor,
             "resumed": True,
-            "tip": f"You are '{name}' ({existing.id}). Resuming from last seen cursor.",
+            "tip": f"You are '{name}' ({existing.display_id}). Resuming from last seen cursor.",
         }
 
-    # Create new session with human-readable ID
-    session_id = generate_session_id()
+    # Create new session
+    # Use client_id as session ID if provided (allows direct lookup by CC's session_id)
+    # Otherwise generate a UUID for new sessions without client_id
+    session_id = client_id if client_id else str(uuid.uuid4())
+    # Always generate human-readable display_id for UI/logs
+    display_id = generate_session_id()
     session = Session(
         id=session_id,
+        display_id=display_id,
         name=name,
         machine=machine,
         cwd=cwd,
@@ -240,6 +247,7 @@ def register_session(
 
     result = {
         "session_id": session_id,
+        "display_id": display_id,
         "name": name,
         "machine": machine,
         "cwd": cwd,
@@ -247,9 +255,9 @@ def register_session(
         "active_sessions": storage.session_count(),
         "cursor": str(registration_event.id),
         "resumed": False,
-        "tip": f"You are '{name}' ({session_id}). Use cursor to start polling: get_events(cursor=cursor).",
+        "tip": f"You are '{name}' ({display_id}). Use cursor to start polling: get_events(cursor=cursor).",
     }
-    dev_notify("register_session", f"{name} → {session_id}")
+    dev_notify("register_session", f"{name} → {display_id}")
     return result
 
 
@@ -269,6 +277,7 @@ def list_sessions() -> list[dict]:
         results.append(
             {
                 "session_id": s.id,
+                "display_id": s.display_id,
                 "name": s.name,
                 "machine": s.machine,
                 "repo": s.repo,

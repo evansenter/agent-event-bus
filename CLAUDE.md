@@ -23,6 +23,13 @@ MCP server providing an event bus for cross-session Claude Code communication. S
 - `make reinstall` - Just reinstalls Python package
 - Schema migrations via `@migration` decorator in `storage.py`
 
+### Before schema/migration changes:
+**ALWAYS back up the database before making schema or migration changes:**
+```bash
+cp ~/.claude/contrib/event-bus/data.db ~/.claude/contrib/event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)
+```
+Migrations can have subtle bugs (race conditions, incorrect data transforms) that corrupt data irreversibly.
+
 ### If you need to test destructive operations:
 Use a temporary database in tests (all tests already do this via `conftest.py`).
 
@@ -80,7 +87,7 @@ src/event_bus/
 ├── storage.py     # SQLite storage backend (Session, Event, SQLiteStorage)
 ├── helpers.py     # Utility functions (notifications, repo extraction)
 ├── middleware.py  # Request logging middleware (logs to ~/.claude/contrib/event-bus/event-bus.log)
-├── session_ids.py # Human-readable ID generation (Docker-style names)
+├── session_ids.py # Human-readable display_id generation (Docker-style names)
 ├── cli.py         # CLI wrapper for shell scripts/hooks
 └── guide.md       # Usage guide served as MCP resource
 ```
@@ -92,7 +99,7 @@ src/event_bus/
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + cursor for polling |
+| `register_session(name, machine?, cwd?, client_id?)` | Register session, get session_id + display_id + cursor |
 | `list_sessions()` | List active sessions with their subscribed channels |
 | `list_channels()` | List active channels with subscriber counts |
 | `publish_event(event_type, payload, session_id?, channel?)` | Publish event to channel |
@@ -238,7 +245,7 @@ Use consistent event types for discoverability across sessions.
 - **SQLite persistence**: State persists across restarts in `~/.claude/contrib/event-bus/data.db`
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
-- **Human-readable IDs**: Session IDs use Docker-style names (e.g., `brave-tiger`) instead of UUIDs
+- **UUID session IDs**: `session_id` is a UUID (or `client_id` if provided); `display_id` holds the human-readable Docker-style name (e.g., `brave-tiger`) for user-facing display
 - **Client deduplication**: Sessions are deduplicated by `(machine, client_id)` - allows session resumption across restarts
 
 ## CLI Wrapper

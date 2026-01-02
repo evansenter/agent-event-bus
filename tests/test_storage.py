@@ -13,6 +13,7 @@ class TestSessionOperations:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/project",
@@ -26,6 +27,7 @@ class TestSessionOperations:
         retrieved = storage.get_session("test-123")
         assert retrieved is not None
         assert retrieved.id == "test-123"
+        assert retrieved.display_id == "test-display"
         assert retrieved.name == "test-session"
         assert retrieved.machine == "localhost"
         assert retrieved.cwd == "/home/user/project"
@@ -41,6 +43,7 @@ class TestSessionOperations:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="original-name",
             machine="localhost",
             cwd="/home/user/project",
@@ -62,6 +65,7 @@ class TestSessionOperations:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/project",
@@ -84,6 +88,7 @@ class TestSessionOperations:
         for i in range(3):
             session = Session(
                 id=f"test-{i}",
+                display_id=f"display-{i}",
                 name=f"session-{i}",
                 machine="localhost",
                 cwd=f"/home/user/project{i}",
@@ -106,6 +111,7 @@ class TestSessionOperations:
         for i in range(5):
             session = Session(
                 id=f"test-{i}",
+                display_id=f"display-{i}",
                 name=f"session-{i}",
                 machine="localhost",
                 cwd=f"/home/user/project{i}",
@@ -126,6 +132,7 @@ class TestSessionDeduplication:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/project",
@@ -145,6 +152,7 @@ class TestSessionDeduplication:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/project",
@@ -169,6 +177,7 @@ class TestHeartbeat:
         now = datetime.now()
         session = Session(
             id="test-123",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/project",
@@ -199,6 +208,7 @@ class TestStaleSessionCleanup:
         # Fresh session (should not be cleaned up)
         fresh = Session(
             id="fresh",
+            display_id="fresh-display",
             name="fresh-session",
             machine="localhost",
             cwd="/home/user/fresh",
@@ -212,6 +222,7 @@ class TestStaleSessionCleanup:
         stale_time = now - timedelta(seconds=SESSION_TIMEOUT + 100)
         stale = Session(
             id="stale",
+            display_id="stale-display",
             name="stale-session",
             machine="localhost",
             cwd="/home/user/stale",
@@ -233,6 +244,7 @@ class TestStaleSessionCleanup:
 
         session = Session(
             id="test",
+            display_id="test-display",
             name="test-session",
             machine="localhost",
             cwd="/home/user/test",
@@ -408,6 +420,7 @@ class TestDatabaseInitialization:
         now = datetime.now()
         session = Session(
             id="test",
+            display_id="test-display",
             name="test",
             machine="localhost",
             cwd="/test",
