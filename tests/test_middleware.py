@@ -1,5 +1,7 @@
 """Tests for middleware formatting functions."""
 
+from unittest.mock import patch
+
 from event_bus.middleware import (
     _BOLD,
     _CYAN,
@@ -11,6 +13,7 @@ from event_bus.middleware import (
     _format_list,
     _format_result,
     _format_session_id_value,
+    _get_active_session_ids,
     _is_human_readable_id,
     _parse_sse_response,
 )
@@ -134,10 +137,15 @@ class TestFormatResult:
             {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
             {"id": 2, "session_id": "happy-falcon", "timestamp": "2026-01-01T12:05:00"},
         ]
-        result = _format_result({"events": events, "next_cursor": "2"})
-        assert "from:" in result
-        assert "brave-tiger" in result
-        assert "happy-falcon" in result
+        # Mock active sessions so we get consistent coloring
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value={"brave-tiger", "happy-falcon"},
+        ):
+            result = _format_result({"events": events, "next_cursor": "2"})
+            assert "from:" in result
+            assert "brave-tiger" in result
+            assert "happy-falcon" in result
 
     def test_events_result_excludes_anonymous(self):
         """Anonymous publishers are not shown."""
@@ -167,11 +175,16 @@ class TestFormatResult:
             {"id": 2, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:30:00"},
             {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
         ]
-        result = _format_result({"events": events, "next_cursor": "2"})
-        # Should show oldest→newest: 12:00→12:30
-        assert "2026-01-01T12:00" in result
-        assert "2026-01-01T12:30" in result
-        assert "→" in result
+        # Mock active sessions for consistent behavior
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value={"brave-tiger"},
+        ):
+            result = _format_result({"events": events, "next_cursor": "2"})
+            # Should show oldest→newest: 12:00→12:30
+            assert "2026-01-01T12:00" in result
+            assert "2026-01-01T12:30" in result
+            assert "→" in result
 
     def test_event_id_result(self):
         """Result with event_id shows event #N."""
@@ -320,3 +333,100 @@ class TestFormatSessionIdValue:
         assert _DIM in result
         assert "abc123" in result
         assert "…" not in result
+
+
+class TestGetActiveSessionIds:
+    """Tests for _get_active_session_ids function."""
+
+    def test_returns_set(self):
+        """Returns a set (possibly empty)."""
+        result = _get_active_session_ids()
+        assert isinstance(result, set)
+
+
+class TestInactiveSessionHighlighting:
+    """Tests for inactive session highlighting in event results."""
+
+    def test_active_sessions_shown_in_cyan(self):
+        """Active sessions are shown in cyan."""
+        events = [
+            {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
+        ]
+        # Mock _get_active_session_ids to return our session as active
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value={"brave-tiger"},
+        ):
+            result = _format_result({"events": events, "next_cursor": "1"})
+            assert "brave-tiger" in result
+            assert _CYAN in result
+            # Should NOT have red for this session
+            # Check that brave-tiger appears after CYAN, not after RED
+            cyan_pos = result.find(_CYAN)
+            red_pos = result.find(_RED)
+            tiger_pos = result.find("brave-tiger")
+            # Either no red, or tiger appears after cyan before any red
+            assert red_pos == -1 or tiger_pos < red_pos or cyan_pos < tiger_pos < red_pos
+
+    def test_inactive_sessions_shown_in_red(self):
+        """Inactive sessions are shown in red."""
+        events = [
+            {"id": 1, "session_id": "stale-falcon", "timestamp": "2026-01-01T12:00:00"},
+        ]
+        # Mock _get_active_session_ids to return empty (no active sessions)
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value=set(),
+        ):
+            result = _format_result({"events": events, "next_cursor": "1"})
+            assert "stale-falcon" in result
+            assert _RED in result
+
+    def test_mixed_active_inactive_sessions(self):
+        """Active and inactive sessions are colored differently."""
+        events = [
+            {"id": 1, "session_id": "active-tiger", "timestamp": "2026-01-01T12:00:00"},
+            {"id": 2, "session_id": "gone-falcon", "timestamp": "2026-01-01T12:05:00"},
+        ]
+        # Mock to mark only active-tiger as active
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value={"active-tiger"},
+        ):
+            result = _format_result({"events": events, "next_cursor": "2"})
+            assert "active-tiger" in result
+            assert "gone-falcon" in result
+            # Both colors should be present
+            assert _CYAN in result
+            assert _RED in result
+
+    def test_active_sessions_sorted_first(self):
+        """Active sessions appear before inactive sessions in output."""
+        events = [
+            {"id": 1, "session_id": "zebra-active", "timestamp": "2026-01-01T12:00:00"},
+            {"id": 2, "session_id": "alpha-gone", "timestamp": "2026-01-01T12:05:00"},
+            {"id": 3, "session_id": "beta-active", "timestamp": "2026-01-01T12:10:00"},
+        ]
+        # zebra-active and beta-active are active, alpha-gone is not
+        # Despite alpha-gone being first alphabetically, active sessions come first
+        with patch(
+            "event_bus.middleware._get_active_session_ids",
+            return_value={"zebra-active", "beta-active"},
+        ):
+            result = _format_result({"events": events, "next_cursor": "3"})
+            # Active sessions should appear before inactive
+            # Order should be: beta-active, zebra-active, alpha-gone
+            beta_pos = result.find("beta-active")
+            zebra_pos = result.find("zebra-active")
+            alpha_pos = result.find("alpha-gone")
+            # Active sessions (beta, zebra) should come before inactive (alpha)
+            assert beta_pos < alpha_pos, (
+                "Active beta-active should appear before inactive alpha-gone"
+            )
+            assert zebra_pos < alpha_pos, (
+                "Active zebra-active should appear before inactive alpha-gone"
+            )
+            # Within active, alphabetical order
+            assert beta_pos < zebra_pos, (
+                "beta-active should appear before zebra-active (alphabetical)"
+            )

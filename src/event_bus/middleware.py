@@ -40,6 +40,15 @@ def _lookup_session_name(session_id: str) -> str | None:
         return None
 
 
+def _get_active_session_ids() -> set[str]:
+    """Get set of currently active session IDs."""
+    try:
+        storage = _get_storage()
+        return {s.id for s in storage.list_sessions()}
+    except Exception:
+        return set()
+
+
 # ANSI color codes for tail -f viewing
 _BOLD = "\033[1m"
 _GREEN = "\033[32m"
@@ -169,6 +178,7 @@ def _format_result(result) -> str:
         extra_info = []
 
         # Show unique publishers (only human-readable session names)
+        # Inactive sessions are shown in red, active in cyan
         if count > 0:
             publishers = set()
             for e in events:
@@ -176,10 +186,21 @@ def _format_result(result) -> str:
                 if _is_human_readable_id(sid):
                     publishers.add(sid)
             if publishers:
-                names = ", ".join(sorted(publishers)[:5])  # Limit to 5
+                active_sessions = _get_active_session_ids()
+                # Sort: active first (alphabetically), then inactive (alphabetically)
+                active = sorted(p for p in publishers if p in active_sessions)
+                inactive = sorted(p for p in publishers if p not in active_sessions)
+                sorted_publishers = (active + inactive)[:5]
+                colored_names = []
+                for name in sorted_publishers:
+                    if name in active_sessions:
+                        colored_names.append(f"{_CYAN}{name}{_RESET}")
+                    else:
+                        colored_names.append(f"{_RED}{name}{_RESET}")
+                names_str = ", ".join(colored_names)
                 if len(publishers) > 5:
-                    names += f" +{len(publishers) - 5}"
-                extra_info.append(f"{_CYAN}from: {names}{_RESET}")
+                    names_str += f" +{len(publishers) - 5}"
+                extra_info.append(f"from: {names_str}")
 
         # Show timespan if we have events with timestamps
         # Use min/max to always show oldest→newest regardless of order param
