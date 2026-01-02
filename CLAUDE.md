@@ -23,6 +23,13 @@ MCP server providing an event bus for cross-session Claude Code communication. S
 - `make reinstall` - Just reinstalls Python package
 - Schema migrations via `@migration` decorator in `storage.py`
 
+### Before schema/migration changes:
+**ALWAYS back up the database before making schema or migration changes:**
+```bash
+cp ~/.claude/contrib/event-bus/data.db ~/.claude/contrib/event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)
+```
+Migrations can have subtle bugs (race conditions, incorrect data transforms) that corrupt data irreversibly.
+
 ### If you need to test destructive operations:
 Use a temporary database in tests (all tests already do this via `conftest.py`).
 
