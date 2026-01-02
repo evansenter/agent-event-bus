@@ -97,8 +97,8 @@ def _format_args(args: dict) -> str:
     if not args:
         return ""
     parts = []
-    # Fields to highlight with colors
-    highlight_fields = {"name", "channel", "client_id"}
+    # Fields to highlight with colors (key identifiers only)
+    highlight_fields = {"name", "channel"}
     for k, v in args.items():
         if k == "session_id" and isinstance(v, str):
             # Special handling for session_id - show human-readable names prominently

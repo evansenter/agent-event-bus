@@ -34,7 +34,7 @@ class TestFormatArgs:
         assert 'type="test"' in result
 
     def test_highlighted_fields(self):
-        """name, channel, client_id are highlighted with bold values."""
+        """name and channel are highlighted with bold values."""
         result = _format_args({"name": "my-feature"})
         assert _CYAN in result
         assert _BOLD in result
