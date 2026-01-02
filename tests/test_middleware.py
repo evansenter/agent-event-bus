@@ -10,6 +10,7 @@ from event_bus.middleware import (
     _format_args,
     _format_list,
     _format_result,
+    _is_human_readable_id,
     _parse_sse_response,
 )
 
@@ -128,6 +129,32 @@ class TestFormatResult:
         result = _format_result({"events": events, "next_cursor": "1"})
         assert "from:" not in result
 
+    def test_events_result_excludes_uuids(self):
+        """UUID session_ids are not shown (only human-readable names)."""
+        events = [
+            {
+                "id": 1,
+                "session_id": "b712a0ba-1ee6-4c18-a647-31a785147665",
+                "timestamp": "2026-01-01T12:00:00",
+            },
+            {"id": 2, "session_id": "5f296cf4", "timestamp": "2026-01-01T12:05:00"},
+        ]
+        result = _format_result({"events": events, "next_cursor": "2"})
+        assert "from:" not in result  # No human-readable IDs, so no "from:"
+
+    def test_events_result_timespan_order_independent(self):
+        """Timespan always shows oldest→newest regardless of event order."""
+        # Events in reverse chronological order (desc)
+        events = [
+            {"id": 2, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:30:00"},
+            {"id": 1, "session_id": "brave-tiger", "timestamp": "2026-01-01T12:00:00"},
+        ]
+        result = _format_result({"events": events, "next_cursor": "2"})
+        # Should show oldest→newest: 12:00→12:30
+        assert "2026-01-01T12:00" in result
+        assert "2026-01-01T12:30" in result
+        assert "→" in result
+
     def test_event_id_result(self):
         """Result with event_id shows event #N."""
         result = _format_result({"event_id": 42, "channel": "all"})
@@ -209,3 +236,44 @@ class TestParseSSEResponse:
         """data: prefix without content returns empty dict."""
         result = _parse_sse_response("data: \n\n")
         assert result == {}
+
+
+class TestIsHumanReadableId:
+    """Tests for _is_human_readable_id function."""
+
+    def test_valid_human_readable_ids(self):
+        """Docker-style adjective-noun IDs are human-readable."""
+        assert _is_human_readable_id("brave-tiger") is True
+        assert _is_human_readable_id("tender-hawk") is True
+        assert _is_human_readable_id("happy-falcon") is True
+
+    def test_uuid_not_human_readable(self):
+        """UUIDs are not human-readable."""
+        assert _is_human_readable_id("b712a0ba-1ee6-4c18-a647-31a785147665") is False
+
+    def test_short_hex_not_human_readable(self):
+        """Short hex strings (truncated UUIDs) are not human-readable."""
+        assert _is_human_readable_id("5f296cf4") is False
+        assert _is_human_readable_id("adb2d408") is False
+
+    def test_anonymous_not_human_readable(self):
+        """'anonymous' is not considered human-readable."""
+        assert _is_human_readable_id("anonymous") is False
+
+    def test_empty_not_human_readable(self):
+        """Empty string is not human-readable."""
+        assert _is_human_readable_id("") is False
+
+    def test_single_word_not_human_readable(self):
+        """Single word without hyphen is not human-readable."""
+        assert _is_human_readable_id("tiger") is False
+
+    def test_numbers_not_human_readable(self):
+        """Words with numbers are not human-readable."""
+        assert _is_human_readable_id("brave-tiger123") is False
+        assert _is_human_readable_id("brave123-tiger") is False
+
+    def test_uppercase_not_human_readable(self):
+        """Uppercase words are not human-readable."""
+        assert _is_human_readable_id("Brave-Tiger") is False
+        assert _is_human_readable_id("BRAVE-TIGER") is False

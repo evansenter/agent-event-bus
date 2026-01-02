@@ -27,6 +27,21 @@ _TOOL_COLORS = {
 }
 
 
+def _is_human_readable_id(session_id: str) -> bool:
+    """Check if a session ID is human-readable (Docker-style adjective-noun).
+
+    Human-readable: "brave-tiger", "tender-hawk" (two lowercase words with hyphen)
+    Not human-readable: "b712a0ba-1ee6-4c18-a647-31a785147665" (UUID)
+    """
+    if not session_id or session_id == "anonymous":
+        return False
+    parts = session_id.split("-")
+    # Must be exactly two parts, both alphabetic lowercase
+    if len(parts) != 2:
+        return False
+    return all(part.isalpha() and part.islower() for part in parts)
+
+
 def _format_args(args: dict) -> str:
     """Format tool arguments concisely with key field highlighting."""
     if not args:
@@ -98,12 +113,12 @@ def _format_result(result) -> str:
 
         extra_info = []
 
-        # Show unique publishers (session names)
+        # Show unique publishers (only human-readable session names)
         if count > 0:
             publishers = set()
             for e in events:
                 sid = e.get("session_id", "")
-                if sid and sid != "anonymous":
+                if _is_human_readable_id(sid):
                     publishers.add(sid)
             if publishers:
                 names = ", ".join(sorted(publishers)[:5])  # Limit to 5
@@ -112,15 +127,18 @@ def _format_result(result) -> str:
                 extra_info.append(f"{_CYAN}from: {names}{_RESET}")
 
         # Show timespan if we have events with timestamps
-        if count > 0 and events[0].get("timestamp"):
+        # Use min/max to always show oldest→newest regardless of order param
+        if count > 0:
             try:
-                first_ts = events[-1].get("timestamp", "")[:16]  # Oldest
-                last_ts = events[0].get("timestamp", "")[:16]  # Newest
-                if first_ts and last_ts and first_ts != last_ts:
-                    extra_info.append(f"{_DIM}{first_ts} to {last_ts}{_RESET}")
-                elif first_ts:
-                    extra_info.append(f"{_DIM}{first_ts}{_RESET}")
-            except (KeyError, IndexError):
+                timestamps = [e.get("timestamp", "") for e in events if e.get("timestamp")]
+                if timestamps:
+                    oldest = min(timestamps)[:16]
+                    newest = max(timestamps)[:16]
+                    if oldest != newest:
+                        extra_info.append(f"{_DIM}{oldest} → {newest}{_RESET}")
+                    elif oldest:
+                        extra_info.append(f"{_DIM}{oldest}{_RESET}")
+            except (KeyError, IndexError, TypeError):
                 pass
 
         suffix = f" ({', '.join(extra_info)})" if extra_info else ""
