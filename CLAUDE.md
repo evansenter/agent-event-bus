@@ -137,6 +137,7 @@ The CLI and MCP tools expose the same functionality with consistent naming:
 2. **MCP tool docstrings** - in `server.py` (visible to CC via tool inspection)
 3. **Usage guide** - `guide.md` (served as `event-bus://guide` resource)
 4. **CLAUDE.md** - This file, for codebase context
+5. **~/.claude/contrib/README.md** - User's local contrib directory (lists MCP server data locations)
 
 Ensure parameter names match (kebab ↔ snake conversion) across CLI and MCP.
 
