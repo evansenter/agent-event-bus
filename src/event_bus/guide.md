@@ -241,6 +241,7 @@ The notification alerts the **human** who routes the message to the correct sess
 - `list_sessions()` returns most recently active sessions first
 - Sessions are auto-cleaned after 24 hours of inactivity
 - The repo name is auto-detected from your working directory
+- **Historical events**: Events from before schema v2 may show human-readable session IDs (e.g., "brave-tiger") that don't match current sessions - this is expected and handled gracefully in display
 
 ## Event Type Conventions
 

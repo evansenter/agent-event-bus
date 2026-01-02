@@ -51,8 +51,11 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
     3. Copies existing id → display_id
     4. Changes id to use client_id (if available) or generates UUID
 
-    Note: Existing events keep their old session_id references. New events
-    will use the new UUID-based session_id.
+    Note on historical data: Existing events retain their old session_id references
+    (human-readable names like "brave-tiger"). These become orphaned - they no longer
+    match any session's primary key. This is expected: the middleware handles display
+    of historical events via _is_human_readable_id() fallback. New events will use
+    the new UUID-based session_id.
     """
     import uuid
 
