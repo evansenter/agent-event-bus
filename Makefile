@@ -83,7 +83,7 @@ restart:
 		if launchctl list | grep -q "com.evansenter.claude-event-bus"; then \
 			echo "Service restarted successfully"; \
 		else \
-			echo "Error: Service failed to start. Check ~/.claude/event-bus.err"; \
+			echo "Error: Service failed to start. Check ~/.claude/contrib/event-bus/event-bus.err"; \
 			exit 1; \
 		fi; \
 	else \

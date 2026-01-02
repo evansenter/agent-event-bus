@@ -24,5 +24,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$SCRIPT_DIR/uninstall-cli.sh"
 
 echo ""
-echo "Note: Logs remain at ~/.claude/event-bus.log"
-osascript -e 'display notification "LaunchAgent uninstalled" with title "Evan Bus"' 2>/dev/null
+echo "Note: Data remains at ~/.claude/contrib/event-bus/"
+osascript -e 'display notification "LaunchAgent uninstalled" with title "Event Bus"' 2>/dev/null

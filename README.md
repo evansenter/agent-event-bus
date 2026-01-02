@@ -139,9 +139,11 @@ cargo run --bin remove-bg    # Remove background
 
 ## Data Location
 
-- **Database**: `~/.claude/contrib/event-bus/data.db`
-- **Logs**: `~/.claude/event-bus.log`
-- **Errors**: `~/.claude/event-bus.err`
+All data stored under `~/.claude/contrib/event-bus/`:
+
+- **Database**: `data.db`
+- **Logs**: `event-bus.log`
+- **Errors**: `event-bus.err`
 
 ## Related
 
