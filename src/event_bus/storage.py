@@ -2,7 +2,9 @@
 
 import logging
 import os
+import shutil
 import sqlite3
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,6 +12,38 @@ from pathlib import Path
 from typing import Literal
 
 logger = logging.getLogger("event-bus")
+
+# Schema version for migrations
+# Increment this when adding new migrations
+SCHEMA_VERSION = 1
+
+# Migration function type: takes a connection, returns nothing
+MigrationFunc = Callable[[sqlite3.Connection], None]
+
+# Migration registry: version -> (name, migration_function)
+MIGRATIONS: dict[int, tuple[str, MigrationFunc]] = {}
+
+
+def migration(version: int, name: str):
+    """Decorator to register a schema migration.
+
+    Usage:
+        @migration(2, "add_some_column")
+        def migrate_v2(conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE ... ADD COLUMN ...")
+    """
+
+    def decorator(func: MigrationFunc):
+        MIGRATIONS[version] = (name, func)
+        return func
+
+    return decorator
+
+
+# Future migrations go here:
+# @migration(2, "add_new_feature")
+# def migrate_v2(conn):
+#     conn.execute("ALTER TABLE sessions ADD COLUMN new_column TEXT")
 
 # Register datetime adapters/converters (required for Python 3.12+)
 # See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
@@ -76,8 +110,11 @@ class Event:
     channel: str = "all"  # Target channel for the event
 
 
-# Default database path
-DEFAULT_DB_PATH = Path.home() / ".claude" / "event-bus.db"
+# Database paths
+# New canonical path (aligned with session-analytics under contrib/)
+DEFAULT_DB_PATH = Path.home() / ".claude" / "contrib" / "event-bus" / "data.db"
+# Old path for automatic migration
+OLD_DB_PATH = Path.home() / ".claude" / "event-bus.db"
 
 # Session timeout in seconds (24 hours without activity = dead)
 # Local crashed sessions are cleaned up faster via client liveness check
@@ -94,9 +131,26 @@ class SQLiteStorage:
             db_path = os.environ.get("EVENT_BUS_DB", str(DEFAULT_DB_PATH))
 
         self.db_path = Path(db_path)
+
+        # Migrate from old location if needed (only for default path, not custom/test paths)
+        if self.db_path == DEFAULT_DB_PATH:
+            self._migrate_db_location()
+
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
+
+    def _migrate_db_location(self) -> None:
+        """Migrate database from old location to new location.
+
+        Old: ~/.claude/event-bus.db
+        New: ~/.claude/contrib/event-bus/data.db
+        """
+        if OLD_DB_PATH.exists() and not self.db_path.exists():
+            logger.info(f"Migrating database from {OLD_DB_PATH} to {self.db_path}")
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(OLD_DB_PATH), str(self.db_path))
+            logger.info("Database migration complete")
 
     @contextmanager
     def _connect(self):
@@ -126,9 +180,41 @@ class SQLiteStorage:
             logger.warning("Migrating sessions table: dropping old pid-based schema")
             conn.execute("DROP TABLE sessions")
 
+    def _get_schema_version(self, conn: sqlite3.Connection) -> int:
+        """Get current schema version from database."""
+        try:
+            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            return row[0] if row else 0
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet
+            return 0
+
+    def _run_migrations(self, conn: sqlite3.Connection, current_version: int) -> None:
+        """Run all pending migrations."""
+        for version in range(current_version + 1, SCHEMA_VERSION + 1):
+            if version in MIGRATIONS:
+                name, migration_func = MIGRATIONS[version]
+                logger.info(f"Running migration {version}: {name}")
+                migration_func(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
+        )
+
     def _init_db(self):
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist.
+
+        NOTE: Schema elements are defined here for fresh installs.
+        Migrations incrementally upgrade existing databases.
+        Both paths must result in identical schemas.
+        """
         with self._connect() as conn:
+            # Create schema_version table first
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY
+                )
+            """)
+
             # Check if we need to migrate from pid to client_id schema
             self._migrate_sessions_schema(conn)
 
@@ -177,6 +263,11 @@ class SQLiteStorage:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_dedup ON sessions(machine, client_id)
             """)
+
+            # Run any pending migrations (also handles fresh installs where version=0)
+            current_version = self._get_schema_version(conn)
+            if current_version < SCHEMA_VERSION:
+                self._run_migrations(conn, current_version)
 
     # Session operations
 

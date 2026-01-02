@@ -11,6 +11,8 @@ When running multiple Claude Code sessions (via `/parallel-work` or separate ter
 - **Coordinate work** - Signal dependencies and handoffs
 - **Send notifications** - System notifications with custom icon support
 
+**Related**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) shares design patterns with this project.
+
 ## Architecture
 
 ```
@@ -67,6 +69,7 @@ make check
 |------|-------------|
 | `register_session` | Register this session with the event bus |
 | `list_sessions` | List all active sessions |
+| `list_channels` | List active channels with subscriber counts |
 | `publish_event` | Publish event to a channel (broadcast, repo, session) |
 | `get_events` | Poll for events (filtered by subscriptions) |
 | `unregister_session` | Clean up session on exit |
@@ -134,7 +137,16 @@ cargo run --bin remove-bg    # Remove background
 - [x] CLI wrapper for shell scripts
 - [ ] Tailscale support for multi-machine
 
+## Data Location
+
+All data stored under `~/.claude/contrib/event-bus/`:
+
+- **Database**: `data.db`
+- **Logs**: `event-bus.log`
+- **Errors**: `event-bus.err`
+
 ## Related
 
+- [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) - Historical analysis of Claude Code sessions
 - [RFC: Global event bus](https://github.com/evansenter/dotfiles/issues/41)
 - [`/parallel-work` command](https://github.com/evansenter/dotfiles)

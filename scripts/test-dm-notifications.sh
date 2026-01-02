@@ -152,4 +152,4 @@ echo "  1. Did you see notifications for DMs to session:$SESSION_B_ID?"
 echo "  2. Did you NOT see notification for repo:claude-event-bus?"
 echo
 echo "Check server logs for any warnings:"
-echo "  tail -f ~/.claude/event-bus.log"
+echo "  tail -f ~/.claude/contrib/event-bus/event-bus.log"

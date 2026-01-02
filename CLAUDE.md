@@ -6,6 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MCP server providing an event bus for cross-session Claude Code communication. Sessions can register, publish events, and poll for updates.
 
+**Related project**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) - Historical analysis of Claude Code sessions. Both projects share design patterns and should be kept aligned.
+
+## DATABASE PROTECTION
+
+**The database at `~/.claude/contrib/event-bus/data.db` contains irreplaceable event history.**
+
+### NEVER do any of the following:
+- Add code that deletes the database file (`os.remove()`, `unlink()`, `rm`)
+- Add `DROP TABLE` statements for `events` or `sessions`
+- Add `DELETE FROM` for user data tables
+- Add any "reset" or "clear all" functionality that destroys historical data
+
+### Safe operations:
+- `make uninstall` - Preserves database (only removes LaunchAgent + MCP config)
+- `make reinstall` - Just reinstalls Python package
+- Schema migrations via `@migration` decorator in `storage.py`
+
+### If you need to test destructive operations:
+Use a temporary database in tests (all tests already do this via `conftest.py`).
+
 ## Commands
 
 ```bash
@@ -109,7 +129,6 @@ The CLI and MCP tools expose the same functionality with consistent naming:
 
 **CLI-only features** (not in MCP):
 - `--timeout` - HTTP request timeout
-- `--track-state` - File-based cursor persistence
 - `--json` - JSON output format
 - `--exclude-types` - Event type filtering
 
@@ -118,6 +137,7 @@ The CLI and MCP tools expose the same functionality with consistent naming:
 2. **MCP tool docstrings** - in `server.py` (visible to CC via tool inspection)
 3. **Usage guide** - `guide.md` (served as `event-bus://guide` resource)
 4. **CLAUDE.md** - This file, for codebase context
+5. **~/.claude/contrib/README.md** - User's local contrib directory (lists MCP server data locations)
 
 Ensure parameter names match (kebab ↔ snake conversion) across CLI and MCP.
 
@@ -215,7 +235,7 @@ Use consistent event types for discoverability across sessions.
 - **Session cleanup**: 24-hour heartbeat timeout + client liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` auto-refresh heartbeat
 - **Cursor auto-tracking**: When `session_id` is passed to `get_events()`, the cursor is persisted. On session resume, `register_session()` returns the last cursor - no missed events!
-- **SQLite persistence**: State persists across restarts in `~/.claude/event-bus.db`
+- **SQLite persistence**: State persists across restarts in `~/.claude/contrib/event-bus/data.db`
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
 - **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
 - **Human-readable IDs**: Session IDs use Docker-style names (e.g., `brave-tiger`) instead of UUIDs
@@ -251,9 +271,6 @@ event-bus-cli events --json --limit 10 --exclude-types session_registered,sessio
 # Get events with session_id (cursor auto-tracked in DB - preferred)
 event-bus-cli events --session-id abc123 --cursor "$CURSOR" --order asc
 
-# Legacy: file-based state tracking (use DB tracking instead)
-event-bus-cli events --track-state ~/.local/state/claude/cursor --json --timeout 200
-
 # Poll for new events chronologically (use with cursor)
 event-bus-cli events --cursor abc123 --order asc --session-id mysession
 
@@ -274,14 +291,13 @@ event-bus-cli notify --title "Done" --message "Build complete"
 | `--limit N` | Maximum events to return |
 | `--exclude-types T1,T2` | Comma-separated event types to filter out |
 | `--timeout MS` | Request timeout in milliseconds (default: 10000) |
-| `--track-state FILE` | Read/write cursor for incremental polling |
 | `--json` | Output as JSON with `events` array and `next_cursor` |
 | `--order asc\|desc` | Event ordering: desc (default, newest first) or asc (oldest first) |
 
 ## Configuration
 
 ```bash
-# Override database path (default: ~/.claude/event-bus.db)
+# Override database path (default: ~/.claude/contrib/event-bus/data.db)
 EVENT_BUS_DB=/path/to/db.sqlite event-bus
 
 # Enable request/response logging (for dev mode)

@@ -32,10 +32,10 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/.claude/event-bus.log</string>
+    <string>__HOME__/.claude/contrib/event-bus/event-bus.log</string>
 
     <key>StandardErrorPath</key>
-    <string>__HOME__/.claude/event-bus.err</string>
+    <string>__HOME__/.claude/contrib/event-bus/event-bus.err</string>
 
     <key>ProcessType</key>
     <string>Background</string>
