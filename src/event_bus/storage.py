@@ -17,8 +17,11 @@ logger = logging.getLogger("event-bus")
 # Increment this when adding new migrations
 SCHEMA_VERSION = 1
 
+# Migration function type: takes a connection, returns nothing
+MigrationFunc = Callable[[sqlite3.Connection], None]
+
 # Migration registry: version -> (name, migration_function)
-MIGRATIONS: dict[int, tuple[str, Callable]] = {}
+MIGRATIONS: dict[int, tuple[str, MigrationFunc]] = {}
 
 
 def migration(version: int, name: str):
@@ -26,11 +29,11 @@ def migration(version: int, name: str):
 
     Usage:
         @migration(2, "add_some_column")
-        def migrate_v2(conn):
+        def migrate_v2(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE ... ADD COLUMN ...")
     """
 
-    def decorator(func: Callable):
+    def decorator(func: MigrationFunc):
         MIGRATIONS[version] = (name, func)
         return func
 
