@@ -513,10 +513,11 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
         session_id=session_id,
     )
 
-    dev_notify("unregister_session", f"{session.name} ({session_id})")
+    dev_notify("unregister_session", f"{session.name} ({session.display_id})")
     return {
         "success": True,
         "session_id": session_id,
+        "display_id": session.display_id,
         "active_sessions": storage.session_count(),
     }
 

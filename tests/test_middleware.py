@@ -79,7 +79,7 @@ class TestFormatList:
         assert _DIM in result
 
     def test_session_list(self):
-        """List with session_id shows names."""
+        """List with session_id shows names with formatting."""
         items = [
             {"session_id": "brave-tiger"},
             {"session_id": "happy-falcon"},
@@ -87,7 +87,8 @@ class TestFormatList:
         result = _format_list(items)
         assert "brave-tiger" in result
         assert "happy-falcon" in result
-        assert _CYAN in result
+        # Human-readable IDs use BOLD when not in DB (no lookup)
+        assert _BOLD in result
 
     def test_channel_list(self):
         """List with channel+subscribers shows channel names."""
@@ -110,10 +111,12 @@ class TestFormatResult:
     """Tests for _format_result function."""
 
     def test_session_id_result(self):
-        """Result with session_id shows session=name."""
+        """Result with session_id shows session=name with formatting."""
         result = _format_result({"session_id": "tender-hawk"})
-        assert "session=tender-hawk" in result
-        assert _CYAN in result
+        # Human-readable ID is formatted with BOLD when no DB lookup
+        assert "tender-hawk" in result
+        assert "session=" in result
+        assert _BOLD in result
 
     def test_events_result_empty(self):
         """Empty events result shows 0 events."""
@@ -219,7 +222,9 @@ class TestFormatResult:
             "isError": False,
         }
         result = _format_result(wrapped)
-        assert "session=test-session" in result
+        # Human-readable ID is formatted with BOLD when no DB lookup
+        assert "session=" in result
+        assert "test-session" in result
 
     def test_list_result(self):
         """List result delegates to _format_list."""

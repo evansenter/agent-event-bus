@@ -69,8 +69,14 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
     if "deleted_at" not in existing_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at TIMESTAMP")
 
-    # Copy existing id to display_id
-    conn.execute("UPDATE sessions SET display_id = id")
+    # Copy existing id to display_id ONLY if display_id is NULL or same as id (UUID)
+    # This preserves human-readable display_ids from new session registrations
+    # while still populating display_id for legacy sessions from before this column existed
+    conn.execute("""
+        UPDATE sessions
+        SET display_id = id
+        WHERE display_id IS NULL
+    """)
 
     # For sessions with client_id, update id to use client_id
     # For sessions without client_id, generate a UUID
@@ -234,8 +240,9 @@ class SQLiteStorage:
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         """Get current schema version from database."""
         try:
-            row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            return row[0] if row else 0
+            # Get MAX version to handle multiple rows (bug from earlier versions)
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            return row[0] if row and row[0] is not None else 0
         except sqlite3.OperationalError:
             # Table doesn't exist yet
             return 0
@@ -247,9 +254,9 @@ class SQLiteStorage:
                 name, migration_func = MIGRATIONS[version]
                 logger.info(f"Running migration {version}: {name}")
                 migration_func(conn)
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
-        )
+        # Clear and set version (handles multi-row bug from earlier versions)
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
     def _init_db(self):
         """Create tables if they don't exist.

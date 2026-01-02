@@ -107,9 +107,11 @@ def _format_args(args: dict) -> str:
     parts = []
     # Fields to highlight with colors (key identifiers only)
     highlight_fields = {"name", "channel"}
+    # ID fields that should be formatted specially (dim UUIDs, bold human-readable)
+    id_fields = {"session_id", "client_id"}
     for k, v in args.items():
-        if k == "session_id" and isinstance(v, str):
-            # Special handling for session_id - show human-readable names prominently
+        if k in id_fields and isinstance(v, str):
+            # Special handling for ID fields - show human-readable names prominently, dim UUIDs
             formatted_val = _format_session_id_value(v)
             parts.append(f"{_CYAN}{k}{_RESET}={formatted_val}")
         elif k in highlight_fields:
@@ -133,9 +135,22 @@ def _format_list(items: list) -> str:
     if first:
         if "session_id" in first:
             # Show session display_ids (human-readable names): tender-hawk, brave-tiger, ...
-            # Prefer display_id if available, fall back to session_id
-            names = [item.get("display_id") or item.get("session_id", "?") for item in items]
-            return f"{_CYAN}{', '.join(names)}{_RESET}"
+            # Prefer display_id if available, look it up if not, format UUID as fallback
+            names = []
+            for item in items:
+                display_id = item.get("display_id")
+                if display_id:
+                    names.append(f"{_CYAN}{display_id}{_RESET}")
+                else:
+                    # Try to look up the display_id from session_id
+                    sid = item.get("session_id", "?")
+                    resolved = _lookup_session_display_id(sid) if sid != "?" else None
+                    if resolved:
+                        names.append(f"{_CYAN}{resolved}{_RESET}")
+                    else:
+                        # Format the ID (dim truncated UUID)
+                        names.append(_format_session_id_value(sid))
+            return ", ".join(names)
         if "channel" in first and "subscribers" in first:
             # Show channel names: all, repo:foo, machine:bar, ...
             names = [item.get("channel", "?") for item in items]
@@ -168,7 +183,15 @@ def _format_result(result) -> str:
 
     # Handle common result patterns with colors
     if "session_id" in result:
-        return f"{_CYAN}session={result['session_id']}{_RESET}"
+        # For session results, prefer display_id if available, otherwise look it up
+        sid = result["session_id"]
+        display_id = result.get("display_id") or _lookup_session_display_id(sid)
+        if display_id:
+            return f"{_CYAN}session={display_id}{_RESET}"
+        else:
+            # Fallback: dim the UUID
+            formatted_id = _format_session_id_value(sid)
+            return f"session={formatted_id}"
     if "events" in result:
         events = result.get("events", [])
         count = len(events)
