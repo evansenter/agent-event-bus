@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 logger = logging.getLogger("event-bus")
 
@@ -17,7 +17,7 @@ logger = logging.getLogger("event-bus")
 SCHEMA_VERSION = 1
 
 # Migration registry: version -> (name, migration_function)
-MIGRATIONS: dict[int, tuple[str, callable]] = {}
+MIGRATIONS: dict[int, tuple[str, Callable]] = {}
 
 
 def migration(version: int, name: str):
@@ -29,7 +29,7 @@ def migration(version: int, name: str):
             conn.execute("ALTER TABLE ... ADD COLUMN ...")
     """
 
-    def decorator(func: callable):
+    def decorator(func: Callable):
         MIGRATIONS[version] = (name, func)
         return func
 
@@ -260,16 +260,10 @@ class SQLiteStorage:
                 CREATE INDEX IF NOT EXISTS idx_sessions_dedup ON sessions(machine, client_id)
             """)
 
-            # Run any pending migrations
+            # Run any pending migrations (also handles fresh installs where version=0)
             current_version = self._get_schema_version(conn)
             if current_version < SCHEMA_VERSION:
                 self._run_migrations(conn, current_version)
-            elif current_version == 0:
-                # Fresh install, set version
-                conn.execute(
-                    "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
-                    (SCHEMA_VERSION,),
-                )
 
     # Session operations
 
