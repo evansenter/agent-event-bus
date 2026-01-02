@@ -79,7 +79,7 @@ src/event_bus/
 ├── server.py      # MCP tools and server entry point
 ├── storage.py     # SQLite storage backend (Session, Event, SQLiteStorage)
 ├── helpers.py     # Utility functions (notifications, repo extraction)
-├── middleware.py  # Request logging middleware for dev mode
+├── middleware.py  # Request logging middleware (logs to ~/.claude/contrib/event-bus/event-bus.log)
 ├── session_ids.py # Human-readable ID generation (Docker-style names)
 ├── cli.py         # CLI wrapper for shell scripts/hooks
 └── guide.md       # Usage guide served as MCP resource
@@ -294,13 +294,27 @@ event-bus-cli notify --title "Done" --message "Build complete"
 | `--json` | Output as JSON with `events` array and `next_cursor` |
 | `--order asc\|desc` | Event ordering: desc (default, newest first) or asc (oldest first) |
 
+## Logging
+
+All MCP tool calls are logged to `~/.claude/contrib/event-bus/event-bus.log` with pretty formatting and ANSI colors:
+
+```bash
+# Watch live activity (colors render in terminal)
+tail -f ~/.claude/contrib/event-bus/event-bus.log
+
+# Example output:
+# 22:30:15 │ list_sessions() → [7 items]
+# 22:30:16 │ get_events(order="asc", limit=20) → 3 events, cursor=42
+# 22:30:17 │ publish_event(event_type="task_done", payload="Finished") → event #43 [all]
+```
+
 ## Configuration
 
 ```bash
 # Override database path (default: ~/.claude/contrib/event-bus/data.db)
 EVENT_BUS_DB=/path/to/db.sqlite event-bus
 
-# Enable request/response logging (for dev mode)
+# Enable console logging in addition to file (for development)
 DEV_MODE=1 event-bus
 
 # Custom notification icon (requires terminal-notifier on macOS)

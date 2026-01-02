@@ -373,10 +373,7 @@ class SQLiteStorage:
 
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM sessions WHERE last_heartbeat < ?", (cutoff_dt,))
-            count = cursor.rowcount
-            if count > 0:
-                logger.warning(f"Cleaned up {count} stale session(s)")
-            return count
+            return cursor.rowcount
 
     def session_count(self) -> int:
         """Get count of active sessions."""
@@ -439,8 +436,7 @@ class SQLiteStorage:
                 try:
                     since_id = int(cursor)
                 except ValueError:
-                    logger.warning(f"Malformed cursor '{cursor}', resetting to start")
-                    since_id = 0
+                    since_id = 0  # Malformed cursor, reset to start
 
             # Build WHERE clause based on cursor
             if since_id == 0:

@@ -28,15 +28,31 @@ from event_bus.middleware import RequestLoggingMiddleware
 from event_bus.session_ids import generate_session_id
 from event_bus.storage import Session, SQLiteStorage
 
-# Configure logging - only enable DEBUG for our logger, not third-party libs
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Configure logging
+# Always log to ~/.claude/contrib/event-bus/event-bus.log for tail -f access
+# In dev mode, also log to console
+# Skip file logging during tests to avoid polluting production logs
+LOG_FILE = Path.home() / ".claude" / "contrib" / "event-bus" / "event-bus.log"
+
 logger = logging.getLogger("event-bus")
-if os.environ.get("DEV_MODE"):
-    logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG if os.environ.get("DEV_MODE") else logging.INFO)
+
+# File handler - skip during tests, guard against reimport duplication
+if not os.environ.get("PYTEST_CURRENT_TEST") and not logger.handlers:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s │ %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(file_handler)
+
+    # Console handler - only in dev mode
+    if os.environ.get("DEV_MODE"):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+        )
+        logger.addHandler(console_handler)
 
 # Initialize MCP server
 mcp = FastMCP("event-bus")
@@ -91,7 +107,6 @@ def _get_live_sessions() -> list[Session]:
         is_local = s.machine == local_hostname
         if not is_client_alive(s.client_id, is_local):
             storage.delete_session(s.id)
-            logger.info(f"Cleaned up dead session {s.id} (client_id {s.client_id} not running)")
             continue
         live.append(s)
 
@@ -118,19 +133,13 @@ def _notify_dm_recipient(
 
     parts = channel.split(":", 1)
     if len(parts) != 2 or not parts[1]:
-        logger.warning(f"Invalid session channel format: '{channel}'. Expected 'session:<id>'")
-        return
+        return  # Invalid format, silently skip
 
     target_id = parts[1]
     target_session = storage.get_session(target_id)
 
     if not target_session:
-        logger.warning(
-            f"Cannot send DM notification: target session '{target_id}' not found. "
-            f"The event was published to channel 'session:{target_id}', but no active session "
-            f"exists with that ID. Session may have expired or ID may be incorrect."
-        )
-        return
+        return  # Session not found, silently skip
 
     # Get sender info for notification context
     sender_name = "anonymous"
@@ -138,32 +147,19 @@ def _notify_dm_recipient(
         sender_session = storage.get_session(sender_session_id)
         if sender_session:
             sender_name = sender_session.name
-        else:
-            logger.warning(
-                f"Sender session '{sender_session_id}' not found when sending DM to {target_id}. "
-                f"Using anonymous as sender name."
-            )
+        # If sender not found, keep "anonymous" - don't log (normal during tests/cleanup)
 
     # Send notification to alert the human
     payload_preview = payload[:50] + "..." if len(payload) > 50 else payload
     try:
         project_name = target_session.get_project_name()
-        notification_sent = send_notification(
+        send_notification(
             title=f"📨 {target_session.name} • {project_name}",
             message=f"From: {sender_name}\n{payload_preview}",
         )
-
-        if not notification_sent:
-            logger.warning(
-                f"Failed to send DM notification to session {target_id} "
-                f"(name: {target_session.name}, sender: {sender_name}). "
-                f"The event was published successfully, but the human may not be notified."
-            )
-    except Exception as e:
-        logger.error(
-            f"Exception while sending DM notification to session {target_id}: {e}. "
-            f"The event will still be published."
-        )
+        # Notification failure is silent - event is still published
+    except Exception:
+        pass  # Notification failure is non-critical, event is still published
 
 
 @mcp.tool()
@@ -440,9 +436,10 @@ def get_events(
     # Note: Updates on any poll, not just when cursor is provided. This is intentional -
     # any poll means the session has "seen" events up to this point, regardless of
     # whether they started from a specific cursor or checked recent activity.
+    # Silently ignore unknown session_ids - callers may pass external session IDs
+    # (like Claude Code's own UUIDs) that aren't registered with us.
     if session_id and next_cursor:
-        if not storage.update_session_cursor(session_id, next_cursor):
-            logger.warning(f"Failed to persist cursor for session {session_id}")
+        storage.update_session_cursor(session_id, next_cursor)
 
     events = [
         {
@@ -539,15 +536,16 @@ def notify(title: str, message: str, sound: bool = False) -> dict:
 
 
 def create_app():
-    """Create the ASGI app with optional logging middleware."""
+    """Create the ASGI app with logging middleware.
+
+    All MCP tool calls are logged to ~/.claude/contrib/event-bus/event-bus.log.
+    Use `tail -f ~/.claude/contrib/event-bus/event-bus.log` to watch activity.
+    """
     # stateless_http=True allows resilience to server restarts
     app = mcp.http_app(stateless_http=True)
 
-    if os.environ.get("DEV_MODE"):
-        logger.info("Dev mode enabled - logging all requests")
-        return RequestLoggingMiddleware(app)
-
-    return app
+    # Always wrap with logging middleware
+    return RequestLoggingMiddleware(app)
 
 
 def main():
@@ -557,13 +555,15 @@ def main():
     port = int(os.environ.get("PORT", 8080))
     host = os.environ.get("HOST", "127.0.0.1")
 
+    logger.info(f"Starting Claude Event Bus on {host}:{port}")
     print(f"Starting Claude Event Bus on {host}:{port}")
     print(
         f"Add to Claude Code: claude mcp add --transport http --scope user event-bus http://{host}:{port}/mcp"
     )
 
-    # FastMCP provides an ASGI app (wrap with logging in dev mode)
-    uvicorn.run(create_app(), host=host, port=port)
+    # Disable uvicorn's access log - we have our own middleware logging
+    # This keeps ~/.claude/contrib/event-bus/event-bus.log clean with just our pretty-printed tool calls
+    uvicorn.run(create_app(), host=host, port=port, access_log=False)
 
 
 if __name__ == "__main__":

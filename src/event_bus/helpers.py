@@ -127,12 +127,10 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
                 subprocess.run(cmd, check=True, capture_output=True)
                 return True
             else:
-                logger.warning("notify-send not found on Linux")
-                return False
+                return False  # notify-send not available
 
         else:
-            logger.warning(f"Notifications not supported on {system}")
-            return False
+            return False  # Unsupported platform
 
     except subprocess.CalledProcessError as e:
         # Include stderr/stdout for debugging
