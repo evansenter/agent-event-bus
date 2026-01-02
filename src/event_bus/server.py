@@ -37,22 +37,22 @@ LOG_FILE = Path.home() / ".claude" / "contrib" / "event-bus" / "event-bus.log"
 logger = logging.getLogger("event-bus")
 logger.setLevel(logging.DEBUG if os.environ.get("DEV_MODE") else logging.INFO)
 
-# File handler - skip during tests (detected by PYTEST_CURRENT_TEST env var)
-if not os.environ.get("PYTEST_CURRENT_TEST"):
+# File handler - skip during tests, guard against reimport duplication
+if not os.environ.get("PYTEST_CURRENT_TEST") and not logger.handlers:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s │ %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(file_handler)
 
-# Console handler - only in dev mode
-if os.environ.get("DEV_MODE"):
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-    )
-    logger.addHandler(console_handler)
+    # Console handler - only in dev mode
+    if os.environ.get("DEV_MODE"):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+        )
+        logger.addHandler(console_handler)
 
 # Initialize MCP server
 mcp = FastMCP("event-bus")

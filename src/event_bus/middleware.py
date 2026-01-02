@@ -318,5 +318,5 @@ class RequestLoggingMiddleware:
             else:
                 logger.info(f"{caller_prefix}{tool_colored}() {arrow} {result_str}")
 
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass  # Skip malformed requests
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.debug(f"Skipping malformed MCP request: {e}")
