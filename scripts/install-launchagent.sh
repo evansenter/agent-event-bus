@@ -52,9 +52,9 @@ if launchctl list | grep -q "$LABEL"; then
     "$SCRIPT_DIR/install-cli.sh"
     echo ""
     echo "To uninstall: $SCRIPT_DIR/uninstall-launchagent.sh"
-    osascript -e 'display notification "LaunchAgent installed and running" with title "Evan Bus"' 2>/dev/null
+    osascript -e 'display notification "LaunchAgent installed and running" with title "Event Bus"' 2>/dev/null
 else
     echo "Error: Service failed to start. Check ~/.claude/event-bus.err"
-    osascript -e 'display notification "Failed to start - check logs" with title "Evan Bus" sound name "Basso"' 2>/dev/null
+    osascript -e 'display notification "Failed to start - check logs" with title "Event Bus" sound name "Basso"' 2>/dev/null
     exit 1
 fi

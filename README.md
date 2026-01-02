@@ -6,6 +6,8 @@ MCP server for cross-session Claude Code communication and coordination.
 
 When running multiple Claude Code sessions (via `/parallel-work` or separate terminals), each session is isolated. This MCP server provides an event bus for sessions to:
 
+**Related**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) shares design patterns with this project.
+
 - **Announce presence** - Know what other sessions are active
 - **Broadcast status** - Share progress updates and task completion
 - **Coordinate work** - Signal dependencies and handoffs
@@ -67,6 +69,7 @@ make check
 |------|-------------|
 | `register_session` | Register this session with the event bus |
 | `list_sessions` | List all active sessions |
+| `list_channels` | List active channels with subscriber counts |
 | `publish_event` | Publish event to a channel (broadcast, repo, session) |
 | `get_events` | Poll for events (filtered by subscriptions) |
 | `unregister_session` | Clean up session on exit |
@@ -134,7 +137,14 @@ cargo run --bin remove-bg    # Remove background
 - [x] CLI wrapper for shell scripts
 - [ ] Tailscale support for multi-machine
 
+## Data Location
+
+- **Database**: `~/.claude/contrib/event-bus/data.db`
+- **Logs**: `~/.claude/event-bus.log`
+- **Errors**: `~/.claude/event-bus.err`
+
 ## Related
 
+- [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) - Historical analysis of Claude Code sessions
 - [RFC: Global event bus](https://github.com/evansenter/dotfiles/issues/41)
 - [`/parallel-work` command](https://github.com/evansenter/dotfiles)

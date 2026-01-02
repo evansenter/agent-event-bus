@@ -20,11 +20,12 @@ clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# Create virtual environment
+# Create virtual environment (requires Python 3.10+)
 venv:
 	@if [ ! -d .venv ]; then \
 		echo "Creating virtual environment..."; \
-		python3 -m venv .venv; \
+		PYTHON=$$(command -v python3.12 || command -v python3.11 || command -v python3.10 || echo "python3"); \
+		$$PYTHON -m venv .venv && .venv/bin/pip install --upgrade pip; \
 	fi
 
 # Install with dev dependencies (for development)
@@ -73,11 +74,22 @@ uninstall:
 
 # Restart the server (reload code changes)
 restart:
-	@echo "Restarting event-bus..."
-	@launchctl stop com.evansenter.claude-event-bus 2>/dev/null || true
-	@sleep 1
-	@launchctl start com.evansenter.claude-event-bus
-	@echo "Done. Server restarted."
+	@PLIST="$$HOME/Library/LaunchAgents/com.evansenter.claude-event-bus.plist"; \
+	if [ -f "$$PLIST" ]; then \
+		echo "Restarting event-bus..."; \
+		launchctl unload "$$PLIST" 2>/dev/null || true; \
+		launchctl load "$$PLIST"; \
+		sleep 1; \
+		if launchctl list | grep -q "com.evansenter.claude-event-bus"; then \
+			echo "Service restarted successfully"; \
+		else \
+			echo "Error: Service failed to start. Check ~/.claude/event-bus.err"; \
+			exit 1; \
+		fi; \
+	else \
+		echo "LaunchAgent not installed. Run: make install"; \
+		exit 1; \
+	fi
 
 # Reinstall and restart (install + restart in one command)
 reinstall: install restart
