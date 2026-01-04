@@ -290,9 +290,9 @@ class TestGetEvents:
         assert "event2" in types
         assert "event3" in types
 
-    def test_get_events_channel_filtering(self):
-        """Test that events are filtered by channel."""
-        # Register a session to get channel filtering
+    def test_get_events_broadcast_model(self):
+        """Test that all events are visible (broadcast model)."""
+        # Register a session
         reg = register_session(name="test", machine="test-machine", cwd="/test/repo")
         session_id = reg["session_id"]
 
@@ -303,15 +303,16 @@ class TestGetEvents:
         publish_event("my_repo", "msg4", channel="repo:repo")
         publish_event("other_repo", "msg5", channel="repo:other-repo")
 
-        # Get events for this session
+        # Get events for this session - broadcast model means ALL events visible
         result = get_events(session_id=session_id)
 
         types = {e["event_type"] for e in result["events"]}
+        # All events should be visible regardless of channel
         assert "broadcast" in types
         assert "for_me" in types
         assert "my_repo" in types
-        assert "for_other" not in types
-        assert "other_repo" not in types
+        assert "for_other" in types  # Now visible in broadcast model
+        assert "other_repo" in types  # Now visible in broadcast model
 
 
 class TestGetEventsOrdering:
@@ -489,8 +490,8 @@ class TestGetImplicitChannels:
         """Test with nonexistent session."""
         assert server._get_implicit_channels("nonexistent") is None
 
-    def test_implicit_channels(self):
-        """Test implicit channel subscriptions."""
+    def test_broadcast_model_returns_none(self):
+        """Test that broadcast model returns None (no filtering)."""
         reg = register_session(
             name="test",
             machine="my-machine",
@@ -498,12 +499,8 @@ class TestGetImplicitChannels:
         )
         session_id = reg["session_id"]
 
-        channels = server._get_implicit_channels(session_id)
-
-        assert "all" in channels
-        assert f"session:{session_id}" in channels
-        assert "repo:myrepo" in channels
-        assert "machine:my-machine" in channels
+        # Broadcast model: always returns None (no filtering)
+        assert server._get_implicit_channels(session_id) is None
 
 
 class TestAutoHeartbeat:
@@ -829,24 +826,27 @@ class TestGetEventsChannelFilter:
         assert "broadcast" not in types
         assert "other_repo" not in types
 
-    def test_channel_filter_overrides_session_filtering(self):
-        """Test that explicit channel filter overrides session-based filtering."""
-        # Register session with its own repo
+    def test_explicit_channel_filter_narrows_results(self):
+        """Test that explicit channel filter narrows results to that channel."""
+        # Register session
         reg = register_session(name="test", machine="remote-host", cwd="/test/myrepo")
         session_id = reg["session_id"]
 
-        # Publish to a different repo
-        publish_event("other_repo_event", "msg", channel="repo:different-repo")
+        # Publish to different channels
+        publish_event("my_repo_event", "msg1", channel="repo:myrepo")
+        publish_event("other_repo_event", "msg2", channel="repo:different-repo")
 
-        # Without channel filter, shouldn't see it (session filter)
+        # Without channel filter, see all events (broadcast model)
         result = get_events(session_id=session_id)
         types = {e["event_type"] for e in result["events"]}
-        assert "other_repo_event" not in types
+        assert "my_repo_event" in types
+        assert "other_repo_event" in types  # Visible in broadcast model
 
-        # With explicit channel filter, should see it
+        # With explicit channel filter, only see that channel's events
         result = get_events(session_id=session_id, channel="repo:different-repo")
         types = {e["event_type"] for e in result["events"]}
         assert "other_repo_event" in types
+        assert "my_repo_event" not in types  # Filtered out by explicit channel
 
     def test_channel_filter_all(self):
         """Test filtering to 'all' channel."""

@@ -74,16 +74,17 @@ unregister_session(client_id="my-unique-id")
 
 ## Channels
 
-Events are published to channels. Sessions auto-subscribe based on their attributes:
+Events can include a channel for context. **All sessions see all events** (broadcast model).
+Channels are metadata indicating what the event relates to:
 
-| Channel | Who Receives | When to Use |
-|---------|--------------|-------------|
-| `all` | Everyone | Rare - major announcements only |
-| `repo:{name}` | Same repository | **Most common** - coordinate parallel work |
-| `session:{id}` | One session | Direct messages, help requests |
-| `machine:{name}` | Same machine | Local coordination |
+| Channel | Meaning | When to Use |
+|---------|---------|-------------|
+| `all` | General broadcast | Default - general announcements |
+| `repo:{name}` | About this repository | Coordinate parallel work in a repo |
+| `session:{id}` | For one session | Direct messages, help requests |
+| `machine:{name}` | About this machine | Machine-specific coordination |
 
-**Default is `all`**, but prefer `repo:` for most coordination to avoid noise.
+The `channel` field helps recipients understand context. Use `get_events(channel=X)` to explicitly filter if needed.
 
 ### Discovering Channels
 
@@ -93,11 +94,12 @@ list_channels()
 → [{channel: "all", subscribers: 2}, {channel: "repo:my-project", subscribers: 2}, ...]
 ```
 
-Use `list_sessions()` to see what channels each session is subscribed to:
+Use `list_sessions()` to see what channels each session relates to:
 ```
 list_sessions()
 → [{name: "auth-feature", subscribed_channels: ["all", "session:abc", "repo:my-project", "machine:laptop"], ...}]
 ```
+Note: `subscribed_channels` shows related channels for context - with the broadcast model, all sessions see all events regardless of channel.
 
 ## Event Polling
 
@@ -136,13 +138,13 @@ Returns events after the cursor, **in chronological order**. Use this for catchi
 - `order="desc"` (default): Newest first - good for "what's happening?"
 - `order="asc"`: Oldest first - good for polling/catching up
 
-### Channel filtering
-Filter events to a specific channel:
+### Explicit channel filter
+Optionally filter events to a specific channel:
 ```
 get_events(channel="repo:my-project")
 → {events: [...], next_cursor: "50"}
 ```
-Without `channel`, events are filtered to your session's implicit subscriptions (if `session_id` provided) or all events.
+Without `channel`, you see all events (broadcast model). Use this parameter when you only want events about a specific repo, session, or machine.
 
 ### Recommended Pattern
 ```python
@@ -208,7 +210,7 @@ notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
 5. **Unregister on exit** - Keeps the session list clean
 
 ### Communication
-6. **Use repo channels** - Avoids noise from unrelated projects (prefer `repo:` over `all`)
+6. **Use meaningful channels** - Include `repo:` or `session:` for context (everyone sees all events, but channel metadata helps)
 7. **Keep payloads short** - They're for coordination, not data transfer
 8. **DMs auto-notify** - When you send to `session:{id}`, the human gets notified
 

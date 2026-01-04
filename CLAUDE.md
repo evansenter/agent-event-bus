@@ -182,27 +182,27 @@ Standard conventions for MCP tool and argument naming across related projects (s
 - CLI commands are short nouns/verbs: `sessions`, `publish`
 - MCP tools are descriptive: `list_sessions`, `publish_event`
 
-## Channel-Based Messaging
+## Channel Metadata
 
-Events can be targeted to specific channels:
+Events include a channel field for context. **All sessions see all events** (broadcast model).
 
-| Channel | Who receives |
-|---------|--------------|
-| `all` | Everyone (default, broadcast) |
-| `session:{id}` | Direct message to one session |
-| `repo:{name}` | All sessions in that repo |
-| `machine:{name}` | All sessions on that machine |
+| Channel | Meaning |
+|---------|---------|
+| `all` | General broadcast (default) |
+| `session:{id}` | About/for one session (triggers notification) |
+| `repo:{name}` | About this repository |
+| `machine:{name}` | About this machine |
 
-Sessions are auto-subscribed based on their attributes - no explicit subscribe needed.
+Channels are informational metadata. Use `get_events(channel=X)` for explicit filtering if needed.
 
 ```python
 # Broadcast (default)
 publish_event("status", "Done!", channel="all")
 
-# Direct message
+# Direct message (triggers notification to user)
 publish_event("help", "Review auth.ts?", channel="session:abc123")
 
-# Repo-scoped
+# Repo context
 publish_event("api_ready", "API merged", channel="repo:my-project")
 ```
 
@@ -244,7 +244,7 @@ Use consistent event types for discoverability across sessions.
 - **Cursor auto-tracking**: When `session_id` is passed to `get_events()`, the cursor is persisted. On session resume, `register_session()` returns the last cursor - no missed events!
 - **SQLite persistence**: State persists across restarts in `~/.claude/contrib/event-bus/data.db`
 - **Localhost binding**: Binds to 127.0.0.1 by default for security
-- **Implicit subscriptions**: No explicit subscribe - sessions auto-subscribed to relevant channels
+- **Broadcast model**: All sessions see all events; channels are metadata for context, not filters
 - **UUID session IDs**: `session_id` is a UUID (or `client_id` if provided); `display_id` holds the human-readable Docker-style name (e.g., `brave-tiger`) for user-facing display
 - **Client deduplication**: Sessions are deduplicated by `(machine, client_id)` - allows session resumption across restarts
 
@@ -293,8 +293,8 @@ event-bus-cli notify --title "Done" --message "Build complete"
 | Option | Description |
 |--------|-------------|
 | `--cursor ID` | Get events after this cursor (opaque string) |
-| `--session-id ID` | Your session ID for channel filtering |
-| `--channel CHANNEL` | Filter to a specific channel (e.g., `repo:my-project`) |
+| `--session-id ID` | Your session ID (for cursor tracking and heartbeat) |
+| `--channel CHANNEL` | Optionally filter to a specific channel (e.g., `repo:my-project`) |
 | `--limit N` | Maximum events to return |
 | `--exclude-types T1,T2` | Comma-separated event types to filter out |
 | `--timeout MS` | Request timeout in milliseconds (default: 10000) |
