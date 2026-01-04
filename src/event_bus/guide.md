@@ -21,6 +21,8 @@ CC sessions (e.g., via `/parallel-work` or separate terminals), this MCP server 
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
 
+*Signatures simplified for quick start. Full parameters (machine, cwd, cursor, limit, channel, etc.) available - check MCP tool docstrings.*
+
 ## Quick Start
 
 ### 1. Register on startup
