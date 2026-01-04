@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test clean install uninstall dev venv restart reinstall
+.PHONY: check fmt lint test clean install uninstall dev venv restart reinstall logs
 
 # Run all quality gates (format check, lint, tests)
 check: fmt lint test
@@ -93,3 +93,7 @@ restart:
 
 # Reinstall and restart (install + restart in one command)
 reinstall: install restart
+
+# Tail the event bus log
+logs:
+	@tail -f ~/.claude/contrib/event-bus/event-bus.log

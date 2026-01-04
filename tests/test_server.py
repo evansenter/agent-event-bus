@@ -617,6 +617,36 @@ class TestSessionCursorTracking:
         max_event_id = str(max(e["id"] for e in result["events"]))
         assert session.last_cursor == max_event_id
 
+    def test_cursor_not_updated_on_empty_poll(self):
+        """Test that cursor is not updated when poll returns zero events.
+
+        This is intentional behavior: if there are no new events, the high-water
+        mark should remain unchanged so resume continues from the correct position.
+        """
+        # Register a session
+        reg = register_session(name="test", machine="remote-host", client_id="cursor-empty-test")
+        session_id = reg["session_id"]
+
+        # Publish events and poll to establish cursor
+        publish_event("event1", "payload1")
+        publish_event("event2", "payload2")
+        result = get_events(session_id=session_id)
+        # Should have 3 events: session_registered + 2 published
+        assert len(result["events"]) >= 2
+
+        # Save the cursor after initial poll
+        session = server.storage.get_session(session_id)
+        saved_cursor = session.last_cursor
+        assert saved_cursor is not None
+
+        # Poll again with cursor - should get empty result
+        result2 = get_events(session_id=session_id, cursor=saved_cursor, order="asc")
+        assert len(result2["events"]) == 0
+
+        # Cursor should NOT have been updated (still same value)
+        session_after = server.storage.get_session(session_id)
+        assert session_after.last_cursor == saved_cursor
+
     def test_resumed_session_gets_last_cursor(self):
         """Test that resumed sessions get their last_cursor for seamless resume."""
         # Register initial session
