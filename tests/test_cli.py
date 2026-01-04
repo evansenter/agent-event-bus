@@ -62,6 +62,28 @@ class TestCallTool:
         assert result == {}
 
     @patch("event_bus.cli.requests.post")
+    def test_debug_false_prints_error_and_exits(self, mock_post, capsys):
+        """Test that debug=False (default) prints error and exits."""
+        mock_post.side_effect = ValueError("Something went wrong")
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.call_tool("list_sessions", {}, debug=False)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Something went wrong" in captured.err
+
+    @patch("event_bus.cli.requests.post")
+    def test_debug_true_propagates_exception(self, mock_post):
+        """Test that debug=True causes exception to propagate."""
+        mock_post.side_effect = ValueError("Something went wrong")
+
+        with pytest.raises(ValueError) as exc_info:
+            cli.call_tool("list_sessions", {}, debug=True)
+
+        assert "Something went wrong" in str(exc_info.value)
+
+    @patch("event_bus.cli.requests.post")
     def test_multiline_sse_response(self, mock_post):
         """Test parsing multiline SSE response."""
         mock_response = MagicMock()
