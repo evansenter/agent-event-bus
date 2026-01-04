@@ -11,142 +11,88 @@ When running multiple Claude Code sessions (via `/parallel-work` or separate ter
 - **Coordinate work** - Signal dependencies and handoffs
 - **Send notifications** - System notifications with custom icon support
 
-**Related**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) shares design patterns with this project.
-
-## Architecture
-
 ```
 ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
 │  CC Session 1   │  │  CC Session 2   │  │  CC Session 3   │
-│  (dotfiles)     │  │  (rust-genai)   │  │  (gemicro)      │
 └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-         │                    │                    │
          └────────────────────┼────────────────────┘
-                              │
                               ▼
               ┌───────────────────────────────────┐
-              │   claude-event-bus                │
-              │   localhost:8080                  │
+              │   claude-event-bus (localhost)    │
               └───────────────────────────────────┘
 ```
 
 ## Installation
 
 ```bash
-# Clone and install everything
 git clone https://github.com/evansenter/claude-event-bus.git
 cd claude-event-bus
 make install
 ```
 
-This installs:
-- Virtual environment with dependencies
-- LaunchAgent (auto-starts on login)
-- CLI to `~/.local/bin/event-bus-cli`
-- MCP server to Claude Code
+Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/event-bus-cli`), MCP server.
 
-Make sure `~/.local/bin` is in your PATH:
-```bash
-export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc
-```
-
-## Development
-
-```bash
-# Install with dev dependencies
-make dev
-
-# Run in dev mode (foreground, auto-reload)
-./scripts/dev.sh
-
-# Run quality checks
-make check
-```
+Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `register_session` | Register this session with the event bus |
-| `list_sessions` | List all active sessions |
-| `list_channels` | List active channels with subscriber counts |
-| `publish_event` | Publish event to a channel (broadcast, repo, session) |
-| `get_events` | Poll for events (filtered by subscriptions) |
-| `unregister_session` | Clean up session on exit |
-| `notify` | Send system notification with optional sound |
+| `register_session` | Register session, get session_id + cursor |
+| `list_sessions` | List active sessions |
+| `list_channels` | List channels with subscriber counts |
+| `publish_event` | Publish event to channel |
+| `get_events` | Poll for events (use `resume=True` for incremental) |
+| `unregister_session` | Clean up on exit |
+| `notify` | System notification |
 
-## Channel-Based Messaging
+## Channels
 
-Events can be targeted to specific channels:
+Events include channel metadata for context. **All sessions see all events** (broadcast model).
 
-| Channel | Who receives |
-|---------|--------------|
-| `all` | Everyone (default, broadcast) |
-| `session:{id}` | Direct message to one session |
-| `repo:{name}` | All sessions in that repo |
-| `machine:{name}` | All sessions on that machine |
+| Channel | Context |
+|---------|---------|
+| `all` | General broadcast (default) |
+| `session:{id}` | Direct message (triggers notification) |
+| `repo:{name}` | Repository-specific |
+| `machine:{name}` | Machine-specific |
 
-## CLI Wrapper
+## CLI
 
 For shell scripts and hooks:
 
 ```bash
-event-bus-cli register --name "my-feature" --client-id "$$"
-event-bus-cli publish --type "done" --payload "Finished"
+# Register (returns session_id)
+SESSION_ID=$(event-bus-cli register --name "my-feature" --client-id "$$" --json | jq -r .session_id)
+
+# Publish and notify
+event-bus-cli publish --type "done" --payload "Finished" --channel "repo:my-project"
 event-bus-cli notify --title "Build" --message "Complete" --sound
-event-bus-cli unregister --session-id $SESSION_ID
+
+# Poll for events (incremental)
+event-bus-cli events --session-id "$SESSION_ID" --resume --order asc
+
+# Cleanup
+event-bus-cli unregister --session-id "$SESSION_ID"
+```
+
+## Development
+
+```bash
+make dev          # Install with dev dependencies
+./scripts/dev.sh  # Run in foreground with auto-reload
+make check        # Format + lint + test
 ```
 
 ## Notifications
 
-On macOS, notifications display a custom Birman cat icon (requires `terminal-notifier`):
+Requires `terminal-notifier` for custom icon: `brew install terminal-notifier`
 
-```bash
-brew install terminal-notifier
-```
+## Data
 
-The LaunchAgent and dev.sh set `EVENT_BUS_ICON` automatically.
-
-## Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `install-launchagent.sh` | Install as macOS LaunchAgent (auto-start) + CLI |
-| `install-cli.sh` | Install CLI symlink to ~/.local/bin |
-| `uninstall-launchagent.sh` | Remove LaunchAgent + CLI |
-| `uninstall-cli.sh` | Remove CLI symlink only |
-| `dev.sh` | Run in foreground with auto-reload |
-
-## Icon Generation
-
-The notification icon can be regenerated using Gemini:
-
-```bash
-cd scripts/icon-gen
-GEMINI_API_KEY=key cargo run --release -- "your prompt"
-cargo run --bin smart-crop   # AI-powered tight crop
-cargo run --bin remove-bg    # Remove background
-```
-
-## Roadmap
-
-- [x] Event bus with channel-based messaging
-- [x] SQLite persistence
-- [x] System notifications with custom icon
-- [x] LaunchAgent for auto-start
-- [x] CLI wrapper for shell scripts
-- [ ] Tailscale support for multi-machine
-
-## Data Location
-
-All data stored under `~/.claude/contrib/event-bus/`:
-
-- **Database**: `data.db`
-- **Logs**: `event-bus.log`
-- **Errors**: `event-bus.err`
+All data in `~/.claude/contrib/event-bus/`: `data.db`, `event-bus.log`, `event-bus.err`
 
 ## Related
 
-- [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) - Historical analysis of Claude Code sessions
-- [RFC: Global event bus](https://github.com/evansenter/dotfiles/issues/41)
-- [`/parallel-work` command](https://github.com/evansenter/dotfiles)
+- [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) - Historical session analysis
+- [dotfiles](https://github.com/evansenter/dotfiles) - `/parallel-work` command and hooks

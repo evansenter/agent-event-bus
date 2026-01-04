@@ -2,9 +2,8 @@
 
 ## What is this?
 
-The Event Bus enables communication between Claude Code sessions. When you're
-running multiple CC sessions (e.g., via `/parallel-work` or separate terminals),
-each session is isolated. This MCP server lets sessions:
+The Event Bus enables communication between Claude Code sessions. When running multiple
+CC sessions (e.g., via `/parallel-work` or separate terminals), this MCP server lets sessions:
 
 - See what other sessions are active
 - Coordinate work (signal when APIs are ready, request help)
@@ -14,310 +13,144 @@ each session is isolated. This MCP server lets sessions:
 
 | Tool | Purpose |
 |------|---------|
-| `register_session(name, machine?, cwd?, client_id?)` | Register yourself, get a session_id |
-| `list_sessions()` | See all active sessions with their subscribed channels |
-| `list_channels()` | See active channels and subscriber counts |
-| `publish_event(type, payload, channel?)` | Send event to a channel |
-| `get_events(cursor?, limit?, session_id?, order?, channel?, resume?)` | Poll for new events |
-| `unregister_session(session_id?, client_id?)` | Clean up when exiting |
-| `notify(title, message, sound?)` | Send macOS notification to user |
+| `register_session(name, client_id?)` | Register yourself, get session_id + cursor |
+| `list_sessions()` | See active sessions |
+| `list_channels()` | See active channels |
+| `publish_event(type, payload, channel?)` | Send event |
+| `get_events(session_id?, resume?, order?)` | Poll for events |
+| `unregister_session(session_id?)` | Clean up on exit |
+| `notify(title, message, sound?)` | System notification |
+
+*Signatures simplified for quick start. Full parameters (machine, cwd, cursor, limit, channel, etc.) available - check MCP tool docstrings.*
 
 ## Quick Start
 
 ### 1. Register on startup
 ```
-register_session(name="auth-feature")
-→ {session_id: "uuid-or-client-id", display_id: "brave-tiger", cursor: "42", repo: "my-project", ...}
+register_session(name="auth-feature", client_id="my-unique-id")
+→ {session_id: "my-unique-id", display_id: "brave-tiger", cursor: "42", ...}
 ```
-- `session_id` is your unique identifier (UUID, or `client_id` if you provided one)
-- `display_id` is a human-readable name for display (e.g., "brave-tiger")
-- Save `session_id` for API calls - the cursor is tracked automatically when you pass session_id to get_events().
+- `session_id` is your unique identifier (your `client_id`, or a UUID if not provided)
+- `display_id` is human-readable ("brave-tiger") - for display only
+- Use `session_id` for all API calls
 
-### 2. Check who else is working
+### 2. Poll for events
 ```
-list_sessions()
-→ [{session_id: "...", display_id: "brave-tiger", name: "auth-feature", subscribed_channels: ["all", ...], ...}]
+get_events(session_id="my-unique-id", resume=True, order="asc")
+→ {events: [...], next_cursor: "55"}
 ```
-Sessions are ordered by most recently active first. Use `display_id` for display, `session_id` for API calls.
+- `resume=True` picks up where you left off (cursor auto-tracked)
+- `order="asc"` returns events chronologically
 
-### 2b. See active channels
-```
-list_channels()
-→ [{channel: "all", subscribers: 3}, {channel: "repo:my-project", subscribers: 2}, ...]
-```
-Shows all channels with at least one subscriber.
-
-### 3. Publish events to coordinate
+### 3. Publish to coordinate
 ```
 publish_event("api_ready", "Auth endpoints merged", channel="repo:my-project")
 ```
 
-### 4. Poll for events
-```
-# Use cursor from registration to start polling
-get_events(cursor="42", session_id="brave-tiger", order="asc")
-→ {events: [{id: 43, event_type: "api_ready", ...}], next_cursor: "43"}
-```
-Use `order="asc"` for chronological order when polling, `order="desc"` (default) for newest first.
-
-### 5. Notify the user
+### 4. Notify the user
 ```
 notify("Build Complete", "All tests passing", sound=True)
 ```
 
-### 6. Unregister when done
+### 5. Unregister when done
 ```
-unregister_session(session_id="brave-tiger")
-# Or by client_id (same ID you used when registering)
-unregister_session(client_id="my-unique-id")
+unregister_session(session_id="my-unique-id")
 ```
 
 ## Channels
 
-Events can include a channel for context. **All sessions see all events** (broadcast model).
-Channels are metadata indicating what the event relates to:
+**All sessions see all events** (broadcast model). Channels are metadata for context:
 
-| Channel | Meaning | When to Use |
-|---------|---------|-------------|
-| `all` | General broadcast | Default - general announcements |
-| `repo:{name}` | About this repository | Coordinate parallel work in a repo |
-| `session:{id}` | For one session | Direct messages, help requests |
-| `machine:{name}` | About this machine | Machine-specific coordination |
+| Channel | When to Use |
+|---------|-------------|
+| `all` | General announcements (default) |
+| `repo:{name}` | Coordinate work in a repo |
+| `session:{id}` | Direct messages (triggers notification) |
+| `machine:{name}` | Machine-specific coordination |
 
-The `channel` field helps recipients understand context. Use `get_events(channel=X)` to explicitly filter if needed.
-
-### Discovering Channels
-
-Use `list_channels()` to see what channels are active:
-```
-list_channels()
-→ [{channel: "all", subscribers: 2}, {channel: "repo:my-project", subscribers: 2}, ...]
-```
-
-Use `list_sessions()` to see what channels each session relates to:
-```
-list_sessions()
-→ [{name: "auth-feature", subscribed_channels: ["all", "session:abc", "repo:my-project", "machine:laptop"], ...}]
-```
-Note: `subscribed_channels` shows related channels for context - with the broadcast model, all sessions see all events regardless of channel.
+Use `get_events(channel=X)` to explicitly filter if needed.
 
 ## Event Polling
 
-`get_events` returns a dict with `events` list and `next_cursor` for pagination:
-```
-get_events()
-→ {events: [...], next_cursor: "50"}
-```
-
-### Cursor behavior
-
-- **`cursor=None`** (default): Returns recent events, newest first. Use for quick "what's happening?" checks.
-- **`cursor="<id>"`**: Returns events after that position. Use with `order="asc"` for chronological polling.
-
-The cursor is an opaque string - don't parse it, just pass the value from `next_cursor` or `register_session`.
-
-### Automatic cursor tracking
-
-When you pass `session_id` to `get_events()`, your cursor position is automatically saved. On session resume (same `client_id`), you get the last cursor you polled with - no missed events!
-
-### Default order (newest first)
-```
-get_events()
-→ {events: [{id: 50, ...}, {id: 49, ...}], next_cursor: "49"}
-```
-Returns recent events, **newest first** (DESC). Use this for a quick check of recent activity.
-
-### Polling loop (cursor + order="asc")
-```
-get_events(cursor="42", order="asc")
-→ {events: [{id: 43, ...}, {id: 44, ...}], next_cursor: "44"}
-```
-Returns events after the cursor, **in chronological order**. Use this for catching up.
-
-### Order parameter
-- `order="desc"` (default): Newest first - good for "what's happening?"
-- `order="asc"`: Oldest first - good for polling/catching up
-
-### Explicit channel filter
-Optionally filter events to a specific channel:
-```
-get_events(channel="repo:my-project")
-→ {events: [...], next_cursor: "50"}
-```
-Without `channel`, you see all events (broadcast model). Use this parameter when you only want events about a specific repo, session, or machine.
-
-### Resume parameter
-Use `resume=True` to automatically start from your last saved cursor position:
-```
-get_events(session_id=session_id, resume=True, order="asc")
-→ {events: [...], next_cursor: "55"}
-```
-This is the simplest way to do incremental polling - no need to track the cursor yourself:
-- Requires `session_id` to look up your saved position
-- Ignored if you also provide an explicit `cursor` (explicit cursor takes precedence)
-- Combined with `order="asc"` for chronological catch-up
-
-### Recommended Pattern
+### The Simple Way (recommended)
 ```python
-# 1. On session start, register with client_id
-result = register_session(name="my-feature", client_id="my-unique-id")
+# Register with client_id for session resumption
+result = register_session(name="my-feature", client_id="unique-id")
 session_id = result["session_id"]
 
-# 2. Poll for new events using resume=True (simplest approach)
-result = get_events(session_id=session_id, resume=True, order="asc")
-for event in result["events"]:
-    # Process each event
-    pass
-# Cursor is auto-saved after each poll!
-
-# 3. On session resume, your last position is preserved
-# Just call register_session with same client_id - cursor picks up where you left off
+# Poll incrementally - cursor tracked automatically
+events = get_events(session_id=session_id, resume=True, order="asc")
 ```
+
+### Order Parameter
+- `order="desc"` (default): Newest first - "what's happening?"
+- `order="asc"`: Oldest first - catching up chronologically
+
+### Manual Cursor (if needed)
+```
+get_events(cursor="42", order="asc")
+→ {events: [...], next_cursor: "55"}
+```
+Pass `next_cursor` to subsequent calls. But `resume=True` is simpler.
 
 ## Common Patterns
 
-### Signal when your work is ready for others
+### Signal when your work is ready
 ```
-# You finished the API, another session is waiting to integrate
 publish_event("api_ready", "Auth API merged to main", channel="repo:my-project")
-```
-
-### Wait for another session's work
-```
-# Use cursor from register_session as starting point
-result = get_events(cursor=cursor, session_id=my_session_id, order="asc")
-for e in result["events"]:
-    if e["event_type"] == "api_ready":
-        # Now safe to integrate
-cursor = result["next_cursor"]  # Track for next poll
 ```
 
 ### Ask another session for help
 ```
-# Find the session working on auth
 sessions = list_sessions()
 auth_session = next(s for s in sessions if "auth" in s["name"])
-
-# Send them a direct message using session_id
 publish_event("help_needed", "How do I call the new auth endpoint?",
               channel=f"session:{auth_session['session_id']}")
-# (display_id is for humans, session_id is for API calls)
 ```
 
-### Notify user when task completes
-```
-# Useful for long-running tasks
-notify("PR Created", "https://github.com/org/repo/pull/123", sound=True)
-```
+## How Direct Messages Work
+
+MCP is request/response - the server can't push to CC sessions. DMs work via the human:
+
+1. Session A sends: `publish_event("help", "Need review", channel="session:abc123")`
+2. Server sends macOS notification to human
+3. Human switches to that terminal
+4. Human tells Claude: "check the event bus"
+5. Claude polls and sees the message
 
 ## Best Practices
 
-### Session Registration
-1. **Register on session start** - Makes you discoverable; enables DMs
-2. **Save session_id and cursor** - You'll need both for polling
-3. **Include session_id in get_events** - Enables filtering and auto-heartbeat
-4. **Poll at natural breakpoints** - Check for messages before/after major tasks
-5. **Unregister on exit** - Keeps the session list clean
-
-### Communication
-6. **Use meaningful channels** - Include `repo:` or `session:` for context (everyone sees all events, but channel metadata helps)
-7. **Keep payloads short** - They're for coordination, not data transfer
-8. **DMs auto-notify** - When you send to `session:{id}`, the human gets notified
-
-### Notifications
-9. **Notify sparingly** - Only for things the user needs to know
-10. **Understand the human-as-router pattern** - Notifications go to the user, not Claude
-
-## How Direct Messages Work (Human as Router)
-
-MCP is request/response only - the server can't push to Claude Code sessions.
-When you send a DM, here's what happens:
-
-1. Session A sends: `publish_event("help", "Need review", channel="session:brave-tiger")`
-2. Server sends macOS notification: "📨 Message for my-feature (From: auth-work)"
-   (Uses terminal-notifier if installed, falls back to osascript)
-3. Human sees notification, switches to that terminal
-4. Human tells Claude: "check the event bus"
-5. Claude polls: `get_events(cursor=last_cursor, session_id=my_id)` and sees the message
-
-The notification alerts the **human** who routes the message to the correct session.
-
-## Tips
-
-- `register_session` returns `cursor` - use it to start polling from the right place
-- Pass `client_id` to enable session resumption across restarts
-- **Session IDs**: `session_id` is for API calls (UUID or your client_id), `display_id` is human-readable (e.g., "brave-tiger")
-- **Cursor auto-tracking**: When you pass `session_id` to `get_events()`, your cursor is auto-saved. On resume, you pick up where you left off!
-- **Simplest polling**: Use `get_events(session_id=X, resume=True, order="asc")` for incremental polling without manual cursor management
-- `get_events` and `publish_event` auto-refresh your heartbeat
-- `get_events()` defaults to newest first (`order="desc"`); use `order="asc"` when polling with cursor
-- `list_sessions()` returns most recently active sessions first
-- Sessions are auto-cleaned after 24 hours of inactivity
-- The repo name is auto-detected from your working directory
-- **Historical events**: Events from before schema v2 may show human-readable session IDs (e.g., "brave-tiger") that don't match current sessions - this is expected and handled gracefully in display
+1. **Register with client_id** - Enables session resumption
+2. **Use resume=True for polling** - Simplest incremental approach
+3. **Include session_id in get_events** - Enables cursor tracking + heartbeat
+4. **Use meaningful channels** - `repo:` or `session:` for context
+5. **Keep payloads short** - Coordination, not data transfer
+6. **Unregister on exit** - Keeps session list clean
 
 ## Event Type Conventions
 
-Use consistent event types across commands and sessions for discoverability.
+Use consistent event types for discoverability:
 
-### Standard Event Types
+| Event Type | When to Use |
+|------------|-------------|
+| `task_started` | Work begun on issue/task |
+| `task_completed` | Significant task finished |
+| `ci_completed` | CI finished (pass or fail) |
+| `help_needed` | Request for assistance |
+| `gotcha_discovered` | Non-obvious issue found |
+| `pattern_found` | Useful pattern discovered |
+| `test_flaky` | Flaky test identified |
+| `blocker_found` | Blocking issue discovered |
+| `error_broadcast` | Rate limits, outages |
 
-| Event Type | Description | Example Payload |
-|------------|-------------|-----------------|
-| `rfc_created` | New RFC issue created | `"RFC created: #48 - Event bus integration"` |
-| `rfc_responded` | Response posted to RFC | `"RFC response posted: #48"` |
-| `parallel_work_started` | New worktree/session started | `"Started parallel work: issue-48 - Implement event bus"` |
-| `ci_completed` | CI finished (pass or fail) | `"CI passed on PR #42"` or `"CI failed on PR #42"` |
-| `message` | Generic message/announcement | `"Auth feature done, you can integrate now"` |
-| `help_needed` | Request for assistance | `"Need review on auth.ts approach"` |
-| `task_completed` | Significant task finished | `"Feature X is done and merged"` |
-| `task_started` | Work begun on issue/task | `"Started work on #42 - Add dark mode"` |
-| `gotcha_discovered` | Non-obvious issue found | `"SQLite needs datetime adapters in Python 3.12+"` |
-| `pattern_found` | Useful pattern discovered | `"Use (machine, client_id) as dedup key"` |
-| `test_flaky` | Flaky test identified | `"test_concurrent_writes sometimes fails, safe to retry"` |
-| `workaround_needed` | Temporary fix for known issue | `"Rate limit workaround: batch requests"` |
-| `feedback_addressed` | PR feedback processed | `"Addressed feedback on PR #108: 2 implemented, 1 skipped"` |
-| `error_broadcast` | Repeated failures or rate limits | `"API rate limited - wait 10min"` |
-| `blocker_found` | Blocking issue discovered | `"Main branch CI broken"` |
+**Naming**: Use `snake_case`, be specific (`ci_completed` not `done`), include context in payload.
 
-### Naming Conventions
-
-- Use `snake_case` for event types
-- Be specific: `rfc_created` not just `created`
-- Include context in payload: what happened and any relevant identifiers (PR#, issue#)
-- Payloads are automatically JSON-escaped by the MCP layer - special characters are safe
-
-### Proactive Publishing
-
-Beyond command-triggered events, proactively publish when you discover something useful:
-
-| When | Event Type | Example |
-|------|------------|---------|
-| Find non-obvious issue | `gotcha_discovered` | `"SQLite needs datetime adapters in Python 3.12+"` |
-| Discover useful pattern | `pattern_found` | `"Use (machine, client_id) as dedup key"` |
-| Identify flaky test | `test_flaky` | `"test_concurrent_writes sometimes fails, safe to retry"` |
-| Use temporary workaround | `workaround_needed` | `"Rate limit workaround: batch requests"` |
-| Complete significant task | `task_completed` | `"Auth refactor done, safe to integrate"` |
-| Hit repeated failures | `error_broadcast` | `"API rate limited - wait 10min before retrying"` |
-| Discover blocking issue | `blocker_found` | `"Main branch broken - CI failing on unrelated commit"` |
-
-**Channel choice:** Use `repo:<name>` for repo-specific discoveries, `machine:<host>` for environment issues.
-
-**When to broadcast errors:**
-- Rate limits - warn others before they hit the same limit
-- Service outages - CI, GitHub API, external services down
-- Main branch broken - tests failing on main, blocking all PRs
-
-**When NOT to publish:** Don't emit events for routine work or one-off errors. Reserve for discoveries that would save another session time.
-
-### Examples
+**When to publish proactively**: Discoveries that would save other sessions time - gotchas, patterns, flaky tests, blockers. Don't publish routine work or one-off errors.
 
 ```python
-# Good: specific type with context in payload
+# Good
 publish_event("ci_completed", "CI passed on PR #42", channel="repo:my-project")
-publish_event("gotcha_discovered", "Python 3.12 removed SQLite datetime adapters", channel="repo:my-project")
 
-# Bad: vague type, no context
+# Bad
 publish_event("done", "finished")
-publish_event("update", "something happened")
 ```

@@ -341,7 +341,7 @@ def main():
     # events
     p_events = subparsers.add_parser("events", help="Get recent events")
     p_events.add_argument("--cursor", help="Cursor from previous call (for pagination)")
-    p_events.add_argument("--session-id", help="Your session ID (for filtering)")
+    p_events.add_argument("--session-id", help="Your session ID (for cursor tracking)")
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
         "--exclude-types",
