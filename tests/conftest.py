@@ -88,3 +88,30 @@ def mock_dm_notifications(request):
 
     with patch("event_bus.server._notify_dm_recipient") as mock:
         yield mock
+
+
+def make_events_args(**overrides):
+    """Create Namespace for events command with sensible defaults.
+
+    Usage:
+        args = make_events_args()  # All defaults
+        args = make_events_args(json=True, limit=10)  # Override specific fields
+    """
+    from argparse import Namespace
+
+    defaults = dict(
+        cursor=None,
+        session_id=None,
+        limit=None,
+        exclude_types=None,
+        timeout=10000,
+        track_state=None,
+        json=False,
+        url=None,
+        order="desc",
+        channel=None,
+        resume=False,
+        debug=False,
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)

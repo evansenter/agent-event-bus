@@ -60,6 +60,9 @@ if (
         )
         logger.addHandler(console_handler)
 
+# Constants
+MAX_PAYLOAD_PREVIEW = 50  # Max chars to show in notification previews
+
 # Initialize MCP server
 mcp = FastMCP("event-bus")
 
@@ -156,16 +159,18 @@ def _notify_dm_recipient(
         # If sender not found, keep "anonymous" - don't log (normal during tests/cleanup)
 
     # Send notification to alert the human
-    payload_preview = payload[:50] + "..." if len(payload) > 50 else payload
+    payload_preview = (
+        payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
+    )
     try:
         project_name = target_session.get_project_name()
         send_notification(
             title=f"📨 {target_session.name} • {project_name}",
             message=f"From: {sender_name}\n{payload_preview}",
         )
-        # Notification failure is silent - event is still published
-    except Exception:
-        pass  # Notification failure is non-critical, event is still published
+    except Exception as e:
+        # Notification failure is non-critical, but log for debugging
+        logger.warning(f"Failed to notify session {target_id} of DM: {e}")
 
 
 @mcp.tool()
@@ -369,7 +374,9 @@ def publish_event(
         channel=channel,
     )
 
-    truncated = payload[:50] + "..." if len(payload) > 50 else payload
+    truncated = (
+        payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
+    )
     dev_notify("publish_event", f"{event_type} [{channel}] {truncated}")
 
     return {

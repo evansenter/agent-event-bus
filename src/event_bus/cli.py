@@ -63,7 +63,11 @@ HEADERS = {
 
 
 def call_tool(
-    tool_name: str, arguments: dict, url: str = DEFAULT_URL, timeout_ms: int | None = None
+    tool_name: str,
+    arguments: dict,
+    url: str = DEFAULT_URL,
+    timeout_ms: int | None = None,
+    debug: bool = False,
 ) -> dict:
     """Call an MCP tool and return the result.
 
@@ -72,6 +76,7 @@ def call_tool(
         arguments: Tool arguments
         url: Event bus URL
         timeout_ms: Timeout in milliseconds (default: 10000)
+        debug: If True, show full stack traces on errors
     """
     timeout_sec = (timeout_ms / 1000) if timeout_ms else 10
     try:
@@ -107,6 +112,8 @@ def call_tool(
         print("Start with: event-bus", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
+        if debug:
+            raise
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -123,7 +130,7 @@ def cmd_register(args):
         arguments["client_id"] = args.client_id
     arguments["cwd"] = os.getcwd()
 
-    result = call_tool("register_session", arguments, url=args.url)
+    result = call_tool("register_session", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
 
     # Print session info for easy capture in scripts
@@ -147,13 +154,13 @@ def cmd_unregister(args):
         print("Error: Must provide --session-id or --client-id", file=sys.stderr)
         sys.exit(1)
 
-    result = call_tool("unregister_session", arguments, url=args.url)
+    result = call_tool("unregister_session", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
 
 
 def cmd_sessions(args):
     """List active sessions."""
-    result = call_tool("list_sessions", {}, url=args.url)
+    result = call_tool("list_sessions", {}, url=args.url, debug=args.debug)
     if not result:
         print("No active sessions")
         return
@@ -184,7 +191,7 @@ def cmd_sessions(args):
 
 def cmd_channels(args):
     """List active channels."""
-    result = call_tool("list_channels", {}, url=args.url)
+    result = call_tool("list_channels", {}, url=args.url, debug=args.debug)
     if not result:
         print("No active channels")
         return
@@ -210,7 +217,7 @@ def cmd_publish(args):
     if args.session_id:
         arguments["session_id"] = args.session_id
 
-    result = call_tool("publish_event", arguments, url=args.url)
+    result = call_tool("publish_event", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
 
 
@@ -238,7 +245,9 @@ def cmd_events(args):
     if args.resume:
         arguments["resume"] = True
 
-    result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
+    result = call_tool(
+        "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
+    )
 
     # Result is now a dict with "events" and "next_cursor"
     events = result.get("events", [])
@@ -283,7 +292,7 @@ def cmd_notify(args):
     if args.sound:
         arguments["sound"] = True
 
-    result = call_tool("notify", arguments, url=args.url)
+    result = call_tool("notify", arguments, url=args.url, debug=args.debug)
     if result.get("success"):
         print("Notification sent")
     else:
@@ -301,6 +310,11 @@ def main():
         "--url",
         default=os.environ.get("EVENT_BUS_URL", DEFAULT_URL),
         help="Event bus URL (default: http://127.0.0.1:8080/mcp)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show full stack traces on errors",
     )
 
     subparsers = parser.add_subparsers(dest="command")
