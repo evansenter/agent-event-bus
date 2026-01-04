@@ -166,8 +166,9 @@ def _format_result(result) -> str:
         s = str(result)
         return s[:60] + "..." if len(s) > 60 else s
 
-    # FastMCP wraps results: {content: [...], structuredContent: {...}, isError: ...}
-    # Extract the actual content from structuredContent
+    # FastMCP wraps results in two possible formats:
+    # 1. {content: [...], structuredContent: {...}, isError: ...} - prefer structuredContent
+    # 2. {content: [{type: 'text', text: '...'}], isError: ...} - extract from content
     if "structuredContent" in result:
         result = result.get("structuredContent", {})
         # Some tools return {result: {...}} inside structuredContent
@@ -176,6 +177,16 @@ def _format_result(result) -> str:
         # Handle list results (e.g., list_sessions returns a list)
         if isinstance(result, list):
             return _format_list(result)
+    elif "content" in result and isinstance(result.get("content"), list):
+        # Extract JSON from content array: [{type: 'text', text: '{...}'}]
+        content_list = result["content"]
+        if content_list and isinstance(content_list[0], dict):
+            text = content_list[0].get("text", "")
+            if text:
+                try:
+                    result = json.loads(text)
+                except json.JSONDecodeError:
+                    pass  # Fall through to use result as-is
 
     if not isinstance(result, dict):
         s = str(result)

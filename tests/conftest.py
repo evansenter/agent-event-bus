@@ -15,6 +15,8 @@ def pytest_configure(config):
     """
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     os.environ["EVENT_BUS_DB"] = temp_db.name
+    # Prevent test migrations from logging to production log file
+    os.environ["EVENT_BUS_TESTING"] = "1"
     # Store path for cleanup
     config._temp_db_path = temp_db.name
 

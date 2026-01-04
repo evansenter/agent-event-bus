@@ -39,7 +39,8 @@ logger = logging.getLogger("event-bus")
 logger.setLevel(logging.DEBUG if os.environ.get("DEV_MODE") else logging.INFO)
 
 # File handler - skip during tests, guard against reimport duplication
-if not os.environ.get("PYTEST_CURRENT_TEST") and not logger.handlers:
+# Check both PYTEST_CURRENT_TEST (set per-test) and EVENT_BUS_TESTING (set in conftest.py)
+if not os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("EVENT_BUS_TESTING") and not logger.handlers:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(LOG_FILE)
     file_handler.setLevel(logging.INFO)
