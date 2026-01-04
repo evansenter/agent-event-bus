@@ -3,7 +3,7 @@
 ## What is this?
 
 The Event Bus enables communication between Claude Code sessions. When running multiple
-CC sessions (e.g., via `/parallel-work` or separate terminals), this MCP server lets sessions:
+CC sessions (e.g., in separate terminals or worktrees), this MCP server lets sessions:
 
 - See what other sessions are active
 - Coordinate work (signal when APIs are ready, request help)
@@ -27,8 +27,8 @@ CC sessions (e.g., via `/parallel-work` or separate terminals), this MCP server 
 
 ### 1. Register on startup
 ```
-register_session(name="auth-feature", client_id="my-unique-id")
-→ {session_id: "my-unique-id", display_id: "brave-tiger", cursor: "42", ...}
+register_session(name="auth-feature", client_id="cc-session-abc")
+→ {session_id: "cc-session-abc", display_id: "brave-tiger", cursor: "42", ...}
 ```
 - `session_id` is your unique identifier (your `client_id`, or a UUID if not provided)
 - `display_id` is human-readable ("brave-tiger") - for display only

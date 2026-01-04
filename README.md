@@ -4,7 +4,7 @@ MCP server for cross-session Claude Code communication and coordination.
 
 ## Overview
 
-When running multiple Claude Code sessions (via `/parallel-work` or separate terminals), each session is isolated. This MCP server provides an event bus for sessions to:
+When running multiple Claude Code sessions (in separate terminals or worktrees), each session is isolated. This MCP server provides an event bus for sessions to:
 
 - **Announce presence** - Know what other sessions are active
 - **Broadcast status** - Share progress updates and task completion

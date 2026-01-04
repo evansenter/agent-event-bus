@@ -16,7 +16,7 @@ MCP server for cross-session Claude Code communication. Sessions register, publi
 ### Safe operations:
 - `make uninstall` - Preserves database
 - `make reinstall` - Just reinstalls package
-- Schema migrations via `@migration` decorator
+- Schema migrations via `@migration` decorator (increment `SCHEMA_VERSION` when adding)
 
 ### Before schema changes:
 ```bash
@@ -39,7 +39,7 @@ pytest tests/test_server.py::TestRegisterSession -v
 
 ### When to Restart
 
-Code changes to `server.py`, `storage.py`, `helpers.py`, `cli.py` require restart.
+Code changes to `server.py`, `storage.py`, `helpers.py` require restart.
 `guide.md` is read fresh each request. Dev mode auto-reloads.
 
 ## Architecture
@@ -57,15 +57,7 @@ src/event_bus/
 
 ## MCP Tools
 
-| Tool | Purpose |
-|------|---------|
-| `register_session` | Register session, get session_id + cursor |
-| `list_sessions` | List active sessions |
-| `list_channels` | List channels with subscriber counts |
-| `publish_event` | Publish to channel |
-| `get_events` | Poll events (supports `resume=True`) |
-| `unregister_session` | Clean up on exit |
-| `notify` | System notification |
+`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`
 
 **Usage guide**: `event-bus://guide` resource. Keep it updated when changing APIs.
 
