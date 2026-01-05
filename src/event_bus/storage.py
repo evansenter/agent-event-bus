@@ -545,7 +545,7 @@ class SQLiteStorage:
                     where_clause = f"WHERE {channel_filter}"
                 params_base = (*params_base, *channels)
 
-            if event_types:
+            if event_types and len(event_types) > 0:
                 placeholders = ",".join("?" * len(event_types))
                 type_filter = f"event_type IN ({placeholders})"
                 if where_clause:

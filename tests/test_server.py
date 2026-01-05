@@ -314,6 +314,39 @@ class TestGetEvents:
         assert "for_other" in types  # Now visible in broadcast model
         assert "other_repo" in types  # Now visible in broadcast model
 
+    def test_get_events_with_event_types_filter(self):
+        """Test filtering events by event_types parameter."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        # Publish events of different types
+        publish_event("task_completed", "finished task")
+        publish_event("ci_completed", "CI passed")
+        publish_event("gotcha_discovered", "found issue")
+        publish_event("task_completed", "another task")
+
+        # Filter for specific types
+        result = get_events(event_types=["task_completed", "ci_completed"])
+
+        types = [e["event_type"] for e in result["events"]]
+        assert "task_completed" in types
+        assert "ci_completed" in types
+        assert "gotcha_discovered" not in types
+
+    def test_get_events_empty_event_types(self):
+        """Test that empty event_types list returns all events (same as None)."""
+        # Clear storage
+        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
+
+        publish_event("type1", "msg1")
+        publish_event("type2", "msg2")
+
+        # Empty list should behave like no filter
+        result = get_events(event_types=[])
+        types = [e["event_type"] for e in result["events"]]
+        assert "type1" in types
+        assert "type2" in types
+
 
 class TestGetEventsOrdering:
     """Tests for get_events ordering behavior."""
