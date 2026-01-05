@@ -17,7 +17,7 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 | `list_sessions()` | See active sessions |
 | `list_channels()` | See active channels |
 | `publish_event(type, payload, channel?)` | Send event |
-| `get_events(session_id?, resume?, order?)` | Poll for events |
+| `get_events(session_id?, resume?, order?, event_types?)` | Poll for events |
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
 
@@ -85,6 +85,17 @@ events = get_events(session_id=session_id, resume=True, order="asc")
 ### Order Parameter
 - `order="desc"` (default): Newest first - "what's happening?"
 - `order="asc"`: Oldest first - catching up chronologically
+
+### Filter by Event Type
+```
+get_events(event_types=["task_completed", "ci_completed"])
+→ Only returns events of those types
+```
+
+Useful for focused polling (e.g., only discoveries):
+```
+get_events(event_types=["gotcha_discovered", "pattern_found", "improvement_suggested"])
+```
 
 ### Manual Cursor (if needed)
 ```

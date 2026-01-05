@@ -501,6 +501,7 @@ class SQLiteStorage:
         limit: int = 50,
         channels: list[str] | None = None,
         order: Literal["asc", "desc"] = "desc",
+        event_types: list[str] | None = None,
     ) -> tuple[list[Event], str | None]:
         """Get events with cursor-based pagination.
 
@@ -509,6 +510,7 @@ class SQLiteStorage:
             limit: Maximum number of events to return.
             channels: Optional list of channels to filter by (None = all events).
             order: "desc" (newest first, default) or "asc" (oldest first).
+            event_types: Optional list of event types to filter by (None = all types).
 
         Returns:
             Tuple of (events, next_cursor). Use next_cursor for subsequent calls.
@@ -541,9 +543,18 @@ class SQLiteStorage:
                     where_clause += f" AND {channel_filter}"
                 else:
                     where_clause = f"WHERE {channel_filter}"
-                params = (*params_base, *channels, limit)
-            else:
-                params = (*params_base, limit)
+                params_base = (*params_base, *channels)
+
+            if event_types:
+                placeholders = ",".join("?" * len(event_types))
+                type_filter = f"event_type IN ({placeholders})"
+                if where_clause:
+                    where_clause += f" AND {type_filter}"
+                else:
+                    where_clause = f"WHERE {type_filter}"
+                params_base = (*params_base, *event_types)
+
+            params = (*params_base, limit)
 
             query = f"""
                 SELECT * FROM events

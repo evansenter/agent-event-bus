@@ -406,6 +406,7 @@ def get_events(
     order: Literal["asc", "desc"] = "desc",
     channel: str | None = None,
     resume: bool = False,
+    event_types: list[str] | None = None,
 ) -> dict:
     """Get events from the event bus.
 
@@ -416,6 +417,7 @@ def get_events(
         order: "desc" (newest first, default) or "asc" (oldest first).
         channel: Optionally filter to a specific channel.
         resume: If True, use session's saved cursor position (requires session_id, ignored if cursor provided).
+        event_types: Optional list of event types to filter by (e.g., ["task_completed", "ci_completed"]).
 
     Returns:
         Dict with "events" list and "next_cursor" for pagination.
@@ -451,7 +453,7 @@ def get_events(
         channels = _get_implicit_channels(session_id)
 
     raw_events, next_cursor = storage.get_events(
-        cursor=cursor, limit=limit, channels=channels, order=order
+        cursor=cursor, limit=limit, channels=channels, order=order, event_types=event_types
     )
 
     # Persist high-water mark for session-based tracking (enables seamless resume)

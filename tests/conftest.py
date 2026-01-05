@@ -103,7 +103,7 @@ def make_events_args(**overrides):
         cursor=None,
         session_id=None,
         limit=None,
-        exclude_types=None,
+        exclude=None,
         timeout=10000,
         track_state=None,
         json=False,
@@ -112,6 +112,7 @@ def make_events_args(**overrides):
         channel=None,
         resume=False,
         debug=False,
+        include=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

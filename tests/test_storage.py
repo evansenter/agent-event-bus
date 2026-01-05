@@ -399,6 +399,62 @@ class TestEventChannelFiltering:
         assert len(events) == 3
 
 
+class TestEventTypeFiltering:
+    """Tests for event type filtering."""
+
+    def test_get_events_by_event_types(self, storage):
+        """Test filtering events by event_types list."""
+        storage.add_event("task_completed", "finished task", "s1")
+        storage.add_event("ci_completed", "CI passed", "s1")
+        storage.add_event("gotcha_discovered", "found an issue", "s1")
+        storage.add_event("session_registered", "new session", "s1")
+        storage.add_event("task_completed", "another task", "s1")
+
+        # Filter for specific event types
+        events, _ = storage.get_events(event_types=["task_completed", "ci_completed"])
+        assert len(events) == 3
+        types = {e.event_type for e in events}
+        assert types == {"task_completed", "ci_completed"}
+
+    def test_get_events_single_event_type(self, storage):
+        """Test filtering for a single event type."""
+        storage.add_event("task_completed", "task 1", "s1")
+        storage.add_event("ci_completed", "CI 1", "s1")
+        storage.add_event("task_completed", "task 2", "s1")
+
+        events, _ = storage.get_events(event_types=["gotcha_discovered"])
+        assert len(events) == 0
+
+        events, _ = storage.get_events(event_types=["task_completed"])
+        assert len(events) == 2
+        assert all(e.event_type == "task_completed" for e in events)
+
+    def test_get_events_no_type_filter(self, storage):
+        """Test getting all events when no event_types filter is provided."""
+        storage.add_event("e1", "msg1", "s1")
+        storage.add_event("e2", "msg2", "s1")
+        storage.add_event("e3", "msg3", "s1")
+
+        # No event_types filter = all events
+        events, _ = storage.get_events(event_types=None)
+        assert len(events) == 3
+
+    def test_get_events_combined_filters(self, storage):
+        """Test combining event_types with channel filter."""
+        storage.add_event("task_completed", "task 1", "s1", channel="repo:myrepo")
+        storage.add_event("ci_completed", "CI 1", "s1", channel="repo:myrepo")
+        storage.add_event("task_completed", "task 2", "s1", channel="all")
+        storage.add_event("gotcha_discovered", "gotcha", "s1", channel="repo:myrepo")
+
+        # Filter by both channel and event type
+        events, _ = storage.get_events(
+            channels=["repo:myrepo"], event_types=["task_completed", "ci_completed"]
+        )
+        assert len(events) == 2
+        types = {e.event_type for e in events}
+        assert types == {"task_completed", "ci_completed"}
+
+
 class TestDatabaseInitialization:
     """Tests for database initialization."""
 

@@ -7,9 +7,9 @@ Usage:
     event-bus-cli sessions
     event-bus-cli channels
     event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
-    event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--exclude-types T1,T2]
-                         [--timeout MS] [--track-state FILE] [--json] [--order asc|desc]
-                         [--channel CHANNEL] [--resume]
+    event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--include T1,T2]
+                         [--exclude T1,T2] [--timeout MS] [--track-state FILE] [--json]
+                         [--order asc|desc] [--channel CHANNEL] [--resume]
     event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -33,7 +33,7 @@ Examples:
     event-bus-cli events --session-id abc123
 
     # Get events with JSON output (for scripting)
-    event-bus-cli events --json --limit 10 --exclude-types session_registered,session_unregistered
+    event-bus-cli events --json --limit 10 --exclude session_registered,session_unregistered
 
     # Get events in chronological order (oldest first)
     event-bus-cli events --order asc
@@ -43,6 +43,10 @@ Examples:
 
     # Resume from saved cursor (incremental polling - no duplicates)
     event-bus-cli events --session-id abc123 --resume --order asc
+
+    # Filter by event type
+    event-bus-cli events --include task_completed,ci_completed
+    event-bus-cli events --include gotcha_discovered,pattern_found --exclude session_registered
 
     # Send notification
     event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -244,6 +248,8 @@ def cmd_events(args):
         arguments["channel"] = args.channel
     if args.resume:
         arguments["resume"] = True
+    if args.include:
+        arguments["event_types"] = [t.strip() for t in args.include.split(",")]
 
     result = call_tool(
         "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
@@ -253,9 +259,9 @@ def cmd_events(args):
     events = result.get("events", [])
     next_cursor = result.get("next_cursor")
 
-    # Apply --exclude-types filter
-    if args.exclude_types:
-        exclude_set = {t.strip() for t in args.exclude_types.split(",")}
+    # Apply --exclude filter (client-side for flexibility)
+    if args.exclude:
+        exclude_set = {t.strip() for t in args.exclude.split(",")}
         events = [e for e in events if e["event_type"] not in exclude_set]
 
     # Handle --track-state: write next_cursor to file
@@ -358,7 +364,7 @@ def main():
     p_events.add_argument("--session-id", help="Your session ID (for cursor tracking)")
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
-        "--exclude-types",
+        "--exclude",
         help="Comma-separated event types to exclude (e.g., session_registered,session_unregistered)",
     )
     p_events.add_argument(
@@ -390,6 +396,10 @@ def main():
         "--resume",
         action="store_true",
         help="Resume from saved cursor position (requires --session-id, ignored if --cursor provided)",
+    )
+    p_events.add_argument(
+        "--include",
+        help="Comma-separated event types to include (e.g., task_completed,ci_completed)",
     )
     p_events.set_defaults(func=cmd_events)
 

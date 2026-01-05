@@ -400,7 +400,7 @@ class TestCmdEvents:
             "next_cursor": "1",
         }
 
-        args = make_events_args(exclude_types="session_registered,session_unregistered", json=True)
+        args = make_events_args(exclude="session_registered,session_unregistered", json=True)
         cli.cmd_events(args)
 
         captured = capsys.readouterr()
@@ -548,7 +548,7 @@ class TestCmdEvents:
         }
 
         args = make_events_args(
-            exclude_types="session_registered", track_state=str(state_file), json=True
+            exclude="session_registered", track_state=str(state_file), json=True
         )
         cli.cmd_events(args)
 
