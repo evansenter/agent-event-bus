@@ -76,6 +76,32 @@ event-bus-cli events --session-id "$SESSION_ID" --resume --order asc
 event-bus-cli unregister --session-id "$SESSION_ID"
 ```
 
+## Multi-Machine Setup
+
+Run one server, connect from multiple machines via Tailscale (or any VPN).
+
+**Server machine (home):**
+
+Edit `~/Library/LaunchAgents/com.evansenter.claude-event-bus.plist`, add to `EnvironmentVariables`:
+```xml
+<key>HOST</key>
+<string>0.0.0.0</string>
+```
+
+Then restart: `make restart`
+
+**Client machine (remote):**
+
+```bash
+# Set remote URL for CLI
+export EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
+
+# Test connection
+event-bus-cli sessions
+```
+
+See #75 for MCP tool integration on remote machines.
+
 ## Development
 
 ```bash
