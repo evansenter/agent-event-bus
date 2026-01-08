@@ -73,7 +73,7 @@ CLI and MCP expose the same functionality:
 
 - CLI: kebab-case args (`--session-id`), short commands
 - MCP: snake_case params, descriptive `verb_noun` pattern
-- CLI-only: `--timeout`, `--json`, `--exclude-types`, `--track-state`
+- CLI-only: `--timeout`, `--json`, `--exclude-types`
 
 **When modifying API**: Update CLI help, MCP docstrings, and `guide.md` together.
 

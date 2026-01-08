@@ -459,125 +459,29 @@ class TestCmdEvents:
         call_kwargs = mock_call.call_args
         assert call_kwargs[1]["timeout_ms"] == 200
 
+    def test_events_resume_requires_session_id(self, capsys):
+        """Test that --resume flag requires --session-id."""
+        args = make_events_args(resume=True, session_id=None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_events(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "--resume requires --session-id" in captured.err
+
     @patch("event_bus.cli.call_tool")
-    def test_events_track_state_read(self, mock_call, tmp_path, capsys):
-        """Test reading cursor from state file."""
-        state_file = tmp_path / "cursor"
-        state_file.write_text("50")
+    def test_events_resume_with_session_id_works(self, mock_call, capsys):
+        """Test that --resume with --session-id works correctly."""
+        mock_call.return_value = {"events": [], "next_cursor": "100"}
 
-        mock_call.return_value = {
-            "events": [
-                {
-                    "id": 51,
-                    "event_type": "test",
-                    "channel": "all",
-                    "payload": "data",
-                    "session_id": "abc",
-                    "timestamp": "2024-01-01T12:00:00",
-                }
-            ],
-            "next_cursor": "51",
-        }
-
-        args = make_events_args(track_state=str(state_file), json=True)
+        args = make_events_args(resume=True, session_id="test-session")
         cli.cmd_events(args)
 
-        # Should have used "50" from file
+        # Should pass resume=True to the server
         call_args = mock_call.call_args[0][1]
-        assert call_args["cursor"] == "50"
-
-    @patch("event_bus.cli.call_tool")
-    def test_events_track_state_write(self, mock_call, tmp_path, capsys):
-        """Test writing next_cursor to state file."""
-        state_file = tmp_path / "cursor"
-
-        mock_call.return_value = {
-            "events": [
-                {
-                    "id": 100,
-                    "event_type": "test",
-                    "channel": "all",
-                    "payload": "data",
-                    "session_id": "abc",
-                    "timestamp": "2024-01-01T12:00:00",
-                }
-            ],
-            "next_cursor": "100",
-        }
-
-        args = make_events_args(track_state=str(state_file))
-        cli.cmd_events(args)
-
-        # State file should have been updated with next_cursor
-        assert state_file.read_text() == "100"
-
-    @patch("event_bus.cli.call_tool")
-    def test_events_track_state_creates_dir(self, mock_call, tmp_path, capsys):
-        """Test that track_state creates parent directories."""
-        state_file = tmp_path / "subdir" / "deep" / "cursor"
-
-        mock_call.return_value = {
-            "events": [
-                {
-                    "id": 42,
-                    "event_type": "test",
-                    "channel": "all",
-                    "payload": "data",
-                    "session_id": "abc",
-                    "timestamp": "2024-01-01T12:00:00",
-                }
-            ],
-            "next_cursor": "42",
-        }
-
-        args = make_events_args(track_state=str(state_file))
-        cli.cmd_events(args)
-
-        # Should have created directories and written file
-        assert state_file.exists()
-        assert state_file.read_text() == "42"
-
-    @patch("event_bus.cli.call_tool")
-    def test_events_track_state_missing_file(self, mock_call, tmp_path, capsys):
-        """Test track_state with missing file starts from None."""
-        state_file = tmp_path / "nonexistent"
-
-        mock_call.return_value = {"events": [], "next_cursor": None}
-
-        args = make_events_args(cursor="999", track_state=str(state_file))
-        cli.cmd_events(args)
-
-        # Should not have passed cursor (file doesn't exist)
-        call_args = mock_call.call_args[0][1]
-        assert "cursor" not in call_args
-
-    @patch("event_bus.cli.call_tool")
-    def test_events_exclude_types_writes_state_even_when_all_filtered(self, mock_call, tmp_path):
-        """Test that state file is updated even when all events are filtered out."""
-        state_file = tmp_path / "cursor"
-
-        # All events will be filtered out
-        mock_call.return_value = {
-            "events": [
-                {
-                    "id": 10,
-                    "event_type": "session_registered",
-                    "channel": "all",
-                    "payload": "noise",
-                    "session_id": "abc",
-                    "timestamp": "2024-01-01T12:00:00",
-                },
-            ],
-            "next_cursor": "10",
-        }
-
-        args = make_events_args(
-            exclude="session_registered", track_state=str(state_file), json=True
-        )
-        cli.cmd_events(args)
-
-        # State file should be written with next_cursor, even though events list is empty
-        assert state_file.read_text() == "10"
+        assert call_args["resume"] is True
+        assert call_args["session_id"] == "test-session"
 
 
 class TestCmdNotify:

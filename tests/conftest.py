@@ -105,7 +105,6 @@ def make_events_args(**overrides):
         limit=None,
         exclude=None,
         timeout=10000,
-        track_state=None,
         json=False,
         url=None,
         order="desc",
