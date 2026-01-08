@@ -533,3 +533,121 @@ class TestDatabaseInitialization:
         assert columns == ["machine", "client_id"], (
             f"Expected index on (machine, client_id), found: {columns}"
         )
+
+    def test_migrate_v1_to_v2_schema(self, tmp_path):
+        """Test v1→v2 migration adds display_id and deleted_at columns."""
+        import sqlite3
+
+        db_path = tmp_path / "v1_test.db"
+
+        # Create v1 schema manually (without display_id and deleted_at)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY
+            )
+        """)
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                machine TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_heartbeat TIMESTAMP NOT NULL,
+                client_id TEXT,
+                last_cursor TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'all'
+            )
+        """)
+        # Add a v1 session (using human-readable ID as was done before v2)
+        conn.execute("""
+            INSERT INTO sessions (id, name, machine, cwd, repo, registered_at, last_heartbeat, client_id)
+            VALUES ('brave-tiger', 'test-session', 'localhost', '/test', 'test-repo',
+                    '2024-01-01 12:00:00', '2024-01-01 12:00:00', 'client-123')
+        """)
+        conn.commit()
+        conn.close()
+
+        # Open with SQLiteStorage - should trigger v1→v2 migration
+        storage = SQLiteStorage(db_path=str(db_path))
+
+        # Verify migration added columns
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        assert "display_id" in columns, "display_id column should be added by migration"
+        assert "deleted_at" in columns, "deleted_at column should be added by migration"
+
+        # Verify the session's display_id was populated from the old id
+        # (The migration copies id → display_id, then may change id if client_id exists)
+        sessions = storage.list_sessions()
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session.display_id == "brave-tiger", "display_id should be populated from old id"
+        # Since client_id was set, the new id should be the client_id
+        assert session.id == "client-123", "id should become client_id after migration"
+
+        # Verify schema version was updated
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        conn.close()
+        assert version == 2, f"Schema version should be 2, got {version}"
+
+
+class TestSoftDelete:
+    """Tests for soft-delete behavior."""
+
+    def test_soft_delete_sets_deleted_at_and_preserves_row(self, storage, temp_db):
+        """Verify soft-delete sets deleted_at without removing the row."""
+        import sqlite3
+
+        now = datetime.now()
+        session = Session(
+            id="soft-delete-test",
+            display_id="soft-display",
+            name="test-session",
+            machine="localhost",
+            cwd="/test",
+            repo="test",
+            registered_at=now,
+            last_heartbeat=now,
+        )
+        storage.add_session(session)
+
+        # Verify session exists
+        assert storage.get_session("soft-delete-test") is not None
+
+        # Delete the session
+        storage.delete_session("soft-delete-test")
+
+        # Verify invisible via normal API
+        assert storage.get_session("soft-delete-test") is None
+        assert storage.session_count() == 0
+
+        # Verify row still exists with deleted_at set (query DB directly)
+        conn = sqlite3.connect(temp_db)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT id, deleted_at FROM sessions WHERE id = ?",
+            ("soft-delete-test",),
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        assert row is not None, "Row should still exist after soft-delete"
+        assert row["deleted_at"] is not None, "deleted_at should be set"

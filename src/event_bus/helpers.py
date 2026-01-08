@@ -144,7 +144,7 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
         return False
 
 
-def dev_notify(tool_name: str, summary: str) -> None:
+def _dev_notify(tool_name: str, summary: str) -> None:
     """Send a notification in dev mode for tool calls."""
     if os.environ.get("DEV_MODE"):
         send_notification(f"🔧 {tool_name}", summary)

@@ -1023,3 +1023,35 @@ class TestGetEventsChannelFilter:
         # Verify filtered events are not present
         assert "e2" not in types2
         assert "e4" not in types2
+
+
+class TestUsageGuide:
+    """Tests for the usage_guide MCP resource."""
+
+    def test_usage_guide_returns_content(self):
+        """Test that usage_guide resource returns guide content."""
+        from event_bus import server
+
+        # The @mcp.resource() decorator wraps the function in FunctionResource
+        # Access the underlying function via fn attribute
+        result = server.usage_guide.fn()
+
+        # Verify non-trivial content
+        assert len(result) > 100, "Guide should have substantial content"
+
+        # Verify key phrases that should be in the guide
+        assert "Event Bus" in result or "event bus" in result.lower()
+
+    def test_usage_guide_reads_from_guide_md(self):
+        """Test that usage_guide reads from the guide.md file."""
+        from pathlib import Path
+
+        from event_bus import server
+
+        # Read the guide directly
+        guide_path = Path(server.__file__).parent / "guide.md"
+        expected_content = guide_path.read_text()
+
+        # Access the underlying function via fn attribute
+        result = server.usage_guide.fn()
+        assert result == expected_content

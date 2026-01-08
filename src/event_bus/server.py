@@ -20,7 +20,7 @@ from typing import Literal
 from fastmcp import FastMCP
 
 from event_bus.helpers import (
-    dev_notify,
+    _dev_notify,
     extract_repo_from_cwd,
     is_client_alive,
     send_notification,
@@ -210,7 +210,7 @@ def register_session(
         existing.name = name
         existing.last_heartbeat = now
         storage.add_session(existing)  # INSERT OR REPLACE
-        dev_notify("register_session", f"{name} resumed → {existing.display_id}")
+        _dev_notify("register_session", f"{name} resumed → {existing.display_id}")
 
         # Use session's last_cursor if available (resume where they left off)
         # Otherwise fall back to current position
@@ -267,7 +267,7 @@ def register_session(
         "resumed": False,
         "tip": f"You are '{name}' ({display_id}). Use cursor to start polling: get_events(cursor=cursor).",
     }
-    dev_notify("register_session", f"{name} → {display_id}")
+    _dev_notify("register_session", f"{name} → {display_id}")
     return result
 
 
@@ -300,7 +300,7 @@ def list_sessions() -> list[dict]:
             }
         )
 
-    dev_notify("list_sessions", f"{len(results)} active")
+    _dev_notify("list_sessions", f"{len(results)} active")
     return results
 
 
@@ -325,7 +325,7 @@ def list_channels() -> list[dict]:
         {"channel": ch, "subscribers": count} for ch, count in sorted(channel_subscribers.items())
     ]
 
-    dev_notify("list_channels", f"{len(results)} active channels")
+    _dev_notify("list_channels", f"{len(results)} active channels")
     return results
 
 
@@ -377,7 +377,7 @@ def publish_event(
     truncated = (
         payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
     )
-    dev_notify("publish_event", f"{event_type} [{channel}] {truncated}")
+    _dev_notify("publish_event", f"{event_type} [{channel}] {truncated}")
 
     return {
         "event_id": event.id,
@@ -479,7 +479,7 @@ def get_events(
         for e in raw_events
     ]
 
-    dev_notify("get_events", f"{len(events)} events (cursor={cursor})")
+    _dev_notify("get_events", f"{len(events)} events (cursor={cursor})")
 
     return {
         "events": events,
@@ -510,15 +510,15 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
         if session:
             session_id = session.id
         else:
-            dev_notify("unregister_session", f"client_id {client_id} not found")
+            _dev_notify("unregister_session", f"client_id {client_id} not found")
             return {"error": "Session not found", "client_id": client_id, "machine": machine}
     elif not session_id:
-        dev_notify("unregister_session", "no identifier provided")
+        _dev_notify("unregister_session", "no identifier provided")
         return {"error": "Must provide either session_id or client_id"}
 
     session = storage.get_session(session_id)
     if not session:
-        dev_notify("unregister_session", f"{session_id} not found")
+        _dev_notify("unregister_session", f"{session_id} not found")
         return {"error": "Session not found", "session_id": session_id}
 
     storage.delete_session(session_id)
@@ -530,7 +530,7 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
         session_id=session_id,
     )
 
-    dev_notify("unregister_session", f"{session.name} ({session.display_id})")
+    _dev_notify("unregister_session", f"{session.name} ({session.display_id})")
     return {
         "success": True,
         "session_id": session_id,

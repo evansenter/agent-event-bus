@@ -3,20 +3,18 @@
 import json
 import logging
 
-from event_bus.storage import SQLiteStorage
-
 logger = logging.getLogger("event-bus")
 
-# Lazy-loaded storage for session lookups
-_storage: SQLiteStorage | None = None
 
+def _get_storage():
+    """Get the shared storage instance from server.
 
-def _get_storage() -> SQLiteStorage:
-    """Get or create storage instance for session lookups."""
-    global _storage
-    if _storage is None:
-        _storage = SQLiteStorage()
-    return _storage
+    Uses late import to avoid circular dependency (server imports middleware).
+    Returns the same SQLiteStorage instance used by the MCP tools.
+    """
+    from event_bus.server import storage
+
+    return storage
 
 
 def _lookup_session_display_id(session_id: str) -> str | None:
