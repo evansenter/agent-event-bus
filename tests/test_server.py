@@ -1,8 +1,11 @@
 """Tests for MCP server tools."""
 
+import logging
 import os
 import socket
 from datetime import datetime
+
+import pytest
 
 from event_bus import server
 from event_bus.storage import Session, SQLiteStorage
@@ -351,8 +354,15 @@ class TestGetEvents:
 class TestGetEventsOrdering:
     """Tests for get_events ordering behavior."""
 
-    def test_default_order_is_desc(self):
-        """Test that default order is DESC (newest first)."""
+    @pytest.mark.parametrize(
+        "order,expected_order",
+        [
+            (None, ["third", "second", "first"]),  # Default is desc (newest first)
+            ("desc", ["third", "second", "first"]),  # Explicit desc
+        ],
+    )
+    def test_desc_ordering(self, order, expected_order):
+        """Test DESC ordering returns newest first (default and explicit)."""
         # Clear storage
         server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
 
@@ -360,25 +370,13 @@ class TestGetEventsOrdering:
         publish_event("second", "2")
         publish_event("third", "3")
 
-        # Default order should be DESC (newest first)
-        result = get_events()
+        kwargs = {"order": order} if order else {}
+        result = get_events(**kwargs)
         types = [e["event_type"] for e in result["events"]]
-        assert types.index("third") < types.index("second")
-        assert types.index("second") < types.index("first")
 
-    def test_explicit_order_desc(self):
-        """Test that order='desc' returns newest first."""
-        # Clear storage
-        server.storage = SQLiteStorage(db_path=os.environ["EVENT_BUS_DB"])
-
-        publish_event("first", "1")
-        publish_event("second", "2")
-        publish_event("third", "3")
-
-        result = get_events(order="desc")
-        types = [e["event_type"] for e in result["events"]]
-        assert types.index("third") < types.index("second")
-        assert types.index("second") < types.index("first")
+        # Verify ordering: expected_order[0] should come before expected_order[1], etc.
+        for i in range(len(expected_order) - 1):
+            assert types.index(expected_order[i]) < types.index(expected_order[i + 1])
 
     def test_explicit_order_asc(self):
         """Test that order='asc' returns oldest first."""
@@ -1055,3 +1053,38 @@ class TestUsageGuide:
         # Access the underlying function via fn attribute
         result = server.usage_guide.fn()
         assert result == expected_content
+
+
+class TestChannelValidation:
+    """Tests for channel format validation."""
+
+    def test_publish_event_warns_on_invalid_session_channel(self, caplog):
+        """Test that invalid session channel format logs a warning."""
+        with caplog.at_level(logging.WARNING, logger="event-bus"):
+            publish_event("test", "payload", channel="session:")  # Empty value
+
+        assert "Invalid session channel format" in caplog.text
+
+    def test_publish_event_warns_on_invalid_repo_channel(self, caplog):
+        """Test that invalid repo channel format logs a warning."""
+        with caplog.at_level(logging.WARNING, logger="event-bus"):
+            publish_event("test", "payload", channel="repo:")  # Empty value
+
+        assert "Invalid repo channel format" in caplog.text
+
+    def test_publish_event_warns_on_invalid_machine_channel(self, caplog):
+        """Test that invalid machine channel format logs a warning."""
+        with caplog.at_level(logging.WARNING, logger="event-bus"):
+            publish_event("test", "payload", channel="machine:")  # Empty value
+
+        assert "Invalid machine channel format" in caplog.text
+
+    def test_publish_event_no_warning_on_valid_channel(self, caplog):
+        """Test that valid channels don't produce warnings."""
+        with caplog.at_level(logging.WARNING, logger="event-bus"):
+            publish_event("test", "payload", channel="all")
+            publish_event("test", "payload", channel="session:abc-123")
+            publish_event("test", "payload", channel="repo:my-repo")
+            publish_event("test", "payload", channel="machine:localhost")
+
+        assert "Invalid" not in caplog.text

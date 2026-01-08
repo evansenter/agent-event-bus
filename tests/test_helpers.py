@@ -2,8 +2,10 @@
 
 import os
 from datetime import datetime
+from unittest.mock import patch
 
 from event_bus.helpers import (
+    _dev_notify,
     escape_applescript_string,
     extract_repo_from_cwd,
     is_client_alive,
@@ -218,3 +220,35 @@ class TestIsClientAlive:
         """Test that empty string client_id is treated as alive."""
         # Empty string can't be parsed as PID, so treated as alive
         assert is_client_alive("", is_local=True) is True
+
+    def test_permission_error_returns_true(self, monkeypatch):
+        """Test that PermissionError (process exists but can't signal) returns True."""
+
+        def raise_permission_error(pid, sig):
+            raise PermissionError("Operation not permitted")
+
+        monkeypatch.setattr("os.kill", raise_permission_error)
+
+        # Should return True (process exists, we just can't signal it)
+        assert is_client_alive("12345", is_local=True) is True
+
+
+class TestDevNotify:
+    """Tests for _dev_notify helper."""
+
+    def test_dev_notify_sends_notification_in_dev_mode(self, monkeypatch):
+        """Test _dev_notify sends notification when DEV_MODE is set."""
+        monkeypatch.setenv("DEV_MODE", "1")
+
+        with patch("event_bus.helpers.send_notification") as mock_notify:
+            mock_notify.return_value = True
+            _dev_notify("test_tool", "summary message")
+            mock_notify.assert_called_once_with("🔧 test_tool", "summary message")
+
+    def test_dev_notify_does_nothing_without_dev_mode(self, monkeypatch):
+        """Test _dev_notify is silent when DEV_MODE is not set."""
+        monkeypatch.delenv("DEV_MODE", raising=False)
+
+        with patch("event_bus.helpers.send_notification") as mock_notify:
+            _dev_notify("test_tool", "summary")
+            mock_notify.assert_not_called()

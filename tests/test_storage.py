@@ -1,5 +1,6 @@
 """Tests for SQLite storage backend."""
 
+import sqlite3
 from datetime import datetime, timedelta
 
 from event_bus.storage import SESSION_TIMEOUT, Session, SQLiteStorage
@@ -651,3 +652,138 @@ class TestSoftDelete:
 
         assert row is not None, "Row should still exist after soft-delete"
         assert row["deleted_at"] is not None, "deleted_at should be set"
+
+
+class TestDbLocationMigration:
+    """Tests for database location migration."""
+
+    def test_migrate_db_from_old_to_new_location(self, tmp_path, monkeypatch):
+        """Test database migration moves file from old to new location."""
+        import event_bus.storage as storage_module
+
+        old_path = tmp_path / ".claude" / "event-bus.db"
+        new_path = tmp_path / ".claude" / "contrib" / "event-bus" / "data.db"
+
+        # Create old-style DB with proper schema (v1 style)
+        old_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(old_path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                machine TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_heartbeat TIMESTAMP NOT NULL,
+                client_id TEXT,
+                last_cursor TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'all'
+            )
+        """)
+        conn.close()
+
+        # Monkeypatch the paths
+        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
+        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
+
+        # Initialize storage with the new default path - should trigger migration
+        storage = SQLiteStorage(db_path=str(new_path))
+
+        # Verify migration occurred
+        assert new_path.exists(), "New DB should exist after migration"
+        assert not old_path.exists(), "Old DB should be moved (not exist)"
+
+        # Verify storage is functional after migration
+        assert storage.session_count() == 0, "Storage should work after migration"
+
+    def test_no_migration_when_old_db_missing(self, tmp_path, monkeypatch):
+        """Test that no migration occurs if old DB doesn't exist."""
+        import event_bus.storage as storage_module
+
+        old_path = tmp_path / ".claude" / "event-bus.db"
+        new_path = tmp_path / ".claude" / "contrib" / "event-bus" / "data.db"
+
+        # Don't create old DB
+        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
+        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
+
+        # Initialize storage - should create fresh DB
+        SQLiteStorage(db_path=str(new_path))
+
+        assert new_path.exists(), "New DB should be created"
+        assert not old_path.exists(), "Old DB should still not exist"
+
+    def test_no_migration_when_new_db_already_exists(self, tmp_path, monkeypatch):
+        """Test that migration is skipped if new DB already exists."""
+        import event_bus.storage as storage_module
+
+        old_path = tmp_path / ".claude" / "event-bus.db"
+        new_path = tmp_path / ".claude" / "contrib" / "event-bus" / "data.db"
+
+        # Create old DB
+        old_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(old_path))
+        conn.execute("CREATE TABLE old_marker (id INTEGER)")
+        conn.close()
+
+        # Create new DB with current schema (so SQLiteStorage doesn't fail)
+        new_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(new_path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version VALUES (2)")
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                display_id TEXT,
+                name TEXT NOT NULL,
+                machine TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_heartbeat TIMESTAMP NOT NULL,
+                client_id TEXT,
+                last_cursor TEXT,
+                deleted_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'all'
+            )
+        """)
+        conn.close()
+
+        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
+        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
+
+        # Initialize storage - should NOT overwrite existing new DB
+        SQLiteStorage(db_path=str(new_path))
+
+        # Old DB should still exist (not moved because new already exists)
+        assert old_path.exists(), "Old DB should still exist when migration skipped"
+
+        # Verify new DB doesn't have old_marker table (wasn't overwritten)
+        conn = sqlite3.connect(str(new_path))
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='old_marker'"
+        )
+        row = cursor.fetchone()
+        conn.close()
+        assert row is None, "New DB should not have old_marker table (wasn't overwritten)"
