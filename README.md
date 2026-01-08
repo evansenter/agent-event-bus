@@ -90,6 +90,8 @@ Edit `~/Library/LaunchAgents/com.evansenter.claude-event-bus.plist`, add to `Env
 
 Then restart: `make restart`
 
+> **Note:** `make install` overwrites the plist. To persist this setting, also edit `scripts/com.evansenter.claude-event-bus.plist` (uncomment the HOST lines).
+
 **Client machine (remote):**
 
 ```bash
