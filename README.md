@@ -95,14 +95,20 @@ Then restart: `make restart`
 **Client machine (remote):**
 
 ```bash
-# Set remote URL for CLI
-export EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
+# Add MCP server pointing to home machine
+claude mcp add --transport http --scope user event-bus http://<tailscale-ip>:8080/mcp
 
-# Test connection
-event-bus-cli sessions
+# Verify connection
+claude mcp list
+# event-bus: http://<tailscale-ip>:8080/mcp (HTTP) - ✓ Connected
 ```
 
-See #75 for MCP tool integration on remote machines.
+New Claude Code sessions will have full `mcp__event-bus__*` tool access to the central server.
+
+For CLI usage (in hooks/scripts), also set:
+```bash
+export EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
+```
 
 ## Development
 
