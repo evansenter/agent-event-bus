@@ -61,6 +61,35 @@ src/event_bus/
 
 **Usage guide**: `event-bus://guide` resource. Keep it updated when changing APIs.
 
+### Tool Docstrings
+
+**Keep docstrings minimal** - tool definitions consume tokens in every conversation (~200 tokens per verbose tool). `guide.md` is the canonical reference for detailed documentation; keep it updated with verbose explanations, usage patterns, and examples.
+
+**Include:**
+- First-line description (what the tool does)
+- Brief `Args:` section (one line per param)
+- Non-obvious behavior (e.g., "Auto-refreshes heartbeat")
+
+**Exclude (put in guide.md instead):**
+- `Returns:` sections (JSON results are self-documenting)
+- Usage examples and patterns
+- "Tip:" or "Note:" sections
+- Implementation details
+
+**Example:**
+```python
+@mcp.tool()
+def publish_event(event_type: str, payload: str, ...) -> dict:
+    """Publish an event. Auto-refreshes heartbeat.
+
+    Args:
+        event_type: e.g., 'task_completed', 'help_needed'
+        payload: Event message
+        session_id: Your session ID
+        channel: "all", "session:{id}", "repo:{name}", or "machine:{name}"
+    """
+```
+
 ## API Design
 
 CLI and MCP expose the same functionality:
