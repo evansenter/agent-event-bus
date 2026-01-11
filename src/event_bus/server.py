@@ -180,18 +180,13 @@ def register_session(
     cwd: str | None = None,
     client_id: str | None = None,
 ) -> dict:
-    """Register this Claude session with the event bus.
+    """Register with the event bus.
 
     Args:
-        name: A short name for this session (e.g., branch name, task)
-        machine: Machine identifier (defaults to hostname)
-        cwd: Working directory (defaults to CWD env var)
-        client_id: Client identifier for session deduplication (e.g., CC session ID or PID)
-
-    Returns:
-        Session info including assigned session_id and cursor for polling
-
-    Tip: Read the resource at event-bus://guide for usage patterns and best practices.
+        name: Session name (e.g., branch name, task)
+        machine: Defaults to hostname
+        cwd: Defaults to $PWD
+        client_id: Enables session resumption via (machine, client_id)
     """
     storage.cleanup_stale_sessions()
 
@@ -273,14 +268,7 @@ def register_session(
 
 @mcp.tool()
 def list_sessions() -> list[dict]:
-    """List all active sessions on the event bus.
-
-    Sessions are ordered by most recently active first (last_heartbeat DESC),
-    so the most likely-to-be-alive sessions appear first.
-
-    Returns:
-        List of active sessions with their info
-    """
+    """List active sessions, ordered by most recently active."""
     results = []
 
     for s in _get_live_sessions():
@@ -306,14 +294,7 @@ def list_sessions() -> list[dict]:
 
 @mcp.tool()
 def list_channels() -> list[dict]:
-    """List active channels on the event bus.
-
-    Shows channels that have at least one current subscriber.
-    Channels are implicit based on session attributes (repo, machine, session_id).
-
-    Returns:
-        List of channels with subscriber counts
-    """
+    """List channels with subscriber counts."""
     channel_subscribers: dict[str, int] = {}
 
     for s in _get_live_sessions():
@@ -336,20 +317,13 @@ def publish_event(
     session_id: str | None = None,
     channel: str = "all",
 ) -> dict:
-    """Publish an event to a channel.
+    """Publish an event. Auto-refreshes heartbeat.
 
     Args:
-        event_type: Type of event (e.g., 'task_completed', 'help_needed')
-        payload: Event payload/message
-        session_id: Your session ID (for attribution and auto-heartbeat)
-        channel: Target channel (default: "all" for broadcast)
-            - "all": Broadcast to everyone
-            - "session:{id}": Direct message to specific session
-            - "repo:{name}": All sessions in that repo
-            - "machine:{name}": All sessions on that machine
-
-    Returns:
-        The created event with its ID
+        event_type: e.g., 'task_completed', 'help_needed'
+        payload: Event message
+        session_id: Your session ID
+        channel: "all", "session:{id}", "repo:{name}", or "machine:{name}"
     """
     # Auto-refresh heartbeat when session publishes
     _auto_heartbeat(session_id)
@@ -408,29 +382,16 @@ def get_events(
     resume: bool = False,
     event_types: list[str] | None = None,
 ) -> dict:
-    """Get events from the event bus.
+    """Get events. Auto-refreshes heartbeat.
 
     Args:
-        cursor: Position from previous call or register_session. None = recent activity.
-        limit: Maximum number of events to return (default: 50).
-        session_id: Your session ID (for auto-heartbeat and cursor tracking).
-        order: "desc" (newest first, default) or "asc" (oldest first).
-        channel: Optionally filter to a specific channel.
-        resume: If True, use session's saved cursor position (requires session_id, ignored if cursor provided).
-        event_types: Optional list of event types to filter by (e.g., ["task_completed", "ci_completed"]).
-
-    Returns:
-        Dict with "events" list and "next_cursor" for pagination.
-
-    Typical usage:
-    1. On session start, get cursor from register_session()
-    2. Poll with get_events(cursor=cursor) to get events
-    3. Use next_cursor from response for subsequent calls
-    4. Use get_events() (no cursor) to see recent activity
-    5. Use get_events(session_id=X, resume=True) for incremental polling
-
-    All sessions see all events (broadcast model). Use the channel parameter
-    to explicitly filter if you only want events from a specific channel.
+        cursor: Position from register_session or previous call
+        limit: Max events (default: 50)
+        session_id: Enables cursor auto-tracking
+        order: "desc" (newest first) or "asc"
+        channel: Filter to specific channel
+        resume: Use saved cursor (requires session_id)
+        event_types: Filter by types, e.g., ["task_completed"]
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
@@ -489,19 +450,11 @@ def get_events(
 
 @mcp.tool()
 def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
-    """Unregister a session from the event bus.
-
-    Call this when a Claude session is ending to clean up immediately
-    rather than waiting for heartbeat timeout.
+    """Unregister from event bus. session_id takes precedence if both given.
 
     Args:
-        session_id: Your session ID from register_session
-        client_id: Alternative: your client_id (will look up session by machine + client_id)
-
-    Returns:
-        Success status
-
-    Note: If both are provided, session_id takes precedence.
+        session_id: Your session ID
+        client_id: Alternative - looks up by (machine, client_id)
     """
     # Look up session by client_id if provided
     if client_id and not session_id:
@@ -541,18 +494,12 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
 
 @mcp.tool()
 def notify(title: str, message: str, sound: bool = False) -> dict:
-    """Send a system notification to the user.
-
-    Use this to alert the user about important events like task completion,
-    errors, or when help is needed.
+    """Send a system notification.
 
     Args:
-        title: Notification title (short, e.g., "Build Complete")
-        message: Notification body (details)
-        sound: Whether to play a sound (default: False)
-
-    Returns:
-        Success status
+        title: Short title
+        message: Body text
+        sound: Play sound (default: False)
     """
     success = send_notification(title, message, sound)
     return {
