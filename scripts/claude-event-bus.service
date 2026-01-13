@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Event Bus - Cross-session MCP communication
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONPATH=__PROJECT_DIR__/src
+Environment=EVENT_BUS_ICON=__PROJECT_DIR__/assets/icon.png
+ExecStart=__VENV_PYTHON__ -m event_bus.server
+Restart=always
+RestartSec=5
+StandardOutput=append:__HOME__/.claude/contrib/event-bus/event-bus.log
+StandardError=append:__HOME__/.claude/contrib/event-bus/event-bus.err
+
+[Install]
+WantedBy=default.target
