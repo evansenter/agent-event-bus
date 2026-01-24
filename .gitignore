@@ -47,3 +47,4 @@ htmlcov/
 .event-bus.pid
 event-bus.log
 .DS_Store
+uv.lock
