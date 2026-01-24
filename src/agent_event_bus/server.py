@@ -180,7 +180,7 @@ def register_session(
     cwd: str | None = None,
     client_id: str | None = None,
 ) -> dict:
-    """Register with the event bus.
+    """Register with the event bus. Returns session_id and cursor for polling.
 
     Args:
         name: Session name (e.g., branch name, task)
@@ -317,7 +317,7 @@ def publish_event(
     session_id: str | None = None,
     channel: str = "all",
 ) -> dict:
-    """Publish an event. Auto-refreshes heartbeat.
+    """Publish an event. Auto-refreshes heartbeat. Returns event_id.
 
     Args:
         event_type: e.g., 'task_completed', 'help_needed'
@@ -382,7 +382,7 @@ def get_events(
     resume: bool = False,
     event_types: list[str] | None = None,
 ) -> dict:
-    """Get events. Auto-refreshes heartbeat.
+    """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
     Args:
         cursor: Position from register_session or previous call
