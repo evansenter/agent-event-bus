@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test clean install uninstall dev venv restart reinstall logs
+.PHONY: check fmt lint test clean install install-cli uninstall dev venv restart reinstall logs
 
 # Run all quality gates (format check, lint, tests)
 check: fmt lint test
@@ -60,6 +60,22 @@ install: venv
 	@echo ""
 	@echo "Make sure ~/.local/bin is in your PATH:"
 	@echo '  export PATH="$$HOME/.local/bin:$$PATH"'
+
+# CLI-only installation (for remote setups - no local server)
+install-cli: venv
+	@echo "Installing dependencies..."
+	.venv/bin/pip install -e .
+	@echo ""
+	@echo "Installing CLI..."
+	./scripts/install-cli.sh
+	@echo ""
+	@echo "CLI-only installation complete!"
+	@echo ""
+	@echo "For remote event bus, set in your shell profile:"
+	@echo '  export EVENT_BUS_URL="http://<server-ip>:8080/mcp"'
+	@echo ""
+	@echo "And add MCP server to Claude Code:"
+	@echo '  claude mcp add --transport http --scope user event-bus http://<server-ip>:8080/mcp'
 
 # Uninstall: service + CLI + MCP config
 uninstall:

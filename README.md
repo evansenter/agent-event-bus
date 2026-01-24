@@ -24,6 +24,10 @@ When running multiple Claude Code sessions (in separate terminals or worktrees),
 
 ## Installation
 
+### Local Server (default)
+
+Run the event bus server on this machine:
+
 ```bash
 git clone https://github.com/evansenter/claude-event-bus.git
 cd claude-event-bus
@@ -31,6 +35,28 @@ make install
 ```
 
 Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/event-bus-cli`), MCP server.
+
+### Remote Server (CLI-only)
+
+Connect to an event bus running on another machine (e.g., via Tailscale):
+
+```bash
+git clone https://github.com/evansenter/claude-event-bus.git
+cd claude-event-bus
+make install-cli
+```
+
+Installs only the CLI for hooks/scripts. Then configure the remote connection:
+
+```bash
+# In your shell profile (~/.extra, ~/.zshrc, etc.)
+export EVENT_BUS_URL="http://<server-ip>:8080/mcp"
+
+# Add MCP server to Claude Code
+claude mcp add --transport http --scope user event-bus http://<server-ip>:8080/mcp
+```
+
+### PATH
 
 Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 
@@ -80,7 +106,11 @@ event-bus-cli unregister --session-id "$SESSION_ID"
 
 Run one server, connect from multiple machines via Tailscale (or any VPN).
 
-**Server machine (home):**
+**Server machine:**
+
+```bash
+make install  # Full install with LaunchAgent
+```
 
 Edit `~/Library/LaunchAgents/com.evansenter.claude-event-bus.plist`, add to `EnvironmentVariables`:
 ```xml
@@ -92,23 +122,22 @@ Then restart: `make restart`
 
 > **Note:** `make install` overwrites the plist. To persist this setting, also edit `scripts/com.evansenter.claude-event-bus.plist` (uncomment the HOST lines).
 
-**Client machine (remote):**
+**Client machines:**
 
 ```bash
-# Add MCP server pointing to home machine
-claude mcp add --transport http --scope user event-bus http://<tailscale-ip>:8080/mcp
+make install-cli  # CLI only, no local server
+```
 
-# Verify connection
-claude mcp list
-# event-bus: http://<tailscale-ip>:8080/mcp (HTTP) - ✓ Connected
+Then configure the remote connection:
+```bash
+# In shell profile
+export EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
+
+# Add MCP server to Claude Code
+claude mcp add --transport http --scope user event-bus http://<tailscale-ip>:8080/mcp
 ```
 
 New Claude Code sessions will have full `mcp__event-bus__*` tool access to the central server.
-
-For CLI usage (in hooks/scripts), also set:
-```bash
-export EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
-```
 
 ## Development
 
