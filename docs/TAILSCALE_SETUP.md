@@ -134,10 +134,7 @@ make install-server
 
 This binds to `localhost:8080` only. No Tailscale setup needed.
 
-To disable authentication for local-only use, set in your service config:
-```bash
-AGENT_EVENT_BUS_AUTH_DISABLED=1
-```
+Localhost connections (127.0.0.1, ::1) are automatically trusted and bypass authentication, so the CLI and local MCP connections work without any additional configuration.
 
 ---
 
@@ -166,15 +163,18 @@ Check your URL is using the Tailscale hostname, not an IP address.
 ### Testing authentication
 
 ```bash
-# This should fail (no identity headers)
+# Localhost is trusted (CLI, local MCP)
 curl http://localhost:8080/mcp -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-# Expected: {"error": "Unauthorized", "message": "Tailscale identity required"}
+# Expected: tools list response (localhost bypasses auth)
 
-# This should work (through tailscale serve)
+# Remote via Tailscale also works (has identity headers)
 curl https://YOUR-SERVER.TAILNET.ts.net/mcp -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 # Expected: tools list response
+
+# Remote without Tailscale fails (if you somehow bypass tailscale serve)
+# Expected: {"error": "Unauthorized", "message": "Tailscale identity required"}
 ```
 
 ---
@@ -200,9 +200,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TailscaleAuthMiddleware:
-    """ASGI middleware that requires Tailscale identity headers."""
+    """ASGI middleware that requires Tailscale identity headers.
+
+    Localhost connections are trusted and bypass auth.
+    """
 
     TAILSCALE_USER_HEADER = b"tailscale-user-login"
+    TRUSTED_IPS = ("127.0.0.1", "::1")
 
     def __init__(self, app):
         self.app = app
@@ -212,13 +216,19 @@ class TailscaleAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Trust localhost connections
+        client_ip = scope.get("client", ("", 0))[0]
+        if client_ip in self.TRUSTED_IPS:
+            await self.app(scope, receive, send)
+            return
+
         headers = dict(scope.get("headers", []))
         tailscale_user = headers.get(self.TAILSCALE_USER_HEADER)
 
         if not tailscale_user:
             logger.warning(
                 f"Rejected unauthenticated request to {scope.get('path', '/')} "
-                f"from {scope.get('client', ('unknown',))[0]}"
+                f"from {client_ip}"
             )
             await self._send_unauthorized(send)
             return

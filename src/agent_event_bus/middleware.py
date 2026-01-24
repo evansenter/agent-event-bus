@@ -308,16 +308,27 @@ class TailscaleAuthMiddleware:
     When running behind `tailscale serve`, Tailscale injects identity headers
     (Tailscale-User-Login, Tailscale-User-Name) into requests. This middleware
     rejects requests that don't have these headers.
+
+    Localhost connections (127.0.0.1, ::1) are trusted and bypass auth,
+    allowing the CLI and local MCP connections to work without Tailscale.
     """
 
     # Header injected by tailscale serve (lowercase for ASGI)
     TAILSCALE_USER_HEADER = b"tailscale-user-login"
+    # IPs that bypass auth (localhost connections are trusted)
+    TRUSTED_IPS = ("127.0.0.1", "::1")
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Trust localhost connections (CLI, local MCP)
+        client_ip = scope.get("client", ("", 0))[0]
+        if client_ip in self.TRUSTED_IPS:
             await self.app(scope, receive, send)
             return
 
@@ -328,8 +339,7 @@ class TailscaleAuthMiddleware:
         if not tailscale_user:
             # No Tailscale identity - reject with 401
             logger.warning(
-                f"Rejected unauthenticated request to {scope.get('path', '/')} "
-                f"from {scope.get('client', ('unknown',))[0]}"
+                f"Rejected unauthenticated request to {scope.get('path', '/')} from {client_ip}"
             )
             await self._send_unauthorized(send)
             return
