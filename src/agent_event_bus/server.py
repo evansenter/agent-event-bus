@@ -30,7 +30,7 @@ from agent_event_bus.session_ids import generate_session_id
 from agent_event_bus.storage import Session, SQLiteStorage
 
 # Configure logging
-# Always log to ~/.claude/contrib/event-bus/event-bus.log for tail -f access
+# Always log to ~/.claude/contrib/agent-event-bus/agent-event-bus.log for tail -f access
 # In dev mode, also log to console
 # Skip file logging during tests to avoid polluting production logs
 LOG_FILE = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "agent-event-bus.log"
@@ -552,7 +552,7 @@ def main():
     )
 
     # Disable uvicorn's access log - we have our own middleware logging
-    # This keeps ~/.claude/contrib/event-bus/event-bus.log clean with just our pretty-printed tool calls
+    # This keeps ~/.claude/contrib/agent-event-bus/agent-event-bus.log clean with just our pretty-printed tool calls
     uvicorn.run(create_app(), host=host, port=port, access_log=False)
 
 

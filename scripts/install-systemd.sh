@@ -45,8 +45,8 @@ sleep 1
 if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
     echo ""
     echo "Agent Event Bus installed and running!"
-    echo "  Logs: ~/.claude/contrib/agent-event-bus/event-bus.log"
-    echo "  Errors: ~/.claude/contrib/agent-event-bus/event-bus.err"
+    echo "  Logs: ~/.claude/contrib/agent-event-bus/agent-event-bus.log"
+    echo "  Errors: ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
     echo "  Status: systemctl --user status $SERVICE_NAME"
     echo ""
 
@@ -58,6 +58,6 @@ if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
 else
     echo "Error: Service failed to start. Check logs:"
     echo "  journalctl --user -u $SERVICE_NAME"
-    echo "  ~/.claude/contrib/agent-event-bus/event-bus.err"
+    echo "  ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
     exit 1
 fi

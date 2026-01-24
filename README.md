@@ -1,4 +1,4 @@
-# Claude Event Bus
+# Agent Event Bus
 
 MCP server for cross-session Claude Code communication and coordination.
 
@@ -34,7 +34,7 @@ cd agent-event-bus
 make install
 ```
 
-Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/event-bus-cli`), MCP server.
+Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/agent-agent-event-bus-cli`), MCP server.
 
 ### Remote Server (CLI-only)
 
@@ -53,7 +53,7 @@ Installs only the CLI for hooks/scripts. Then configure the remote connection:
 export AGENT_EVENT_BUS_URL="http://<server-ip>:8080/mcp"
 
 # Add MCP server to Claude Code
-claude mcp add --transport http --scope user event-bus http://<server-ip>:8080/mcp
+claude mcp add --transport http --scope user agent-event-bus http://<server-ip>:8080/mcp
 ```
 
 ### PATH
@@ -89,17 +89,17 @@ For shell scripts and hooks:
 
 ```bash
 # Register (returns session_id)
-SESSION_ID=$(event-bus-cli register --name "my-feature" --client-id "$$" --json | jq -r .session_id)
+SESSION_ID=$(agent-event-bus-cli register --name "my-feature" --client-id "$$" --json | jq -r .session_id)
 
 # Publish and notify
-event-bus-cli publish --type "done" --payload "Finished" --channel "repo:my-project"
-event-bus-cli notify --title "Build" --message "Complete" --sound
+agent-event-bus-cli publish --type "done" --payload "Finished" --channel "repo:my-project"
+agent-event-bus-cli notify --title "Build" --message "Complete" --sound
 
 # Poll for events (incremental)
-event-bus-cli events --session-id "$SESSION_ID" --resume --order asc
+agent-event-bus-cli events --session-id "$SESSION_ID" --resume --order asc
 
 # Cleanup
-event-bus-cli unregister --session-id "$SESSION_ID"
+agent-event-bus-cli unregister --session-id "$SESSION_ID"
 ```
 
 ## Multi-Machine Setup
@@ -134,10 +134,10 @@ Then configure the remote connection:
 export AGENT_EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
 
 # Add MCP server to Claude Code
-claude mcp add --transport http --scope user event-bus http://<tailscale-ip>:8080/mcp
+claude mcp add --transport http --scope user agent-event-bus http://<tailscale-ip>:8080/mcp
 ```
 
-New Claude Code sessions will have full `mcp__event-bus__*` tool access to the central server.
+New Claude Code sessions will have full `mcp__agent-event-bus__*` tool access to the central server.
 
 ## Development
 
@@ -153,7 +153,7 @@ Requires `terminal-notifier` for custom icon: `brew install terminal-notifier`
 
 ## Data
 
-All data in `~/.claude/contrib/event-bus/`: `data.db`, `event-bus.log`, `event-bus.err`
+All data in `~/.claude/contrib/agent-event-bus/`: `data.db`, `agent-event-bus.log`, `agent-event-bus.err`
 
 ## Related
 

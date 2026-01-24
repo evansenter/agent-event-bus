@@ -92,7 +92,7 @@ make install-cli
 claude mcp remove event-bus 2>/dev/null
 
 # Add the remote server (replace URL with your server's Tailscale URL)
-claude mcp add --transport http --scope user event-bus https://YOUR-SERVER.TAILNET.ts.net/mcp
+claude mcp add --transport http --scope user agent-event-bus https://YOUR-SERVER.TAILNET.ts.net/mcp
 ```
 
 ### 3. Set environment variable
@@ -123,7 +123,7 @@ Or add to Claude Code settings (`~/.claude/settings.json`):
 
 ```bash
 # Test via CLI
-event-bus-cli sessions
+agent-event-bus-cli sessions
 
 # Or in Claude Code, the event-bus MCP tools should now work
 ```
