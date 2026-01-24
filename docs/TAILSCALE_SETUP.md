@@ -1,6 +1,6 @@
-# Tailscale Setup for Event Bus
+# Tailscale Setup for Agent Event Bus
 
-This guide covers running event-bus across multiple machines using Tailscale for secure authentication.
+This guide covers running agent-event-bus across multiple machines using Tailscale for secure authentication.
 
 ## Architecture Overview
 
@@ -13,26 +13,26 @@ This guide covers running event-bus across multiple machines using Tailscale for
 │  │              │         │                              │  │
 │  │ Claude Code  │ ──────► │ tailscale serve (:443)       │  │
 │  │     ↓        │  HTTPS  │       ↓                      │  │
-│  │ MCP client   │         │ event-bus (:8080 localhost)  │  │
+│  │ MCP client   │         │ agent-event-bus (:8080)      │  │
 │  └──────────────┘         └──────────────────────────────┘  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **How it works:**
-1. Event-bus runs on localhost:8080 (not exposed to network)
+1. Agent-event-bus runs on localhost:8080 (not exposed to network)
 2. `tailscale serve` proxies HTTPS requests to localhost:8080
 3. Tailscale injects identity headers (`Tailscale-User-Login`) into requests
-4. Event-bus middleware rejects requests without identity headers
+4. Agent-event-bus middleware rejects requests without identity headers
 5. Only devices on your Tailnet can connect
 
 ---
 
 ## Server Setup
 
-Run these steps on the machine hosting event-bus (e.g., a VM, homelab server).
+Run these steps on the machine hosting agent-event-bus (e.g., a VM, homelab server).
 
-### 1. Install event-bus
+### 1. Install agent-event-bus
 
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
@@ -70,7 +70,7 @@ curl https://$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')/
 
 ## Client Setup (Remote Machines)
 
-Run these steps on each machine that will connect to the event-bus (e.g., your laptop).
+Run these steps on each machine that will connect to the agent-event-bus (e.g., your laptop).
 
 ### Prerequisites
 
@@ -88,8 +88,8 @@ make install-cli
 ### 2. Configure Claude Code MCP
 
 ```bash
-# Remove any existing event-bus config
-claude mcp remove event-bus 2>/dev/null
+# Remove any existing agent-event-bus config
+claude mcp remove agent-event-bus 2>/dev/null
 
 # Add the remote server (replace URL with your server's Tailscale URL)
 claude mcp add --transport http --scope user agent-event-bus https://YOUR-SERVER.TAILNET.ts.net/mcp
@@ -132,7 +132,7 @@ agent-event-bus-cli sessions
 
 ## Local-Only Setup
 
-If you only need event-bus on a single machine (no remote access):
+If you only need agent-event-bus on a single machine (no remote access):
 
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
@@ -162,7 +162,7 @@ Check your URL is using the Tailscale hostname, not an IP address.
 ### Connection refused
 
 1. Verify tailscale serve is running: `tailscale serve status`
-2. Verify event-bus is running: `systemctl --user status agent-event-bus` (Linux) or check LaunchAgent (macOS)
+2. Verify agent-event-bus is running: `systemctl --user status agent-event-bus` (Linux) or check LaunchAgent (macOS)
 3. Verify Tailscale connectivity: `tailscale ping YOUR-SERVER`
 
 ### MCP tools not appearing in Claude Code
