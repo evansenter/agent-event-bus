@@ -154,6 +154,16 @@ Check your URL is using the Tailscale hostname, not an IP address.
 2. Verify agent-event-bus is running: `systemctl --user status agent-event-bus` (Linux) or check LaunchAgent (macOS)
 3. Verify Tailscale connectivity: `tailscale ping YOUR-SERVER`
 
+### CLI works but hooks fail to connect
+
+If `agent-event-bus-cli sessions` works in your terminal but hooks show "Event bus registration failed", your hooks may not have access to `AGENT_EVENT_BUS_URL`. Add to the top of each hook script (after `set -euo pipefail`):
+
+```bash
+[[ -f ~/.extra ]] && source ~/.extra
+```
+
+Or source whichever file contains your `AGENT_EVENT_BUS_URL` export.
+
 ### MCP tools not appearing in Claude Code
 
 1. Check MCP config: `claude mcp list`
