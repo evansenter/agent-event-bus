@@ -180,7 +180,7 @@ def register_session(
     cwd: str | None = None,
     client_id: str | None = None,
 ) -> dict:
-    """Register with the event bus.
+    """Register with the event bus. Returns session_id and cursor for polling.
 
     Args:
         name: Session name (e.g., branch name, task)
