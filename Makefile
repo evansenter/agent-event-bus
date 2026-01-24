@@ -58,9 +58,11 @@ install-server: venv
 	fi
 	@echo ""
 	@echo "Server installation complete!"
-	@echo ""
-	@echo "Make sure ~/.local/bin is in your PATH:"
-	@echo '  export PATH="$$HOME/.local/bin:$$PATH"'
+	@if ! echo "$$PATH" | tr ':' '\n' | grep -q "$$HOME/.local/bin"; then \
+		echo ""; \
+		echo "Make sure ~/.local/bin is in your PATH:"; \
+		echo '  export PATH="$$HOME/.local/bin:$$PATH"'; \
+	fi
 
 # Client installation: connects to a remote event bus server
 # Usage: make install-client REMOTE_URL=https://your-server.tailnet.ts.net/mcp
