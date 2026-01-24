@@ -37,7 +37,7 @@ Run these steps on the machine hosting agent-event-bus (e.g., a VM, homelab serv
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
 cd agent-event-bus
-make install
+make install-server
 ```
 
 This installs the service (LaunchAgent on macOS, systemd on Linux) bound to `localhost:8080`.
@@ -77,25 +77,17 @@ Run these steps on each machine that will connect to the agent-event-bus (e.g., 
 - Tailscale installed and connected to the same Tailnet as the server
 - Claude Code installed
 
-### 1. Install CLI only (no local server)
+### 1. Install client (CLI + MCP config)
 
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
 cd agent-event-bus
-make install-cli
+make install-client REMOTE_URL=https://YOUR-SERVER.TAILNET.ts.net/mcp
 ```
 
-### 2. Configure Claude Code MCP
+This installs the CLI and configures Claude Code MCP to use the remote server.
 
-```bash
-# Remove any existing agent-event-bus config
-claude mcp remove agent-event-bus 2>/dev/null
-
-# Add the remote server (replace URL with your server's Tailscale URL)
-claude mcp add --transport http --scope user agent-event-bus https://YOUR-SERVER.TAILNET.ts.net/mcp
-```
-
-### 3. Set environment variable
+### 2. Set environment variable
 
 Add to your shell profile (`~/.zshrc`, `~/.bashrc`, or `~/.extra`):
 
@@ -113,13 +105,13 @@ Or add to Claude Code settings (`~/.claude/settings.json`):
 }
 ```
 
-### 4. Restart Claude Code
+### 3. Restart Claude Code
 
 ```bash
 # Exit and restart Claude Code to pick up the new MCP config
 ```
 
-### 5. Verify connection
+### 4. Verify connection
 
 ```bash
 # Test via CLI
@@ -137,7 +129,7 @@ If you only need agent-event-bus on a single machine (no remote access):
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
 cd agent-event-bus
-make install
+make install-server
 ```
 
 This binds to `localhost:8080` only. No Tailscale setup needed.

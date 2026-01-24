@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 MCP server for cross-session Claude Code communication. Sessions register, publish events, and poll for updates.
 
 **Related**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) shares design patterns.
@@ -26,21 +28,26 @@ cp ~/.claude/contrib/agent-event-bus/data.db ~/.claude/contrib/agent-event-bus/d
 ## Commands
 
 ```bash
-make install    # Full install (venv + LaunchAgent + CLI + MCP)
+make install-server  # Server: runs event bus locally
+make install-client REMOTE_URL=...  # Client: connects to remote server
 make uninstall  # Remove everything (preserves DB)
 make dev        # Install with dev dependencies
 make check      # Format + lint + test
 make restart    # Restart LaunchAgent
 ./scripts/dev.sh  # Dev mode (foreground, auto-reload)
-
-# Single test
-pytest tests/test_server.py::TestRegisterSession -v
 ```
 
-### When to Restart
+**When to restart**: Code changes to `server.py`, `storage.py`, `helpers.py` require restart. `guide.md` is read fresh each request. Dev mode auto-reloads.
 
-Code changes to `server.py`, `storage.py`, `helpers.py` require restart.
-`guide.md` is read fresh each request. Dev mode auto-reloads.
+## Testing
+
+```bash
+make check                                      # Full suite (format + lint + test)
+pytest tests/test_server.py -v                  # Single file
+pytest tests/test_server.py::TestRegisterSession -v  # Single class
+pytest tests/test_server.py::TestRegisterSession::test_register_new_session -v  # Single test
+pytest -k "heartbeat" -v                        # Tests matching pattern
+```
 
 ## Architecture
 

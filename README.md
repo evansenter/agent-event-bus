@@ -24,36 +24,33 @@ When running multiple Claude Code sessions (in separate terminals or worktrees),
 
 ## Installation
 
-### Local Server (default)
+### Server
 
 Run the event bus server on this machine:
 
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
 cd agent-event-bus
-make install
+make install-server
 ```
 
-Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/agent-event-bus-cli`), MCP server.
+Installs: venv, LaunchAgent (auto-start), CLI (`~/.local/bin/agent-event-bus-cli`), MCP server pointing to localhost.
 
-### Remote Server (CLI-only)
+### Client
 
 Connect to an event bus running on another machine (e.g., via Tailscale):
 
 ```bash
 git clone https://github.com/evansenter/agent-event-bus.git
 cd agent-event-bus
-make install-cli
+make install-client REMOTE_URL=https://your-server.tailnet.ts.net/mcp
 ```
 
-Installs only the CLI for hooks/scripts. Then configure the remote connection:
+Installs CLI and configures MCP to point to the remote server. Add the URL to your shell profile:
 
 ```bash
 # In your shell profile (~/.extra, ~/.zshrc, etc.)
-export AGENT_EVENT_BUS_URL="http://<server-ip>:8080/mcp"
-
-# Add MCP server to Claude Code
-claude mcp add --transport http --scope user agent-event-bus http://<server-ip>:8080/mcp
+export AGENT_EVENT_BUS_URL="https://your-server.tailnet.ts.net/mcp"
 ```
 
 ### PATH
@@ -109,7 +106,7 @@ Run one server, connect from multiple machines via Tailscale (or any VPN).
 **Server machine:**
 
 ```bash
-make install  # Full install with LaunchAgent
+make install-server
 ```
 
 Edit `~/Library/LaunchAgents/com.evansenter.agent-event-bus.plist`, add to `EnvironmentVariables`:
@@ -120,21 +117,17 @@ Edit `~/Library/LaunchAgents/com.evansenter.agent-event-bus.plist`, add to `Envi
 
 Then restart: `make restart`
 
-> **Note:** `make install` overwrites the plist. To persist this setting, also edit `scripts/com.evansenter.agent-event-bus.plist` (uncomment the HOST lines).
+> **Note:** `make install-server` overwrites the plist. To persist this setting, also edit `scripts/com.evansenter.agent-event-bus.plist` (uncomment the HOST lines).
 
 **Client machines:**
 
 ```bash
-make install-cli  # CLI only, no local server
+make install-client REMOTE_URL=http://<tailscale-ip>:8080/mcp
 ```
 
-Then configure the remote connection:
+Then add to your shell profile:
 ```bash
-# In shell profile
 export AGENT_EVENT_BUS_URL="http://<tailscale-ip>:8080/mcp"
-
-# Add MCP server to Claude Code
-claude mcp add --transport http --scope user agent-event-bus http://<tailscale-ip>:8080/mcp
 ```
 
 New Claude Code sessions will have full `mcp__agent-event-bus__*` tool access to the central server.

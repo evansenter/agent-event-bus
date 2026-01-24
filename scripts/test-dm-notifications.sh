@@ -33,7 +33,7 @@ echo -e "${BLUE}=== Agent Event Bus DM Notification Test ===${NC}\n"
 # Check if agent-event-bus-cli exists
 if [[ ! -x "$CLI" ]]; then
     echo -e "${RED}Error: agent-event-bus-cli not found at $CLI${NC}"
-    echo "Run 'make install' first to install the CLI"
+    echo "Run 'make install-server' or 'make install-client' first to install the CLI"
     exit 1
 fi
 
