@@ -25,7 +25,7 @@ from event_bus.helpers import (
     is_client_alive,
     send_notification,
 )
-from event_bus.middleware import RequestLoggingMiddleware
+from event_bus.middleware import RequestLoggingMiddleware, TailscaleAuthMiddleware
 from event_bus.session_ids import generate_session_id
 from event_bus.storage import Session, SQLiteStorage
 
@@ -510,16 +510,32 @@ def notify(title: str, message: str, sound: bool = False) -> dict:
 
 
 def create_app():
-    """Create the ASGI app with logging middleware.
+    """Create the ASGI app with middleware stack.
+
+    Middleware order (outer to inner):
+    1. TailscaleAuthMiddleware - requires Tailscale identity headers
+    2. RequestLoggingMiddleware - logs MCP tool calls
 
     All MCP tool calls are logged to ~/.claude/contrib/event-bus/event-bus.log.
     Use `tail -f ~/.claude/contrib/event-bus/event-bus.log` to watch activity.
+
+    Set EVENT_BUS_AUTH_DISABLED=1 to disable auth (for testing/local dev).
     """
     # stateless_http=True allows resilience to server restarts
     app = mcp.http_app(stateless_http=True)
 
     # Always wrap with logging middleware
-    return RequestLoggingMiddleware(app)
+    app = RequestLoggingMiddleware(app)
+
+    # Wrap with auth middleware unless disabled
+    auth_disabled = os.environ.get("EVENT_BUS_AUTH_DISABLED", "").lower() in ("1", "true")
+    if not auth_disabled:
+        app = TailscaleAuthMiddleware(app)
+        logger.info("Tailscale auth enabled - requests require identity headers")
+    else:
+        logger.warning("Tailscale auth DISABLED - all requests allowed")
+
+    return app
 
 
 def main():

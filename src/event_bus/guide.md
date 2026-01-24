@@ -129,6 +129,18 @@ MCP is request/response - the server can't push to CC sessions. DMs work via the
 4. Human tells Claude: "check the event bus"
 5. Claude polls and sees the message
 
+## Authentication (Multi-Machine)
+
+When running across multiple machines via Tailscale, the server requires identity headers:
+
+- Requests must go through `tailscale serve` (injects `Tailscale-User-Login` header)
+- Direct requests to `localhost:8080` are rejected with 401
+- Only devices on your Tailnet can connect
+
+For local-only setups, set `EVENT_BUS_AUTH_DISABLED=1` to bypass auth.
+
+See `docs/TAILSCALE_SETUP.md` for full setup instructions.
+
 ## Best Practices
 
 1. **Register with client_id** - Enables session resumption

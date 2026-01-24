@@ -130,6 +130,9 @@ DEV_MODE=1 event-bus
 
 # Custom notification icon (requires terminal-notifier)
 EVENT_BUS_ICON=/path/to/icon.png event-bus
+
+# Disable Tailscale auth (for testing/local dev)
+EVENT_BUS_AUTH_DISABLED=1 event-bus
 ```
 
 Notifications: Uses terminal-notifier if installed (`brew install terminal-notifier`), falls back to osascript.

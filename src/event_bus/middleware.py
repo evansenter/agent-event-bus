@@ -302,6 +302,67 @@ def _parse_sse_response(response_text: str) -> dict:
     return {}
 
 
+class TailscaleAuthMiddleware:
+    """ASGI middleware that requires Tailscale identity headers.
+
+    When running behind `tailscale serve`, Tailscale injects identity headers
+    (Tailscale-User-Login, Tailscale-User-Name) into requests. This middleware
+    rejects requests that don't have these headers.
+    """
+
+    # Header injected by tailscale serve (lowercase for ASGI)
+    TAILSCALE_USER_HEADER = b"tailscale-user-login"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Check for Tailscale identity header
+        headers = dict(scope.get("headers", []))
+        tailscale_user = headers.get(self.TAILSCALE_USER_HEADER)
+
+        if not tailscale_user:
+            # No Tailscale identity - reject with 401
+            logger.warning(
+                f"Rejected unauthenticated request to {scope.get('path', '/')} "
+                f"from {scope.get('client', ('unknown',))[0]}"
+            )
+            await self._send_unauthorized(send)
+            return
+
+        # Log authenticated user (decode bytes to string)
+        user = tailscale_user.decode("utf-8", errors="replace")
+        logger.debug(f"Authenticated request from {user}")
+
+        # Allow request through
+        await self.app(scope, receive, send)
+
+    async def _send_unauthorized(self, send):
+        """Send a 401 Unauthorized response."""
+        body = b'{"error": "Unauthorized", "message": "Tailscale identity required"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            }
+        )
+
+
 class RequestLoggingMiddleware:
     """ASGI middleware that logs MCP tool calls with pretty formatting."""
 
