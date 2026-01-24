@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from event_bus.middleware import (
     _BOLD,
     _CYAN,
@@ -9,6 +11,7 @@ from event_bus.middleware import (
     _GREEN,
     _MAGENTA,
     _RED,
+    TailscaleAuthMiddleware,
     _format_args,
     _format_list,
     _format_result,
@@ -487,3 +490,97 @@ class TestInactiveSessionHighlighting:
             assert beta_pos < zebra_pos, (
                 "beta-active should appear before zebra-active (alphabetical)"
             )
+
+
+class TestTailscaleAuthMiddleware:
+    """Tests for TailscaleAuthMiddleware."""
+
+    @pytest.fixture
+    def mock_app(self):
+        """Mock ASGI app that tracks calls."""
+
+        async def app(scope, receive, send):
+            app.called = True
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b"OK",
+                "more_body": False,
+            })
+
+        app.called = False
+        return app
+
+    @pytest.mark.asyncio
+    async def test_allows_request_with_tailscale_header(self, mock_app):
+        """Requests with Tailscale-User-Login header are allowed."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "headers": [(b"tailscale-user-login", b"user@example.com")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        assert mock_app.called
+        assert responses[0]["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_rejects_request_without_tailscale_header(self, mock_app):
+        """Requests without Tailscale-User-Login header get 401."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "headers": [],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        assert not mock_app.called
+        assert responses[0]["status"] == 401
+        assert b"application/json" in dict(responses[0]["headers"]).values()
+
+    @pytest.mark.asyncio
+    async def test_passes_through_non_http_requests(self, mock_app):
+        """Non-HTTP requests (websocket, lifespan) pass through."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "lifespan",
+        }
+
+        async def receive():
+            return {"type": "lifespan.startup"}
+
+        async def send(message):
+            pass
+
+        await middleware(scope, receive, send)
+
+        assert mock_app.called
