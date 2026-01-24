@@ -8,13 +8,13 @@ This guide covers running event-bus across multiple machines using Tailscale for
 ┌─────────────────────────────────────────────────────────────┐
 │                     Your Tailnet                            │
 │                                                             │
-│  ┌──────────────┐         ┌──────────────────────────────┐ │
-│  │ Mac (client) │         │ Server (e.g., speck-vm)      │ │
-│  │              │         │                              │ │
-│  │ Claude Code  │ ──────► │ tailscale serve (:443)       │ │
-│  │     ↓        │  HTTPS  │       ↓                      │ │
-│  │ MCP client   │         │ event-bus (:8080 localhost)  │ │
-│  └──────────────┘         └──────────────────────────────┘ │
+│  ┌──────────────┐         ┌──────────────────────────────┐  │
+│  │ Mac (client) │         │ Server (e.g., speck-vm)      │  │
+│  │              │         │                              │  │
+│  │ Claude Code  │ ──────► │ tailscale serve (:443)       │  │
+│  │     ↓        │  HTTPS  │       ↓                      │  │
+│  │ MCP client   │         │ event-bus (:8080 localhost)  │  │
+│  └──────────────┘         └──────────────────────────────┘  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```

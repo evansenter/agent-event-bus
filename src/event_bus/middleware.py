@@ -344,19 +344,23 @@ class TailscaleAuthMiddleware:
     async def _send_unauthorized(self, send):
         """Send a 401 Unauthorized response."""
         body = b'{"error": "Unauthorized", "message": "Tailscale identity required"}'
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": body,
-            "more_body": False,
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            }
+        )
 
 
 class RequestLoggingMiddleware:
