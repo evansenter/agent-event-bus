@@ -5,18 +5,18 @@ This guide covers running agent-event-bus across multiple machines using Tailsca
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Your Tailnet                            │
-│                                                             │
-│  ┌──────────────┐         ┌──────────────────────────────┐  │
-│  │ Mac (client) │         │ Server (e.g., speck-vm)      │  │
-│  │              │         │                              │  │
-│  │ Claude Code  │ ──────► │ tailscale serve (:443)       │  │
-│  │     ↓        │  HTTPS  │       ↓                      │  │
-│  │ MCP client   │         │ agent-event-bus (:8080)      │  │
-│  └──────────────┘         └──────────────────────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Your Tailnet                             │
+│                                                                 │
+│  ┌──────────────┐         ┌──────────────────────────────────┐  │
+│  │ Mac (client) │         │ Server (e.g., speck-vm)          │  │
+│  │              │         │                                  │  │
+│  │ Claude Code  │ ──────► │ tailscale serve (:443)           │  │
+│  │     ↓        │  HTTPS  │   /agent-event-bus → :8080       │  │
+│  │ MCP client   │         │   /agent-session-analytics → ... │  │
+│  └──────────────┘         └──────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **How it works:**
