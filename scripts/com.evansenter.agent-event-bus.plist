@@ -34,8 +34,9 @@
     <key>KeepAlive</key>
     <true/>
 
+    <!-- Note: launchd truncates on restart; Python logger handles append to .log file -->
     <key>StandardOutPath</key>
-    <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.log</string>
+    <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.stdout</string>
 
     <key>StandardErrorPath</key>
     <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.err</string>
