@@ -343,7 +343,9 @@ def main():
     p_publish.add_argument("--type", required=True, help="Event type")
     p_publish.add_argument("--payload", required=True, help="Event payload")
     p_publish.add_argument("--channel", default="all", help="Target channel")
-    p_publish.add_argument("--session-id", help="Your session ID")
+    p_publish.add_argument(
+        "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
+    )
     p_publish.set_defaults(func=cmd_publish)
 
     # events

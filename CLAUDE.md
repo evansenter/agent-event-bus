@@ -140,6 +140,9 @@ AGENT_EVENT_BUS_ICON=/path/to/icon.png agent-event-bus
 
 # Disable Tailscale auth (for testing/local dev)
 AGENT_EVENT_BUS_AUTH_DISABLED=1 agent-event-bus
+
+# CLI session attribution (used by hooks)
+AGENT_EVENT_BUS_SESSION_ID=abc123 agent-event-bus-cli publish ...
 ```
 
 Notifications: Uses terminal-notifier if installed (`brew install terminal-notifier`), falls back to osascript.
