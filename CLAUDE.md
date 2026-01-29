@@ -4,7 +4,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MCP server for cross-session Claude Code communication. Sessions register, publish events, and poll for updates.
 
-**Related**: [claude-session-analytics](https://github.com/evansenter/claude-session-analytics) shares design patterns.
+**Related**: [agent-session-analytics](https://github.com/evansenter/agent-session-analytics) shares design patterns.
+
+---
+
+## Naming Conventions
+
+Follow these patterns consistently (aligned with agent-session-analytics):
+
+| Type | Value |
+|------|-------|
+| Repo | `agent-event-bus` |
+| Python package | `agent_event_bus` |
+| MCP server name | `agent-event-bus` |
+| CLI commands | `agent-event-bus`, `agent-event-bus-cli` |
+| Resource URI | `agent-event-bus://guide` |
+| Data directory | `~/.claude/contrib/agent-event-bus/` |
+| Database | `~/.claude/contrib/agent-event-bus/data.db` |
+| Log files | `agent-event-bus.log`, `agent-event-bus.err` |
+| LaunchAgent | `com.evansenter.agent-event-bus.plist` |
+| systemd service | `agent-event-bus.service` |
+
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`)
+
+---
 
 ## DATABASE PROTECTION
 
