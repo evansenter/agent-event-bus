@@ -823,6 +823,46 @@ class TestSessionCursorTracking:
         # Should work like normal get_events() - returns recent events
         assert len(result["events"]) >= 2
 
+    def test_resume_with_nonexistent_session_returns_empty(self):
+        """Test that resume=True with nonexistent session_id returns empty events.
+
+        This prevents flooding users with old events when using --resume with
+        an unregistered or expired session.
+        """
+        # Publish some events
+        publish_event("event1", "payload1")
+        publish_event("event2", "payload2")
+
+        # Poll with resume=True and a session_id that doesn't exist
+        result = get_events(session_id="nonexistent-session-id", resume=True)
+
+        # Should return empty events, not old events from the beginning
+        assert result["events"] == []
+        # Should still return a valid next_cursor for future polling
+        assert result["next_cursor"] is not None
+
+    def test_resume_with_session_without_cursor_returns_empty(self):
+        """Test that resume=True with session that has no saved cursor returns empty.
+
+        A newly registered session that hasn't polled yet should return empty
+        when using resume=True, not old events from the beginning.
+        """
+        # Register a session but don't poll (no cursor saved)
+        reg = register_session(name="test", machine="test-host", client_id="no-cursor-test")
+        session_id = reg["session_id"]
+
+        # Publish some events (these should NOT be returned)
+        publish_event("event1", "payload1")
+        publish_event("event2", "payload2")
+
+        # Poll with resume=True - session exists but has no cursor
+        result = get_events(session_id=session_id, resume=True)
+
+        # Should return empty events, not the events just published
+        assert result["events"] == []
+        # Should still return a valid next_cursor
+        assert result["next_cursor"] is not None
+
 
 class TestUnregisterByClientId:
     """Tests for unregister_session with client_id lookup."""
