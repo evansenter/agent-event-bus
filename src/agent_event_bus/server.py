@@ -536,6 +536,17 @@ def notify(title: str, message: str, sound: bool = False) -> dict:
 
 # Webhook support
 
+# Module-level HTTP client for webhook dispatch (connection pooling)
+_webhook_client: httpx.AsyncClient | None = None
+
+
+def _get_webhook_client() -> httpx.AsyncClient:
+    """Get or create the shared webhook HTTP client."""
+    global _webhook_client
+    if _webhook_client is None or _webhook_client.is_closed:
+        _webhook_client = httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT)
+    return _webhook_client
+
 
 def _compute_signature(payload: bytes, secret: str) -> str:
     """Compute HMAC-SHA256 signature for webhook payload."""
@@ -559,35 +570,35 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
         signature = _compute_signature(payload_bytes, webhook.secret)
         headers["X-Event-Bus-Signature"] = f"sha256={signature}"
 
-    async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
-        for attempt in range(WEBHOOK_MAX_RETRIES + 1):
-            try:
-                response = await client.post(
-                    webhook.url,
-                    content=payload_bytes,
-                    headers=headers,
+    client = _get_webhook_client()
+    for attempt in range(WEBHOOK_MAX_RETRIES + 1):
+        try:
+            response = await client.post(
+                webhook.url,
+                content=payload_bytes,
+                headers=headers,
+            )
+            if response.status_code < 400:
+                logger.debug(
+                    f"Webhook {webhook.id} ({webhook.url}) delivered: {response.status_code}"
                 )
-                if response.status_code < 400:
-                    logger.debug(
-                        f"Webhook {webhook.id} ({webhook.url}) delivered: {response.status_code}"
-                    )
-                    return True
-                logger.warning(
-                    f"Webhook {webhook.id} ({webhook.url}) returned {response.status_code}, "
-                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
-                )
-            except httpx.TimeoutException as e:
-                logger.warning(
-                    f"Webhook {webhook.id} ({webhook.url}) timed out: {e}, "
-                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
-                )
-            except httpx.RequestError as e:
-                logger.warning(
-                    f"Webhook {webhook.id} ({webhook.url}) request failed: {e}, "
-                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
-                )
-            if attempt < WEBHOOK_MAX_RETRIES:
-                await asyncio.sleep(0.5 * (attempt + 1))  # Backoff
+                return True
+            logger.warning(
+                f"Webhook {webhook.id} ({webhook.url}) returned {response.status_code}, "
+                f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+            )
+        except httpx.TimeoutException as e:
+            logger.warning(
+                f"Webhook {webhook.id} ({webhook.url}) timed out: {e}, "
+                f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+            )
+        except httpx.RequestError as e:
+            logger.warning(
+                f"Webhook {webhook.id} ({webhook.url}) request failed: {e}, "
+                f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+            )
+        if attempt < WEBHOOK_MAX_RETRIES:
+            await asyncio.sleep(0.5 * (attempt + 1))  # Backoff
 
     return False
 
@@ -666,27 +677,11 @@ def register_webhook(
 ) -> dict:
     """Register a webhook to receive event notifications via HTTP POST.
 
-    When events are published, matching webhooks receive a POST request with:
-    {
-        "event_id": 123,
-        "event_type": "task_completed",
-        "payload": "...",
-        "session_id": "abc",
-        "timestamp": "2026-01-31T...",
-        "channel": "all"
-    }
-
-    If a secret is provided, requests include X-Event-Bus-Signature header
-    with HMAC-SHA256 signature: "sha256=<hex>".
-
     Args:
         url: HTTP(S) endpoint to POST events to
         channel: Filter to specific channel (None = all). Supports prefix matching.
         event_types: Filter to specific event types (None = all)
         secret: Shared secret for HMAC signing (optional)
-
-    Returns:
-        Webhook registration details including webhook_id
     """
     webhook = storage.add_webhook(
         url=url,
@@ -712,9 +707,6 @@ def list_webhooks(active_only: bool = True) -> list[dict]:
 
     Args:
         active_only: If True, only return active webhooks (default: True)
-
-    Returns:
-        List of webhook details (secrets are redacted)
     """
     webhooks = storage.list_webhooks(active_only=active_only)
 
@@ -741,9 +733,6 @@ def unregister_webhook(webhook_id: int) -> dict:
 
     Args:
         webhook_id: ID of the webhook to remove
-
-    Returns:
-        Success status
     """
     deleted = storage.delete_webhook(webhook_id)
 

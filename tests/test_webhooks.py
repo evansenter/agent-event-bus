@@ -222,12 +222,12 @@ class TestWebhookDispatch:
             channel="all",
         )
 
-        with patch("agent_event_bus.server.httpx.AsyncClient") as mock_client:
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
             mock_response = AsyncMock()
             mock_response.status_code = 200
-            mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-                return_value=mock_response
-            )
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_get_client.return_value = mock_client
 
             result = await _dispatch_webhook(webhook, event)
             assert result is True
@@ -255,17 +255,17 @@ class TestWebhookDispatch:
             channel="all",
         )
 
-        with patch("agent_event_bus.server.httpx.AsyncClient") as mock_client:
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
             mock_response = AsyncMock()
             mock_response.status_code = 200
-            mock_instance = AsyncMock()
-            mock_instance.post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__.return_value = mock_instance
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_get_client.return_value = mock_client
 
             await _dispatch_webhook(webhook, event)
 
             # Check that signature header was included
-            call_args = mock_instance.post.call_args
+            call_args = mock_client.post.call_args
             headers = call_args.kwargs.get("headers", {})
             assert "X-Event-Bus-Signature" in headers
             assert headers["X-Event-Bus-Signature"].startswith("sha256=")
@@ -455,21 +455,21 @@ class TestWebhookIntegration:
             channel="all",
         )
 
-        with patch("agent_event_bus.server.httpx.AsyncClient") as mock_client:
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
             # Mock 500, 500, then 200 (succeeds on retry)
             mock_responses = [
                 AsyncMock(status_code=500),
                 AsyncMock(status_code=500),
                 AsyncMock(status_code=200),
             ]
-            mock_instance = AsyncMock()
-            mock_instance.post = AsyncMock(side_effect=mock_responses)
-            mock_client.return_value.__aenter__.return_value = mock_instance
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=mock_responses)
+            mock_get_client.return_value = mock_client
 
             result = await _dispatch_webhook(webhook, event)
 
             assert result is True
-            assert mock_instance.post.call_count == 3  # Retried twice, succeeded on 3rd
+            assert mock_client.post.call_count == 3  # Retried twice, succeeded on 3rd
 
     @pytest.mark.asyncio
     async def test_dispatch_webhook_exhausts_retries(self):
@@ -494,18 +494,18 @@ class TestWebhookIntegration:
             channel="all",
         )
 
-        with patch("agent_event_bus.server.httpx.AsyncClient") as mock_client:
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
             # All attempts fail
             mock_response = AsyncMock(status_code=500)
-            mock_instance = AsyncMock()
-            mock_instance.post = AsyncMock(return_value=mock_response)
-            mock_client.return_value.__aenter__.return_value = mock_instance
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_get_client.return_value = mock_client
 
             result = await _dispatch_webhook(webhook, event)
 
             assert result is False
             # 1 initial + 2 retries = 3 calls
-            assert mock_instance.post.call_count == 3
+            assert mock_client.post.call_count == 3
 
     @pytest.mark.asyncio
     async def test_dispatch_webhook_handles_timeout(self):
@@ -532,10 +532,10 @@ class TestWebhookIntegration:
             channel="all",
         )
 
-        with patch("agent_event_bus.server.httpx.AsyncClient") as mock_client:
-            mock_instance = AsyncMock()
-            mock_instance.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-            mock_client.return_value.__aenter__.return_value = mock_instance
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+            mock_get_client.return_value = mock_client
 
             result = await _dispatch_webhook(webhook, event)
 
