@@ -402,6 +402,15 @@ def get_events(
         session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
+        else:
+            # Session doesn't exist or has no saved cursor - treat as "caught up"
+            # Return empty events instead of flooding with old events from beginning
+            logger.debug(f"get_events: resume skipped, no cursor for session_id={session_id[:8]}...")
+            _dev_notify("get_events", f"resume skipped: no cursor for {session_id[:8]}...")
+            return {
+                "events": [],
+                "next_cursor": storage.get_cursor(),
+            }
 
     storage.cleanup_stale_sessions()
 
