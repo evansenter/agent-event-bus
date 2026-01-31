@@ -20,6 +20,9 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 | `get_events(session_id?, resume?, order?, event_types?)` | Poll for events |
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
+| `register_webhook(url, channel?, event_types?, secret?)` | Register HTTP endpoint for push notifications |
+| `list_webhooks(active_only?)` | List registered webhooks |
+| `unregister_webhook(webhook_id)` | Remove a webhook |
 
 *Signatures simplified for quick start. Full parameters (machine, cwd, cursor, limit, channel, etc.) available - check MCP tool docstrings.*
 
@@ -138,6 +141,73 @@ For multi-machine setups via Tailscale:
 - Only devices on your Tailnet can connect
 
 See `docs/TAILSCALE_SETUP.md` for full setup instructions.
+
+## Webhooks (Push Notifications)
+
+Instead of polling, you can register HTTP endpoints to receive events via POST.
+
+### Register a Webhook
+```
+register_webhook(
+    url="https://example.com/events",
+    channel="repo:",                    # Optional: filter by channel prefix
+    event_types=["task_completed"],     # Optional: filter by event type
+    secret="shared-secret"              # Optional: for HMAC signing
+)
+→ {webhook_id: 1, url: "...", created_at: "..."}
+```
+
+### Webhook Payload
+When events match, your endpoint receives a POST with:
+```json
+{
+    "event_id": 123,
+    "event_type": "task_completed",
+    "payload": "PR #42 merged",
+    "session_id": "abc123",
+    "timestamp": "2026-01-31T12:00:00",
+    "channel": "repo:my-project"
+}
+```
+
+### HMAC Signature Verification
+If you provide a `secret`, requests include `X-Event-Bus-Signature` header:
+```
+X-Event-Bus-Signature: sha256=<hex-digest>
+```
+
+Verify in your handler:
+```python
+import hmac
+import hashlib
+
+def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature)
+```
+
+### Filtering
+
+**Channel filter** - Supports exact match or prefix:
+- `channel="repo:my-project"` - Exact match
+- `channel="repo:"` - All repo channels
+- `channel="session:"` - All DMs
+
+**Event types** - List of specific types:
+- `event_types=["task_completed", "ci_completed"]` - Only these types
+- Omit for all event types
+
+### List and Remove Webhooks
+```
+list_webhooks(active_only=True)
+→ [{webhook_id: 1, url: "...", has_secret: true, ...}]
+
+unregister_webhook(webhook_id=1)
+→ {success: true, webhook_id: 1}
+```
+
+### Retry Behavior
+Webhooks retry up to 2 times with exponential backoff if the endpoint returns 4xx/5xx or times out.
 
 ## Best Practices
 

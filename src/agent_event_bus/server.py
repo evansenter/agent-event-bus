@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -567,15 +568,22 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
                     headers=headers,
                 )
                 if response.status_code < 400:
-                    logger.debug(f"Webhook {webhook.id} delivered: {response.status_code}")
+                    logger.debug(
+                        f"Webhook {webhook.id} ({webhook.url}) delivered: {response.status_code}"
+                    )
                     return True
                 logger.warning(
-                    f"Webhook {webhook.id} returned {response.status_code}, "
+                    f"Webhook {webhook.id} ({webhook.url}) returned {response.status_code}, "
                     f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
                 )
-            except Exception as e:
+            except httpx.TimeoutException as e:
                 logger.warning(
-                    f"Webhook {webhook.id} failed: {e}, "
+                    f"Webhook {webhook.id} ({webhook.url}) timed out: {e}, "
+                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+                )
+            except httpx.RequestError as e:
+                logger.warning(
+                    f"Webhook {webhook.id} ({webhook.url}) request failed: {e}, "
                     f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
                 )
             if attempt < WEBHOOK_MAX_RETRIES:
@@ -598,22 +606,55 @@ async def _dispatch_webhooks(event: Event) -> None:
         return_exceptions=True,
     )
 
-    success_count = sum(1 for r in results if r is True)
+    # Log results with exception details
+    success_count = 0
+    for wh, result in zip(webhooks, results):
+        if result is True:
+            success_count += 1
+        elif isinstance(result, Exception):
+            logger.error(
+                f"Webhook {wh.id} ({wh.url}) raised exception for event {event.id}: {result}"
+            )
+        else:
+            # result is False - dispatch failed after retries (already logged)
+            pass
+
     if success_count < len(webhooks):
         logger.warning(
             f"Webhook dispatch: {success_count}/{len(webhooks)} succeeded for event {event.id}"
         )
 
 
+def _handle_dispatch_task_exception(task: asyncio.Task, event_id: int) -> None:
+    """Log exceptions from background webhook dispatch tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(f"Webhook dispatch task failed for event {event_id}: {exc}")
+
+
+def _run_dispatch_in_thread(event: Event) -> None:
+    """Run webhook dispatch in a new thread with its own event loop."""
+    try:
+        asyncio.run(_dispatch_webhooks(event))
+    except Exception as e:
+        logger.error(f"Webhook dispatch failed for event {event.id}: {e}")
+
+
 def _schedule_webhook_dispatch(event: Event) -> None:
     """Schedule webhook dispatch in background (non-blocking)."""
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_dispatch_webhooks(event))
+        task = loop.create_task(_dispatch_webhooks(event))
+        # Capture event.id in closure to avoid issues if event object changes
+        event_id = event.id
+        task.add_done_callback(lambda t: _handle_dispatch_task_exception(t, event_id))
     except RuntimeError:
-        # No running event loop (sync context) - run in new loop
-        # This shouldn't happen in normal MCP operation but handles edge cases
-        asyncio.run(_dispatch_webhooks(event))
+        # No running event loop (sync context) - run in background thread
+        # This shouldn't happen in normal MCP/uvicorn operation but handles edge cases
+        thread = threading.Thread(target=_run_dispatch_in_thread, args=(event,), daemon=True)
+        thread.start()
 
 
 @mcp.tool()

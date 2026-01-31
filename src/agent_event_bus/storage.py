@@ -669,6 +669,7 @@ class SQLiteStorage:
         """Register a new webhook. Returns the created webhook."""
         now = datetime.now()
         # Store event_types as comma-separated string
+        # Normalize empty list to None (matches all event types)
         event_types_str = ",".join(event_types) if event_types else None
 
         with self._connect() as conn:
@@ -714,17 +715,13 @@ class SQLiteStorage:
                     "SELECT * FROM webhooks WHERE active = 1 ORDER BY created_at DESC"
                 ).fetchall()
             else:
-                rows = conn.execute(
-                    "SELECT * FROM webhooks ORDER BY created_at DESC"
-                ).fetchall()
+                rows = conn.execute("SELECT * FROM webhooks ORDER BY created_at DESC").fetchall()
             return [self._row_to_webhook(row) for row in rows]
 
     def get_webhook(self, webhook_id: int) -> Webhook | None:
         """Get a webhook by ID."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM webhooks WHERE id = ?", (webhook_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
             if row:
                 return self._row_to_webhook(row)
             return None

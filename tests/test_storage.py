@@ -609,7 +609,10 @@ class TestDatabaseInitialization:
         conn.close()
         # Schema version should be the latest after all migrations run
         from agent_event_bus.storage import SCHEMA_VERSION
-        assert version == SCHEMA_VERSION, f"Schema version should be {SCHEMA_VERSION}, got {version}"
+
+        assert version == SCHEMA_VERSION, (
+            f"Schema version should be {SCHEMA_VERSION}, got {version}"
+        )
 
 
 class TestSoftDelete:

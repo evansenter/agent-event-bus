@@ -460,9 +460,7 @@ def main():
     p_wh_register.add_argument(
         "--channel", help="Filter to channel (supports prefix, e.g., 'session:')"
     )
-    p_wh_register.add_argument(
-        "--event-types", help="Comma-separated event types to filter"
-    )
+    p_wh_register.add_argument("--event-types", help="Comma-separated event types to filter")
     p_wh_register.add_argument("--secret", help="Shared secret for HMAC signing")
     p_wh_register.set_defaults(func=cmd_webhook_register, bus_url=None)
 
