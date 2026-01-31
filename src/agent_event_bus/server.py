@@ -7,8 +7,15 @@ Provides tools for cross-session Claude Code communication:
 - get_events: Poll for new events (auto-refreshes heartbeat)
 - unregister_session: Clean up on exit
 - notify: Send system notifications
+- register_webhook: Register HTTP endpoint for push notifications
+- list_webhooks: List registered webhooks
+- unregister_webhook: Remove a webhook
 """
 
+import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 import socket
@@ -17,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import httpx
 from fastmcp import FastMCP
 
 from agent_event_bus.helpers import (
@@ -27,7 +35,7 @@ from agent_event_bus.helpers import (
 )
 from agent_event_bus.middleware import RequestLoggingMiddleware, TailscaleAuthMiddleware
 from agent_event_bus.session_ids import generate_session_id
-from agent_event_bus.storage import Session, SQLiteStorage
+from agent_event_bus.storage import Event, Session, SQLiteStorage, Webhook
 
 # Configure logging
 # Always log to ~/.claude/contrib/agent-event-bus/agent-event-bus.log for tail -f access
@@ -62,6 +70,8 @@ if (
 
 # Constants
 MAX_PAYLOAD_PREVIEW = 50  # Max chars to show in notification previews
+WEBHOOK_TIMEOUT = 5.0  # Seconds to wait for webhook response
+WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
 
 # Initialize MCP server
 mcp = FastMCP("agent-event-bus")
@@ -348,6 +358,9 @@ def publish_event(
         channel=channel,
     )
 
+    # Dispatch to matching webhooks (async, non-blocking)
+    _schedule_webhook_dispatch(event)
+
     truncated = (
         payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
     )
@@ -518,6 +531,186 @@ def notify(title: str, message: str, sound: bool = False) -> dict:
         "title": title,
         "message": message,
     }
+
+
+# Webhook support
+
+
+def _compute_signature(payload: bytes, secret: str) -> str:
+    """Compute HMAC-SHA256 signature for webhook payload."""
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
+    """Send event to a single webhook. Returns True on success."""
+    payload = {
+        "event_id": event.id,
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "session_id": event.session_id,
+        "timestamp": event.timestamp.isoformat(),
+        "channel": event.channel,
+    }
+    payload_bytes = json.dumps(payload).encode()
+
+    headers = {"Content-Type": "application/json"}
+    if webhook.secret:
+        signature = _compute_signature(payload_bytes, webhook.secret)
+        headers["X-Event-Bus-Signature"] = f"sha256={signature}"
+
+    async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
+        for attempt in range(WEBHOOK_MAX_RETRIES + 1):
+            try:
+                response = await client.post(
+                    webhook.url,
+                    content=payload_bytes,
+                    headers=headers,
+                )
+                if response.status_code < 400:
+                    logger.debug(f"Webhook {webhook.id} delivered: {response.status_code}")
+                    return True
+                logger.warning(
+                    f"Webhook {webhook.id} returned {response.status_code}, "
+                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Webhook {webhook.id} failed: {e}, "
+                    f"attempt {attempt + 1}/{WEBHOOK_MAX_RETRIES + 1}"
+                )
+            if attempt < WEBHOOK_MAX_RETRIES:
+                await asyncio.sleep(0.5 * (attempt + 1))  # Backoff
+
+    return False
+
+
+async def _dispatch_webhooks(event: Event) -> None:
+    """Dispatch event to all matching webhooks (async, fire-and-forget)."""
+    webhooks = storage.get_matching_webhooks(event)
+    if not webhooks:
+        return
+
+    logger.info(f"Dispatching event {event.id} to {len(webhooks)} webhook(s)")
+
+    # Fire all webhooks concurrently
+    results = await asyncio.gather(
+        *[_dispatch_webhook(wh, event) for wh in webhooks],
+        return_exceptions=True,
+    )
+
+    success_count = sum(1 for r in results if r is True)
+    if success_count < len(webhooks):
+        logger.warning(
+            f"Webhook dispatch: {success_count}/{len(webhooks)} succeeded for event {event.id}"
+        )
+
+
+def _schedule_webhook_dispatch(event: Event) -> None:
+    """Schedule webhook dispatch in background (non-blocking)."""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_dispatch_webhooks(event))
+    except RuntimeError:
+        # No running event loop (sync context) - run in new loop
+        # This shouldn't happen in normal MCP operation but handles edge cases
+        asyncio.run(_dispatch_webhooks(event))
+
+
+@mcp.tool()
+def register_webhook(
+    url: str,
+    channel: str | None = None,
+    event_types: list[str] | None = None,
+    secret: str | None = None,
+) -> dict:
+    """Register a webhook to receive event notifications via HTTP POST.
+
+    When events are published, matching webhooks receive a POST request with:
+    {
+        "event_id": 123,
+        "event_type": "task_completed",
+        "payload": "...",
+        "session_id": "abc",
+        "timestamp": "2026-01-31T...",
+        "channel": "all"
+    }
+
+    If a secret is provided, requests include X-Event-Bus-Signature header
+    with HMAC-SHA256 signature: "sha256=<hex>".
+
+    Args:
+        url: HTTP(S) endpoint to POST events to
+        channel: Filter to specific channel (None = all). Supports prefix matching.
+        event_types: Filter to specific event types (None = all)
+        secret: Shared secret for HMAC signing (optional)
+
+    Returns:
+        Webhook registration details including webhook_id
+    """
+    webhook = storage.add_webhook(
+        url=url,
+        channel_filter=channel,
+        event_types=event_types,
+        secret=secret,
+    )
+
+    _dev_notify("register_webhook", f"#{webhook.id} → {url}")
+
+    return {
+        "webhook_id": webhook.id,
+        "url": url,
+        "channel": channel,
+        "event_types": event_types,
+        "created_at": webhook.created_at.isoformat(),
+    }
+
+
+@mcp.tool()
+def list_webhooks(active_only: bool = True) -> list[dict]:
+    """List registered webhooks.
+
+    Args:
+        active_only: If True, only return active webhooks (default: True)
+
+    Returns:
+        List of webhook details (secrets are redacted)
+    """
+    webhooks = storage.list_webhooks(active_only=active_only)
+
+    results = [
+        {
+            "webhook_id": wh.id,
+            "url": wh.url,
+            "channel": wh.channel_filter,
+            "event_types": wh.event_types,
+            "active": wh.active,
+            "created_at": wh.created_at.isoformat(),
+            "has_secret": wh.secret is not None,
+        }
+        for wh in webhooks
+    ]
+
+    _dev_notify("list_webhooks", f"{len(results)} webhook(s)")
+    return results
+
+
+@mcp.tool()
+def unregister_webhook(webhook_id: int) -> dict:
+    """Remove a webhook registration.
+
+    Args:
+        webhook_id: ID of the webhook to remove
+
+    Returns:
+        Success status
+    """
+    deleted = storage.delete_webhook(webhook_id)
+
+    if deleted:
+        _dev_notify("unregister_webhook", f"#{webhook_id} removed")
+        return {"success": True, "webhook_id": webhook_id}
+    else:
+        return {"success": False, "error": "Webhook not found", "webhook_id": webhook_id}
 
 
 def create_app():

@@ -15,7 +15,7 @@ logger = logging.getLogger("agent-event-bus")
 
 # Schema version for migrations
 # Increment this when adding new migrations
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Migration function type: takes a connection, returns nothing
 MigrationFunc = Callable[[sqlite3.Connection], None]
@@ -100,6 +100,27 @@ def migrate_v2(conn: sqlite3.Connection) -> None:
     # SQLite doesn't support ALTER COLUMN, so we'll enforce in application
 
 
+# Migration for webhooks table
+@migration(3, "add_webhooks_table")
+def migrate_v3(conn: sqlite3.Connection) -> None:
+    """Add webhooks table for push notifications.
+
+    This migration creates the webhooks table for registering
+    HTTP endpoints that receive event notifications.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS webhooks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            channel_filter TEXT,
+            event_types TEXT,
+            created_at TIMESTAMP NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            secret TEXT
+        )
+    """)
+
+
 # Register datetime adapters/converters (required for Python 3.12+)
 # See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
 
@@ -165,6 +186,19 @@ class Event:
     session_id: str
     timestamp: datetime
     channel: str = "all"  # Target channel for the event
+
+
+@dataclass
+class Webhook:
+    """A registered webhook for event notifications."""
+
+    id: int
+    url: str
+    channel_filter: str | None  # None = all channels, or specific channel pattern
+    event_types: list[str] | None  # None = all types, or list of specific types
+    created_at: datetime
+    active: bool = True
+    secret: str | None = None  # Optional shared secret for HMAC signing
 
 
 # Database paths
@@ -333,6 +367,18 @@ class SQLiteStorage:
             # Index for efficient session deduplication lookup (machine, client_id)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_dedup ON sessions(machine, client_id)
+            """)
+            # Webhooks table for push notifications
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS webhooks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    channel_filter TEXT,
+                    event_types TEXT,
+                    created_at TIMESTAMP NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    secret TEXT
+                )
             """)
 
             # Run any pending migrations (also handles fresh installs where version=0)
@@ -610,3 +656,119 @@ class SQLiteStorage:
             row = conn.execute("SELECT MAX(id) as max_id FROM events").fetchone()
             max_id = row["max_id"]
             return str(max_id) if max_id else None
+
+    # Webhook operations
+
+    def add_webhook(
+        self,
+        url: str,
+        channel_filter: str | None = None,
+        event_types: list[str] | None = None,
+        secret: str | None = None,
+    ) -> Webhook:
+        """Register a new webhook. Returns the created webhook."""
+        now = datetime.now()
+        # Store event_types as comma-separated string
+        event_types_str = ",".join(event_types) if event_types else None
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO webhooks (url, channel_filter, event_types, created_at, active, secret)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (url, channel_filter, event_types_str, now, secret),
+            )
+            webhook_id = cursor.lastrowid
+
+            return Webhook(
+                id=webhook_id,
+                url=url,
+                channel_filter=channel_filter,
+                event_types=event_types,
+                created_at=now,
+                active=True,
+                secret=secret,
+            )
+
+    def _row_to_webhook(self, row: sqlite3.Row) -> Webhook:
+        """Convert a database row to a Webhook object."""
+        event_types_str = row["event_types"]
+        event_types = event_types_str.split(",") if event_types_str else None
+
+        return Webhook(
+            id=row["id"],
+            url=row["url"],
+            channel_filter=row["channel_filter"],
+            event_types=event_types,
+            created_at=row["created_at"],
+            active=bool(row["active"]),
+            secret=row["secret"],
+        )
+
+    def list_webhooks(self, active_only: bool = False) -> list[Webhook]:
+        """List all webhooks, optionally filtering to active only."""
+        with self._connect() as conn:
+            if active_only:
+                rows = conn.execute(
+                    "SELECT * FROM webhooks WHERE active = 1 ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM webhooks ORDER BY created_at DESC"
+                ).fetchall()
+            return [self._row_to_webhook(row) for row in rows]
+
+    def get_webhook(self, webhook_id: int) -> Webhook | None:
+        """Get a webhook by ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM webhooks WHERE id = ?", (webhook_id,)
+            ).fetchone()
+            if row:
+                return self._row_to_webhook(row)
+            return None
+
+    def delete_webhook(self, webhook_id: int) -> bool:
+        """Delete a webhook. Returns True if deleted, False if not found."""
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM webhooks WHERE id = ?", (webhook_id,))
+            return cursor.rowcount > 0
+
+    def set_webhook_active(self, webhook_id: int, active: bool) -> bool:
+        """Enable or disable a webhook. Returns True if updated."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE webhooks SET active = ? WHERE id = ?",
+                (1 if active else 0, webhook_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_matching_webhooks(self, event: Event) -> list[Webhook]:
+        """Get all active webhooks that match the given event.
+
+        Matching rules:
+        - channel_filter: None matches all, or exact match, or prefix match (e.g., "repo:" matches "repo:foo")
+        - event_types: None matches all, or event_type must be in the list
+        """
+        webhooks = self.list_webhooks(active_only=True)
+        matching = []
+
+        for wh in webhooks:
+            # Check channel filter
+            if wh.channel_filter is not None:
+                # Exact match or prefix match (e.g., "session:" matches "session:abc")
+                if not (
+                    event.channel == wh.channel_filter
+                    or event.channel.startswith(wh.channel_filter)
+                ):
+                    continue
+
+            # Check event type filter
+            if wh.event_types is not None:
+                if event.event_type not in wh.event_types:
+                    continue
+
+            matching.append(wh)
+
+        return matching

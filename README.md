@@ -68,6 +68,9 @@ Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 | `get_events` | Poll for events (use `resume=True` for incremental) |
 | `unregister_session` | Clean up on exit |
 | `notify` | System notification |
+| `register_webhook` | Register HTTP endpoint for push notifications |
+| `list_webhooks` | List registered webhooks |
+| `unregister_webhook` | Remove a webhook |
 
 ## Channels
 
@@ -98,6 +101,67 @@ agent-event-bus-cli events --session-id "$SESSION_ID" --resume --order asc
 # Cleanup
 agent-event-bus-cli unregister --session-id "$SESSION_ID"
 ```
+
+## Webhooks
+
+Push events to HTTP endpoints instead of polling. Webhooks are called asynchronously when events are published.
+
+### MCP
+
+```python
+# Register a webhook for all events
+register_webhook(url="https://your-server.com/events")
+
+# Filter by channel (prefix matching supported)
+register_webhook(url="https://...", channel="session:")
+
+# Filter by event type
+register_webhook(url="https://...", event_types=["task_completed", "help_needed"])
+
+# With HMAC signature verification
+register_webhook(url="https://...", secret="your-shared-secret")
+
+# List and manage
+list_webhooks()
+unregister_webhook(webhook_id=1)
+```
+
+### CLI
+
+```bash
+# Register
+agent-event-bus-cli webhook register --url https://your-server.com/events
+agent-event-bus-cli webhook register --url https://... --channel "session:" --secret "my-secret"
+
+# List
+agent-event-bus-cli webhook list
+
+# Remove
+agent-event-bus-cli webhook unregister 1
+```
+
+### Payload
+
+Webhooks receive a POST with JSON body:
+
+```json
+{
+  "event_id": 123,
+  "event_type": "task_completed",
+  "payload": "Finished building feature X",
+  "session_id": "abc-123",
+  "timestamp": "2026-01-31T08:00:00",
+  "channel": "repo:my-project"
+}
+```
+
+If a `secret` is configured, requests include an `X-Event-Bus-Signature` header:
+
+```
+X-Event-Bus-Signature: sha256=<hmac-sha256-hex>
+```
+
+Verify by computing HMAC-SHA256 of the raw request body with your secret.
 
 ## Multi-Machine Setup
 
