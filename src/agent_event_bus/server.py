@@ -405,7 +405,9 @@ def get_events(
         else:
             # Session doesn't exist or has no saved cursor - treat as "caught up"
             # Return empty events instead of flooding with old events from beginning
-            logger.debug(f"get_events: resume skipped, no cursor for session_id={session_id[:8]}...")
+            logger.debug(
+                f"get_events: resume skipped, no cursor for session_id={session_id[:8]}..."
+            )
             _dev_notify("get_events", f"resume skipped: no cursor for {session_id[:8]}...")
             return {
                 "events": [],
