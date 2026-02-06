@@ -64,6 +64,9 @@ def clean_storage():
     # Clear all sessions and events
     for session in server.storage.list_sessions():
         server.storage.delete_session(session.id)
+    # Clear all webhooks
+    for webhook in server.storage.list_webhooks(active_only=False):
+        server.storage.delete_webhook(webhook.id)
     # Clear events by recreating storage
     server.storage = SQLiteStorage(db_path=os.environ["AGENT_EVENT_BUS_DB"])
     yield

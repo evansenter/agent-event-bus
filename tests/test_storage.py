@@ -607,7 +607,12 @@ class TestDatabaseInitialization:
         cursor = conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
         conn.close()
-        assert version == 2, f"Schema version should be 2, got {version}"
+        # Schema version should be the latest after all migrations run
+        from agent_event_bus.storage import SCHEMA_VERSION
+
+        assert version == SCHEMA_VERSION, (
+            f"Schema version should be {SCHEMA_VERSION}, got {version}"
+        )
 
 
 class TestSoftDelete:

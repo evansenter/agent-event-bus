@@ -294,6 +294,60 @@ def cmd_notify(args):
         sys.exit(1)
 
 
+def cmd_webhook_register(args):
+    """Register a webhook."""
+    arguments = {"url": args.url}
+    if args.channel:
+        arguments["channel"] = args.channel
+    if args.event_types:
+        arguments["event_types"] = [t.strip() for t in args.event_types.split(",")]
+    if args.secret:
+        arguments["secret"] = args.secret
+
+    result = call_tool("register_webhook", arguments, url=args.bus_url, debug=args.debug)
+    print(json.dumps(result, indent=2))
+    if "webhook_id" in result:
+        print(f"\nWebhook registered: #{result['webhook_id']}", file=sys.stderr)
+
+
+def cmd_webhook_list(args):
+    """List registered webhooks."""
+    arguments = {"active_only": not args.all}
+    result = call_tool("list_webhooks", arguments, url=args.bus_url, debug=args.debug)
+
+    if not result:
+        print("No webhooks registered")
+        return
+
+    print(f"Webhooks ({len(result)}):\n")
+    for wh in result:
+        status = "✓" if wh.get("active") else "✗"
+        secret_indicator = " 🔐" if wh.get("has_secret") else ""
+        print(f"  [{status}] #{wh['webhook_id']}{secret_indicator}")
+        print(f"      URL: {wh['url']}")
+        if wh.get("channel"):
+            print(f"      Channel: {wh['channel']}")
+        if wh.get("event_types"):
+            print(f"      Events: {', '.join(wh['event_types'])}")
+        print(f"      Created: {wh['created_at']}")
+        print()
+
+
+def cmd_webhook_unregister(args):
+    """Unregister a webhook."""
+    result = call_tool(
+        "unregister_webhook",
+        {"webhook_id": args.webhook_id},
+        url=args.bus_url,
+        debug=args.debug,
+    )
+    if result.get("success"):
+        print(f"Webhook #{args.webhook_id} removed")
+    else:
+        print(f"Failed: {result.get('error', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="CLI wrapper for agent-event-bus",
@@ -396,12 +450,44 @@ def main():
     p_notify.add_argument("--sound", action="store_true", help="Play sound")
     p_notify.set_defaults(func=cmd_notify)
 
+    # webhook (parent command with subcommands)
+    p_webhook = subparsers.add_parser("webhook", help="Manage webhooks")
+    webhook_subparsers = p_webhook.add_subparsers(dest="webhook_command")
+
+    # webhook register
+    p_wh_register = webhook_subparsers.add_parser("register", help="Register a webhook")
+    p_wh_register.add_argument("--url", required=True, help="Webhook URL to POST events to")
+    p_wh_register.add_argument(
+        "--channel", help="Filter to channel (supports prefix, e.g., 'session:')"
+    )
+    p_wh_register.add_argument("--event-types", help="Comma-separated event types to filter")
+    p_wh_register.add_argument("--secret", help="Shared secret for HMAC signing")
+    p_wh_register.set_defaults(func=cmd_webhook_register, bus_url=None)
+
+    # webhook list
+    p_wh_list = webhook_subparsers.add_parser("list", help="List webhooks")
+    p_wh_list.add_argument("--all", action="store_true", help="Include inactive webhooks")
+    p_wh_list.set_defaults(func=cmd_webhook_list, bus_url=None)
+
+    # webhook unregister
+    p_wh_unregister = webhook_subparsers.add_parser("unregister", help="Remove a webhook")
+    p_wh_unregister.add_argument("webhook_id", type=int, help="Webhook ID to remove")
+    p_wh_unregister.set_defaults(func=cmd_webhook_unregister, bus_url=None)
+
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
         print("\nUse -h or --help with any command for more details.")
         sys.exit(1)
+
+    # Handle webhook subcommand
+    if args.command == "webhook":
+        if args.webhook_command is None:
+            p_webhook.print_help()
+            sys.exit(1)
+        # Pass the main URL to webhook subcommands
+        args.bus_url = args.url
 
     args.func(args)
 
