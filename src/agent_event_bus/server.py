@@ -423,9 +423,12 @@ def get_events(
                 f"get_events: resume skipped, no cursor for session_id={session_id[:8]}..."
             )
             _dev_notify("get_events", f"resume skipped: no cursor for {session_id[:8]}...")
+            next_cursor = storage.get_cursor()
+            if session and next_cursor is not None:
+                storage.update_session_cursor(session_id, next_cursor)
             return {
                 "events": [],
-                "next_cursor": storage.get_cursor(),
+                "next_cursor": next_cursor,
             }
 
     storage.cleanup_stale_sessions()

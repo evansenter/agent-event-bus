@@ -863,6 +863,31 @@ class TestSessionCursorTracking:
         # Should still return a valid next_cursor
         assert result["next_cursor"] is not None
 
+    def test_resume_saves_cursor_on_early_return(self):
+        """Test that resume=True saves cursor even when returning empty.
+
+        Regression test for #102: without saving the cursor on the early return
+        path, subsequent resume calls would always hit the "no cursor" branch
+        and never return new events.
+        """
+        # Register a session but don't poll (no cursor saved)
+        reg = register_session(name="test", machine="test-host", client_id="save-cursor-test")
+        session_id = reg["session_id"]
+
+        # First resume call - returns empty (expected, no cursor yet)
+        result1 = get_events(session_id=session_id, resume=True)
+        assert result1["events"] == []
+        saved_cursor = result1["next_cursor"]
+        assert saved_cursor is not None
+
+        # Publish a new event AFTER the cursor was saved
+        publish_event("new_event", "should be visible")
+
+        # Second resume call - should now pick up the new event
+        result2 = get_events(session_id=session_id, resume=True, order="asc")
+        assert len(result2["events"]) == 1
+        assert result2["events"][0]["event_type"] == "new_event"
+
 
 class TestUnregisterByClientId:
     """Tests for unregister_session with client_id lookup."""
