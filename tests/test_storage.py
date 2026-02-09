@@ -169,6 +169,86 @@ class TestSessionDeduplication:
         # Different client_id
         assert storage.find_session_by_client("localhost", "99999") is None
 
+    def test_find_session_by_client_excludes_deleted_by_default(self, storage):
+        """Test that soft-deleted sessions are excluded by default."""
+        now = datetime.now()
+        session = Session(
+            id="test-123",
+            display_id="cool-cat",
+            name="test-session",
+            machine="localhost",
+            cwd="/test",
+            repo="test",
+            registered_at=now,
+            last_heartbeat=now,
+            client_id="12345",
+        )
+        storage.add_session(session)
+        storage.delete_session("test-123")
+
+        assert storage.find_session_by_client("localhost", "12345") is None
+
+    def test_find_session_by_client_include_deleted(self, storage):
+        """Test that include_deleted=True finds soft-deleted sessions."""
+        now = datetime.now()
+        session = Session(
+            id="test-123",
+            display_id="cool-cat",
+            name="test-session",
+            machine="localhost",
+            cwd="/test",
+            repo="test",
+            registered_at=now,
+            last_heartbeat=now,
+            client_id="12345",
+        )
+        storage.add_session(session)
+        storage.delete_session("test-123")
+
+        found = storage.find_session_by_client("localhost", "12345", include_deleted=True)
+        assert found is not None
+        assert found.id == "test-123"
+        assert found.display_id == "cool-cat"
+
+    def test_find_session_by_client_include_deleted_prefers_active(self, storage):
+        """Test that include_deleted=True prefers active over deleted sessions."""
+        now = datetime.now()
+
+        # Create and soft-delete a session
+        old_session = Session(
+            id="old-123",
+            display_id="old-cat",
+            name="old-session",
+            machine="localhost",
+            cwd="/test",
+            repo="test",
+            registered_at=now,
+            last_heartbeat=now,
+            client_id="12345",
+        )
+        storage.add_session(old_session)
+        storage.delete_session("old-123")
+
+        # Create an active session with same machine+client_id but different id.
+        # This could happen via a race condition between concurrent registrations
+        # or manual DB edits. Tests that the ORDER BY prefers active over deleted.
+        new_session = Session(
+            id="new-123",
+            display_id="new-cat",
+            name="new-session",
+            machine="localhost",
+            cwd="/test",
+            repo="test",
+            registered_at=now,
+            last_heartbeat=now,
+            client_id="12345",
+        )
+        storage.add_session(new_session)
+
+        found = storage.find_session_by_client("localhost", "12345", include_deleted=True)
+        assert found is not None
+        assert found.id == "new-123"  # Active session preferred
+
 
 class TestHeartbeat:
     """Tests for heartbeat functionality."""

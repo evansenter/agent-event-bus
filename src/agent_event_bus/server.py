@@ -207,14 +207,18 @@ def register_session(
     repo = extract_repo_from_cwd(cwd)
 
     # Check for existing session with same machine+client_id
+    # include_deleted=True recovers codename from stale sessions (#104)
     existing = None
     if client_id is not None:
-        existing = storage.find_session_by_client(machine, client_id)
+        existing = storage.find_session_by_client(machine, client_id, include_deleted=True)
 
     if existing:
-        # Update existing session
+        # Update existing session (reactivate if soft-deleted)
         existing.name = name
+        existing.cwd = cwd
+        existing.repo = repo
         existing.last_heartbeat = now
+        existing.deleted_at = None
         storage.add_session(existing)  # INSERT OR REPLACE
         _dev_notify("register_session", f"{name} resumed → {existing.display_id}")
 

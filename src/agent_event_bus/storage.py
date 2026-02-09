@@ -413,19 +413,30 @@ class SQLiteStorage:
                 ),
             )
 
-    def find_session_by_client(self, machine: str, client_id: str) -> Session | None:
-        """Find an existing active session by machine+client_id key.
+    def find_session_by_client(
+        self, machine: str, client_id: str, include_deleted: bool = False
+    ) -> Session | None:
+        """Find an existing session by machine+client_id key.
 
         The dedup key is (machine, client_id) because client_ids (like PIDs) are
         machine-local - the same value on different machines represents different clients.
 
-        Only returns active (non-deleted) sessions.
+        Args:
+            include_deleted: If True, also match soft-deleted sessions (for codename recovery).
         """
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM sessions WHERE machine = ? AND client_id = ? AND deleted_at IS NULL",
-                (machine, client_id),
-            ).fetchone()
+            if include_deleted:
+                # ORDER BY: deleted_at IS NOT NULL evaluates to 0 (active) or 1 (deleted)
+                # in SQLite, so active sessions sort first; ties broken by most recent heartbeat
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE machine = ? AND client_id = ? ORDER BY deleted_at IS NOT NULL, last_heartbeat DESC LIMIT 1",
+                    (machine, client_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE machine = ? AND client_id = ? AND deleted_at IS NULL",
+                    (machine, client_id),
+                ).fetchone()
             if row:
                 return self._row_to_session(row)
             return None

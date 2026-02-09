@@ -107,6 +107,65 @@ class TestRegisterSession:
         assert result1["session_id"] != result2["session_id"]
         assert result2["resumed"] is False
 
+    def test_resume_preserves_codename_after_stale_cleanup(self):
+        """Test that codename (display_id) is preserved when re-registering after stale cleanup.
+
+        Regression test for #104: cleanup_stale_sessions() soft-deletes sessions with
+        heartbeat >24h, but re-registration should recover the original codename.
+        """
+        # Register a session
+        result1 = register_session(
+            name="original",
+            machine="test-machine",
+            cwd="/home/user/project",
+            client_id="12345",
+        )
+        original_display_id = result1["display_id"]
+        session_id = result1["session_id"]
+
+        # Soft-delete the session (simulates cleanup_stale_sessions)
+        server.storage.delete_session(session_id)
+        assert server.storage.get_session(session_id) is None  # Not visible as active
+
+        # Re-register with same machine+client_id
+        result2 = register_session(
+            name="resumed-after-stale",
+            machine="test-machine",
+            cwd="/home/user/project",
+            client_id="12345",
+        )
+
+        # Codename should be preserved
+        assert result2["display_id"] == original_display_id
+        assert result2["session_id"] == session_id
+        assert result2["resumed"] is True
+
+    def test_resume_reactivates_soft_deleted_session(self):
+        """Test that re-registering a soft-deleted session clears deleted_at."""
+        result = register_session(
+            name="original",
+            machine="test-machine",
+            cwd="/test",
+            client_id="12345",
+        )
+        session_id = result["session_id"]
+
+        # Soft-delete
+        server.storage.delete_session(session_id)
+
+        # Re-register
+        register_session(
+            name="resumed",
+            machine="test-machine",
+            cwd="/test",
+            client_id="12345",
+        )
+
+        # Session should be active again
+        session = server.storage.get_session(session_id)
+        assert session is not None
+        assert session.deleted_at is None
+
 
 class TestListSessions:
     """Tests for list_sessions tool."""
