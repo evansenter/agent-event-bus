@@ -215,6 +215,8 @@ def register_session(
     if existing:
         # Update existing session (reactivate if soft-deleted)
         existing.name = name
+        existing.cwd = cwd
+        existing.repo = repo
         existing.last_heartbeat = now
         existing.deleted_at = None
         storage.add_session(existing)  # INSERT OR REPLACE

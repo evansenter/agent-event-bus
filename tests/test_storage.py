@@ -229,8 +229,9 @@ class TestSessionDeduplication:
         storage.add_session(old_session)
         storage.delete_session("old-123")
 
-        # Create an active session with same machine+client_id but different id
-        # (This shouldn't normally happen, but tests the ORDER BY preference)
+        # Create an active session with same machine+client_id but different id.
+        # This could happen via a race condition between concurrent registrations
+        # or manual DB edits. Tests that the ORDER BY prefers active over deleted.
         new_session = Session(
             id="new-123",
             display_id="new-cat",

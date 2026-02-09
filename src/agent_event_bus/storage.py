@@ -426,6 +426,8 @@ class SQLiteStorage:
         """
         with self._connect() as conn:
             if include_deleted:
+                # ORDER BY: deleted_at IS NOT NULL evaluates to 0 (active) or 1 (deleted)
+                # in SQLite, so active sessions sort first; ties broken by most recent heartbeat
                 row = conn.execute(
                     "SELECT * FROM sessions WHERE machine = ? AND client_id = ? ORDER BY deleted_at IS NOT NULL, last_heartbeat DESC LIMIT 1",
                     (machine, client_id),
