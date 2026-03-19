@@ -20,24 +20,20 @@ clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# Create virtual environment (requires Python 3.10+)
+# Create/sync virtual environment (requires uv)
 venv:
-	@if [ ! -d .venv ]; then \
-		echo "Creating virtual environment..."; \
-		PYTHON=$$(command -v python3.12 || command -v python3.11 || command -v python3.10 || echo "python3"); \
-		$$PYTHON -m venv .venv && .venv/bin/pip install --upgrade pip; \
-	fi
+	uv sync
 
 # Install with dev dependencies (for development)
-dev: venv
-	.venv/bin/pip install -e ".[dev]"
+dev:
+	uv sync --extra dev
 
 # Server installation: runs the event bus service locally (idempotent)
 # Use this on the machine that will host the event bus
 # Re-run to pick up code changes (restarts service automatically)
-install-server: venv
+install-server:
 	@echo "Installing server..."
-	.venv/bin/pip install -e .
+	uv sync
 	@echo ""
 	@if [ "$$(uname)" = "Darwin" ]; then \
 		echo "Installing LaunchAgent (macOS)..."; \
@@ -68,14 +64,14 @@ install-server: venv
 # Client installation: connects to a remote event bus server (idempotent)
 # Usage: make install-client REMOTE_URL=https://your-server.tailnet.ts.net/mcp
 # Re-run to update remote URL or pick up CLI changes
-install-client: venv
+install-client:
 	@if [ -z "$(REMOTE_URL)" ]; then \
 		echo "Error: REMOTE_URL is required"; \
 		echo "Usage: make install-client REMOTE_URL=https://your-server.tailnet.ts.net/mcp"; \
 		exit 1; \
 	fi
 	@echo "Installing client (connecting to $(REMOTE_URL))..."
-	.venv/bin/pip install -e .
+	uv sync
 	@echo ""
 	@echo "Installing CLI..."
 	./scripts/install-cli.sh
