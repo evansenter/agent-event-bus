@@ -5,15 +5,15 @@ check: fmt lint test
 
 # Check/fix formatting with ruff
 fmt:
-	ruff format --check .
+	uv run ruff format --check .
 
 # Run linter with ruff
 lint:
-	ruff check .
+	uv run ruff check .
 
 # Run tests
 test:
-	pytest tests/ -v
+	uv run pytest tests/ -v
 
 # Clean build artifacts
 clean:
