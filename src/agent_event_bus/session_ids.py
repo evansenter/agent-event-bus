@@ -70,7 +70,7 @@ DINOSAURS = [
     "plesio",
     "spino",
     "carno",
-    "iguana",
+    "iguano",
     "hadro",
     "cerato",
     "compso",
