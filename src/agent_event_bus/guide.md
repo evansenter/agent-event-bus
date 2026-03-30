@@ -31,10 +31,10 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 ### 1. Register on startup
 ```
 register_session(name="auth-feature", client_id="cc-session-abc")
-→ {session_id: "cc-session-abc", display_id: "brave-tiger", cursor: "42", ...}
+→ {session_id: "cc-session-abc", display_id: "brave-trex", cursor: "42", ...}
 ```
 - `session_id` is your unique identifier (your `client_id`, or a UUID if not provided)
-- `display_id` is human-readable ("brave-tiger") - for display only
+- `display_id` is human-readable ("brave-trex") - for display only
 - Use `session_id` for all API calls
 
 ### 2. Poll for events

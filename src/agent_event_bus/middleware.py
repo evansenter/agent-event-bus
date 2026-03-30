@@ -27,7 +27,7 @@ def _lookup_session_display_id(session_id: str) -> str | None:
     """Look up human-readable display_id from a session_id.
 
     Session IDs are now UUIDs (or client_ids). This resolves them to
-    human-readable display names like "brave-tiger".
+    human-readable display names like "brave-trex".
 
     Returns the display_id if found, None otherwise.
     """
@@ -43,7 +43,7 @@ def _get_active_sessions_map() -> dict[str, str]:
     """Get mapping of session_id → display_id for active sessions.
 
     Returns a dict where keys are session IDs (UUIDs) and values are
-    human-readable display_ids (like "brave-tiger").
+    human-readable display_ids (like "brave-trex").
     """
     try:
         storage = _get_storage()
@@ -75,9 +75,9 @@ _TOOL_COLORS = {
 
 
 def _is_human_readable_id(session_id: str) -> bool:
-    """Check if a session ID is human-readable (Docker-style adjective-noun).
+    """Check if a session ID is human-readable (adjective-dinosaur format).
 
-    Human-readable: "brave-tiger", "tender-hawk" (two lowercase words with hyphen)
+    Human-readable: "brave-trex", "tender-raptor" (two lowercase words with hyphen)
     Not human-readable: "b712a0ba-1ee6-4c18-a647-31a785147665" (UUID)
     """
     if not session_id or session_id == "anonymous":
@@ -92,7 +92,7 @@ def _is_human_readable_id(session_id: str) -> bool:
 def _format_session_id_value(session_id: str) -> str:
     """Format a session_id value for display.
 
-    Human-readable IDs (brave-tiger) are shown prominently.
+    Human-readable IDs (brave-trex) are shown prominently.
     UUIDs/hex strings are dimmed and truncated.
     """
     if _is_human_readable_id(session_id):
@@ -138,7 +138,7 @@ def _format_list(items: list) -> str:
     first = items[0] if isinstance(items[0], dict) else None
     if first:
         if "session_id" in first:
-            # Show session display_ids (human-readable names): tender-hawk, brave-tiger, ...
+            # Show session display_ids (human-readable names): tender-raptor, brave-trex, ...
             # Prefer display_id if available, look it up if not, format UUID as fallback
             names = []
             for item in items:

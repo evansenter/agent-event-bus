@@ -80,7 +80,7 @@ src/agent_event_bus/
 ├── storage.py     # SQLite backend (Session, Event, SQLiteStorage)
 ├── helpers.py     # Notifications, repo extraction
 ├── middleware.py  # Request logging → ~/.claude/contrib/agent-event-bus/agent-event-bus.log
-├── session_ids.py # Docker-style display_id generation
+├── session_ids.py # Dinosaur-themed display_id generation
 ├── cli.py         # CLI wrapper for shell scripts
 └── guide.md       # Usage guide (agent-event-bus://guide resource)
 ```
@@ -143,7 +143,7 @@ CLI and MCP expose the same functionality:
 - **Session cleanup**: 24-hour timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` refresh heartbeat
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
-- **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-tiger")
+- **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-trex")
 - **Client deduplication**: `(machine, client_id)` enables session resumption
 
 ## Operations

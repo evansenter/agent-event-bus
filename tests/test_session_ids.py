@@ -1,7 +1,7 @@
-"""Tests for session_ids module (Docker-style display ID generation)."""
+"""Tests for session_ids module (dinosaur-themed display ID generation)."""
 
 from agent_event_bus.middleware import _is_human_readable_id
-from agent_event_bus.session_ids import ADJECTIVES, ANIMALS, generate_session_id
+from agent_event_bus.session_ids import ADJECTIVES, DINOSAURS, generate_session_id
 
 
 class TestGenerateSessionId:
@@ -21,11 +21,11 @@ class TestGenerateSessionId:
         assert _is_human_readable_id(session_id), f"ID failed check: {session_id}"
 
     def test_uses_words_from_lists(self):
-        """Generated ID uses words from ADJECTIVES and ANIMALS lists."""
+        """Generated ID uses words from ADJECTIVES and DINOSAURS lists."""
         session_id = generate_session_id()
-        adjective, animal = session_id.split("-")
+        adjective, dinosaur = session_id.split("-")
         assert adjective in ADJECTIVES, f"Adjective not in list: {adjective}"
-        assert animal in ANIMALS, f"Animal not in list: {animal}"
+        assert dinosaur in DINOSAURS, f"Dinosaur not in list: {dinosaur}"
 
     def test_randomness(self):
         """Multiple calls produce different results (with high probability)."""
@@ -37,11 +37,11 @@ class TestGenerateSessionId:
     def test_word_lists_non_empty(self):
         """Word lists have sufficient entries for good randomness."""
         assert len(ADJECTIVES) >= 10, "ADJECTIVES list too small"
-        assert len(ANIMALS) >= 10, "ANIMALS list too small"
+        assert len(DINOSAURS) >= 10, "DINOSAURS list too small"
 
     def test_word_lists_lowercase(self):
         """All words in lists are lowercase alphabetic."""
         for word in ADJECTIVES:
             assert word.isalpha() and word.islower(), f"Invalid adjective: {word}"
-        for word in ANIMALS:
-            assert word.isalpha() and word.islower(), f"Invalid animal: {word}"
+        for word in DINOSAURS:
+            assert word.isalpha() and word.islower(), f"Invalid dinosaur: {word}"
