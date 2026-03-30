@@ -42,7 +42,7 @@ Pagination: pass `next_cursor` as `cursor` in the next call. Empty `events` arra
 
 ### Session format (`list_sessions`)
 
-Sessions self-register with a name, machine, and optional `client_id` for resumption. The server assigns a `display_id` (Docker-style codename) and infers `repo` from the working directory.
+Sessions self-register with a name, machine, and optional `client_id` for resumption. The server assigns a `display_id` (dinosaur-themed codename) and infers `repo` from the working directory.
 
 ```json
 {
