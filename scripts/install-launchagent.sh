@@ -13,7 +13,7 @@ LABEL="com.evansenter.agent-event-bus"
 # Check venv exists
 if [[ ! -f "$VENV_PYTHON" ]]; then
     echo "Error: Virtual environment not found at $PROJECT_DIR/.venv"
-    echo "Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e ."
+    echo "Run: make install-server  (or: uv sync)"
     exit 1
 fi
 

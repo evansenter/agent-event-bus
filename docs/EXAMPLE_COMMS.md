@@ -572,7 +572,7 @@ help_needed → session:b7f4160b
   "Follow-up: After renaming the directory, recreate the venv (it has hardcoded
    paths):
    cd ~/projects/agent-event-bus
-   rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install -e .
+   rm -rf .venv && uv sync
    Then `make install` will set up the LaunchAgent with correct paths."
 ```
 
