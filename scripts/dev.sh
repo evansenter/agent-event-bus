@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
-source .venv/bin/activate
 
 SERVICE_WAS_RUNNING=false
 
@@ -50,4 +49,4 @@ echo ""
 
 # DEV_MODE enables request/response body logging
 export AGENT_EVENT_BUS_ICON="$PROJECT_DIR/assets/icon.png"
-DEV_MODE=1 uvicorn agent_event_bus.server:create_app --host 127.0.0.1 --port 8080 --reload --factory
+DEV_MODE=1 uv run uvicorn agent_event_bus.server:create_app --host 127.0.0.1 --port 8080 --reload --factory

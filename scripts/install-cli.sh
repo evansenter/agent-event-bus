@@ -12,7 +12,7 @@ CLI_PATH="$INSTALL_DIR/agent-event-bus-cli"
 # Check venv CLI exists
 if [[ ! -f "$VENV_CLI" ]]; then
     echo "Error: CLI not found at $VENV_CLI"
-    echo "Run: make dev (or pip install -e .)"
+    echo "Run: make dev  (or: uv sync)"
     exit 1
 fi
 
