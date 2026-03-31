@@ -948,6 +948,9 @@ class TestSessionCursorTracking:
 
         Regression test for #114: verifies that pre-existing events are skipped
         and only events published after the first resume call are returned.
+
+        Key difference from test_resume_saves_cursor_on_early_return: events
+        exist *before* the first resume poll, verifying they are filtered out.
         """
         # Register a session
         reg = register_session(name="test", machine="test-host", client_id="persist-tip-test")

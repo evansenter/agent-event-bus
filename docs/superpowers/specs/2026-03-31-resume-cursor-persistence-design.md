@@ -9,7 +9,7 @@ The `--resume` flag in `get_events` silently drops all events for sessions that 
 
 ## Root Cause
 
-`server.py` lines 405-415: the `else` branch handles two distinct cases identically:
+In `server.py`'s `get_events` function, the resume early-return `else` branch handles two distinct cases identically:
 1. Session doesn't exist (`session` is `None`)
 2. Session exists but has no saved cursor (`session.last_cursor` is falsy)
 
