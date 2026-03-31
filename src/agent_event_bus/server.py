@@ -420,20 +420,25 @@ def get_events(
         session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
-        else:
-            # Session doesn't exist or has no saved cursor - treat as "caught up"
-            # Return empty events instead of flooding with old events from beginning
+        elif session:
+            # Session exists but has no saved cursor - persist tip so next resume works
+            tip = storage.get_cursor()
+            storage.update_session_cursor(session_id, tip)
             logger.debug(
-                f"get_events: resume skipped, no cursor for session_id={session_id[:8]}..."
+                f"get_events: resume initialized cursor for session_id={session_id[:8]}..."
             )
-            _dev_notify("get_events", f"resume skipped: no cursor for {session_id[:8]}...")
-            next_cursor = storage.get_cursor()
-            if session and next_cursor is not None:
-                storage.update_session_cursor(session_id, next_cursor)
+            _dev_notify("get_events", f"resume initialized: cursor set for {session_id[:8]}...")
             return {
                 "events": [],
-                "next_cursor": next_cursor,
+                "next_cursor": tip,
             }
+        else:
+            # Session doesn't exist
+            logger.debug(
+                f"get_events: resume failed, session not found session_id={session_id[:8]}..."
+            )
+            _dev_notify("get_events", f"resume failed: session not found {session_id[:8]}...")
+            return {"error": "Session not found", "session_id": session_id}
 
     storage.cleanup_stale_sessions()
 

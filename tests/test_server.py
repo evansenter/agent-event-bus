@@ -882,12 +882,8 @@ class TestSessionCursorTracking:
         # Should work like normal get_events() - returns recent events
         assert len(result["events"]) >= 2
 
-    def test_resume_with_nonexistent_session_returns_empty(self):
-        """Test that resume=True with nonexistent session_id returns empty events.
-
-        This prevents flooding users with old events when using --resume with
-        an unregistered or expired session.
-        """
+    def test_resume_with_nonexistent_session_returns_error(self):
+        """Test that resume=True with nonexistent session_id returns an error."""
         # Publish some events
         publish_event("event1", "payload1")
         publish_event("event2", "payload2")
@@ -895,10 +891,10 @@ class TestSessionCursorTracking:
         # Poll with resume=True and a session_id that doesn't exist
         result = get_events(session_id="nonexistent-session-id", resume=True)
 
-        # Should return empty events, not old events from the beginning
-        assert result["events"] == []
-        # Should still return a valid next_cursor for future polling
-        assert result["next_cursor"] is not None
+        # Should return an error, not events
+        assert "error" in result
+        assert result["error"] == "Session not found"
+        assert result["session_id"] == "nonexistent-session-id"
 
     def test_resume_with_session_without_cursor_returns_empty(self):
         """Test that resume=True with session that has no saved cursor returns empty.
@@ -946,6 +942,57 @@ class TestSessionCursorTracking:
         result2 = get_events(session_id=session_id, resume=True, order="asc")
         assert len(result2["events"]) == 1
         assert result2["events"][0]["event_type"] == "new_event"
+
+    def test_resume_persists_tip_cursor_for_cursorless_session(self):
+        """Test that resume=True persists tip cursor so next poll picks up new events.
+
+        Regression test for #114: verifies that pre-existing events are skipped
+        and only events published after the first resume call are returned.
+        """
+        # Register a session
+        reg = register_session(name="test", machine="test-host", client_id="persist-tip-test")
+        session_id = reg["session_id"]
+
+        # Publish events before first resume poll
+        publish_event("old_event", "should not appear")
+
+        # First resume=True — returns empty but should persist tip cursor
+        result1 = get_events(session_id=session_id, resume=True)
+        assert result1["events"] == []
+
+        # Publish a new event after the tip cursor was persisted
+        publish_event("new_event", "should appear")
+
+        # Second resume=True — should return only the new event
+        result2 = get_events(session_id=session_id, resume=True, order="asc")
+        assert len(result2["events"]) == 1
+        assert result2["events"][0]["event_type"] == "new_event"
+
+    def test_rapid_resume_polling_no_event_loss(self):
+        """Test that rapid resume=True polling doesn't drop events.
+
+        Simulates the scenario from #114: multiple rapid polls interspersed
+        with publishes should never lose events.
+        """
+        reg = register_session(name="test", machine="test-host", client_id="rapid-poll-test")
+        session_id = reg["session_id"]
+
+        # Initialize cursor with first resume poll
+        get_events(session_id=session_id, resume=True)
+
+        all_received = []
+
+        # Simulate rapid polling with interspersed publishes
+        for i in range(5):
+            publish_event(f"event_{i}", f"payload_{i}")
+
+            # Poll immediately after publish
+            result = get_events(session_id=session_id, resume=True, order="asc")
+            all_received.extend(e["event_type"] for e in result["events"])
+
+        # All 5 events should have been received, none dropped
+        for i in range(5):
+            assert f"event_{i}" in all_received, f"event_{i} was dropped"
 
 
 class TestUnregisterByClientId:
