@@ -1,5 +1,6 @@
 """Tests for CLI wrapper."""
 
+import json
 from argparse import Namespace
 from unittest.mock import MagicMock, patch
 
@@ -515,6 +516,58 @@ class TestCmdEvents:
         call_args = mock_call.call_args[0][1]
         assert call_args["resume"] is True
         assert call_args["session_id"] == "test-session"
+
+
+class TestCmdEventsErrorSurfacing:
+    """Tests for CLI surfacing server-side errors in events command."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_events_error_json_mode(self, mock_call, capsys):
+        """Test that --json mode outputs server error as JSON and exits non-zero."""
+        mock_call.return_value = {"error": "Session not found", "session_id": "bad-id"}
+
+        args = make_events_args(json=True, session_id="bad-id", resume=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_events(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["error"] == "Session not found"
+        assert output["session_id"] == "bad-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_events_error_text_mode(self, mock_call, capsys):
+        """Test that text mode prints error to stderr and exits non-zero."""
+        mock_call.return_value = {"error": "Session not found", "session_id": "bad-id"}
+
+        args = make_events_args(session_id="bad-id", resume=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_events(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Session not found" in captured.err
+
+
+class TestCmdUnregisterErrorSurfacing:
+    """Tests for CLI surfacing server-side errors in unregister command."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_unregister_error_surfaces(self, mock_call, capsys):
+        """Test that unregister surfaces server errors to stderr."""
+        mock_call.return_value = {"error": "Session not found", "session_id": "bad-id"}
+
+        args = Namespace(session_id="bad-id", client_id=None, url=None, debug=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_unregister(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Session not found" in captured.err
 
 
 class TestCmdNotify:
