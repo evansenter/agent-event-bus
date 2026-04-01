@@ -159,6 +159,11 @@ def cmd_unregister(args):
         sys.exit(1)
 
     result = call_tool("unregister_session", arguments, url=args.url, debug=args.debug)
+
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
     print(json.dumps(result, indent=2))
 
 
@@ -252,6 +257,14 @@ def cmd_events(args):
     result = call_tool(
         "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
     )
+
+    # Check for server-side errors (e.g., session not found)
+    if "error" in result:
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
 
     # Result is now a dict with "events" and "next_cursor"
     events = result.get("events", [])
