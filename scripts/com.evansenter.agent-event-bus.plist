@@ -39,7 +39,7 @@
     <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.stdout</string>
 
     <key>StandardErrorPath</key>
-    <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.err</string>
+    <string>__ERR_FILE__</string>
 
     <key>ProcessType</key>
     <string>Background</string>

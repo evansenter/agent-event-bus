@@ -10,8 +10,8 @@ Environment=AGENT_EVENT_BUS_ICON=__PROJECT_DIR__/assets/icon.png
 ExecStart=__VENV_PYTHON__ -m agent_event_bus.server
 Restart=always
 RestartSec=5
-StandardOutput=append:__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.log
-StandardError=append:__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.err
+StandardOutput=append:__LOG_FILE__
+StandardError=append:__ERR_FILE__
 
 [Install]
 WantedBy=default.target

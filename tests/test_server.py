@@ -3,6 +3,8 @@
 import logging
 import os
 import socket
+import subprocess
+import sys
 from datetime import datetime
 
 import pytest
@@ -1262,3 +1264,36 @@ class TestChannelValidation:
             publish_event("test", "payload", channel="machine:localhost")
 
         assert "Invalid" not in caplog.text
+
+
+class TestLogFileEnvVar:
+    """Tests for AGENT_EVENT_BUS_LOG env var override."""
+
+    def _resolved_log_file(self, env: dict) -> str:
+        """Resolve server.LOG_FILE in a subprocess with the given env.
+
+        Subprocess required because LOG_FILE is set at module import time,
+        and reloading the server module in-process would disrupt other tests.
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", "from agent_event_bus import server; print(server.LOG_FILE)"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        return result.stdout.strip()
+
+    def test_log_file_respects_env_var(self, tmp_path):
+        """LOG_FILE honors AGENT_EVENT_BUS_LOG when set."""
+        custom = tmp_path / "custom.log"
+        env = {**os.environ, "AGENT_EVENT_BUS_LOG": str(custom), "AGENT_EVENT_BUS_TESTING": "1"}
+        assert self._resolved_log_file(env) == str(custom)
+
+    def test_log_file_falls_back_to_default(self):
+        """LOG_FILE uses the canonical default when AGENT_EVENT_BUS_LOG is unset."""
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_EVENT_BUS_LOG"}
+        env["AGENT_EVENT_BUS_TESTING"] = "1"
+        expected = os.path.expanduser("~/.claude/contrib/agent-event-bus/agent-event-bus.log")
+        assert self._resolved_log_file(env) == expected

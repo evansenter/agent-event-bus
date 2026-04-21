@@ -158,6 +158,11 @@ make logs BUS_HOST=your-server.tailnet.ts.net
 # Override database path
 AGENT_EVENT_BUS_DB=/path/to/db.sqlite agent-event-bus
 
+# Override log/error file paths (set before `make install-server` so the
+# launchd/systemd templates are generated with the custom paths)
+AGENT_EVENT_BUS_LOG=/path/to/custom.log
+AGENT_EVENT_BUS_ERR=/path/to/custom.err
+
 # Dev mode console logging
 DEV_MODE=1 agent-event-bus
 

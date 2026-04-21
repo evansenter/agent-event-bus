@@ -11,6 +11,10 @@ SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_DEST="$SERVICE_DIR/agent-event-bus.service"
 SERVICE_NAME="agent-event-bus"
 
+# Resolve paths (respect env var overrides, fall back to canonical defaults)
+LOG_FILE="${AGENT_EVENT_BUS_LOG:-$HOME/.claude/contrib/agent-event-bus/agent-event-bus.log}"
+ERR_FILE="${AGENT_EVENT_BUS_ERR:-$HOME/.claude/contrib/agent-event-bus/agent-event-bus.err}"
+
 # Check venv exists
 if [[ ! -f "$VENV_PYTHON" ]]; then
     echo "Error: Virtual environment not found at $PROJECT_DIR/.venv"
@@ -33,6 +37,8 @@ echo "Installing systemd service..."
 sed -e "s|__VENV_PYTHON__|$VENV_PYTHON|g" \
     -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
+    -e "s|__LOG_FILE__|$LOG_FILE|g" \
+    -e "s|__ERR_FILE__|$ERR_FILE|g" \
     "$SERVICE_TEMPLATE" > "$SERVICE_DEST"
 
 # Reload systemd and start service
@@ -45,8 +51,8 @@ sleep 1
 if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
     echo ""
     echo "Agent Event Bus installed and running!"
-    echo "  Logs: ~/.claude/contrib/agent-event-bus/agent-event-bus.log"
-    echo "  Errors: ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
+    echo "  Logs: $LOG_FILE"
+    echo "  Errors: $ERR_FILE"
     echo "  Status: systemctl --user status $SERVICE_NAME"
     echo ""
 
@@ -58,6 +64,6 @@ if systemctl --user is-active "$SERVICE_NAME" &>/dev/null; then
 else
     echo "Error: Service failed to start. Check logs:"
     echo "  journalctl --user -u $SERVICE_NAME"
-    echo "  ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
+    echo "  $ERR_FILE"
     exit 1
 fi
