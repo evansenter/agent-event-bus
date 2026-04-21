@@ -143,6 +143,25 @@ restart:
 		fi; \
 	fi
 
-# Tail the event bus log
+# Tail the event bus log (auto-detects local vs remote bus)
+# Override with BUS_HOST=<tailscale-host> to force a remote tail
 logs:
-	@tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log
+	@HOST="$(BUS_HOST)"; \
+	if [ -z "$$HOST" ]; then \
+		CLAUDE_CMD=$$(command -v claude || echo "$$HOME/.local/bin/claude"); \
+		if [ -x "$$CLAUDE_CMD" ]; then \
+			URL=$$("$$CLAUDE_CMD" mcp list 2>/dev/null | awk '/^agent-event-bus:/ {print $$2}'); \
+		fi; \
+		if [ -z "$$URL" ]; then \
+			URL="$$AGENT_EVENT_BUS_URL"; \
+		fi; \
+		if echo "$$URL" | grep -qE '^https?://'; then \
+			HOST=$$(echo "$$URL" | sed -E 's|https?://||; s|/.*||; s|:[0-9]+$$||; s|^\[||; s|\]$$||'); \
+		fi; \
+	fi; \
+	if [ -z "$$HOST" ] || [ "$$HOST" = "localhost" ] || [ "$$HOST" = "127.0.0.1" ] || [ "$$HOST" = "::1" ]; then \
+		tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log; \
+	else \
+		echo "Tailing remote bus at $$HOST (Ctrl-C to exit)..."; \
+		ssh -t -- "$$HOST" 'tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log'; \
+	fi

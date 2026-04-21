@@ -149,8 +149,11 @@ CLI and MCP expose the same functionality:
 ## Operations
 
 ```bash
-# Watch live activity
-tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log
+# Watch live activity (auto-detects local vs remote bus from MCP config)
+make logs
+
+# Force a remote tail (overrides auto-detect)
+make logs BUS_HOST=your-server.tailnet.ts.net
 
 # Override database path
 AGENT_EVENT_BUS_DB=/path/to/db.sqlite agent-event-bus
