@@ -25,7 +25,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | LaunchAgent | `com.evansenter.agent-event-bus.plist` |
 | systemd service | `agent-event-bus.service` |
 
-**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`)
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`)
 
 ---
 

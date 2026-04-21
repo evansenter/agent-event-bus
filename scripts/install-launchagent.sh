@@ -36,6 +36,7 @@ echo "Installing LaunchAgent..."
 sed -e "s|__VENV_PYTHON__|$VENV_PYTHON|g" \
     -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
+    -e "s|__LOG_FILE__|$LOG_FILE|g" \
     -e "s|__ERR_FILE__|$ERR_FILE|g" \
     "$PLIST_TEMPLATE" > "$PLIST_DEST"
 

@@ -151,6 +151,9 @@ restart:
 # Override with BUS_HOST=<tailscale-host> to force a remote tail.
 # Auto-detect parses `claude mcp list` text output (agent-event-bus: URL ...);
 # detection silently falls through to local if that format ever changes.
+# Remote tail path is hardcoded to the canonical default: we can't know the
+# remote bus's AGENT_EVENT_BUS_LOG from here, so a remote override is not
+# honored by `make logs`. Run the tail directly over SSH in that case.
 logs:
 	@HOST="$(BUS_HOST)"; \
 	if [ -z "$$HOST" ]; then \
