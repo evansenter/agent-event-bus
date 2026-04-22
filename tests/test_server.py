@@ -1269,8 +1269,8 @@ class TestChannelValidation:
 class TestMakeLogsHostDetection:
     """Tests for the host-detection pipeline in the Makefile's `logs` target.
 
-    The sed/grep pipeline is at Makefile:154-157. These tests duplicate it via
-    shell subprocess so regressions in the URL → HOST extraction are caught.
+    The grep-then-sed pipeline is at Makefile:166-168. These tests duplicate it
+    via shell subprocess so regressions in the URL → HOST extraction are caught.
     Keep this in sync if the Makefile pipeline changes.
     """
 
