@@ -23,6 +23,10 @@
         <string>__PROJECT_DIR__/src</string>
         <key>AGENT_EVENT_BUS_ICON</key>
         <string>__PROJECT_DIR__/assets/icon.png</string>
+        <key>AGENT_EVENT_BUS_LOG</key>
+        <string>__LOG_FILE__</string>
+        <key>AGENT_EVENT_BUS_ERR</key>
+        <string>__ERR_FILE__</string>
         <!-- Multi-machine: Set HOST to 0.0.0.0 to accept remote connections -->
         <!-- <key>HOST</key> -->
         <!-- <string>0.0.0.0</string> -->
@@ -39,7 +43,7 @@
     <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.stdout</string>
 
     <key>StandardErrorPath</key>
-    <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.err</string>
+    <string>__ERR_FILE__</string>
 
     <key>ProcessType</key>
     <string>Background</string>

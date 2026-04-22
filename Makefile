@@ -1,5 +1,9 @@
 .PHONY: check fmt lint test clean install-server install-client uninstall dev venv restart logs
 
+# Canonical paths (override with matching AGENT_EVENT_BUS_* env vars)
+LOG_FILE := $(or $(AGENT_EVENT_BUS_LOG),$(HOME)/.claude/contrib/agent-event-bus/agent-event-bus.log)
+ERR_FILE := $(or $(AGENT_EVENT_BUS_ERR),$(HOME)/.claude/contrib/agent-event-bus/agent-event-bus.err)
+
 # Run all quality gates (format check, lint, tests)
 check: fmt lint test
 
@@ -124,7 +128,7 @@ restart:
 			if launchctl list | grep -q "com.evansenter.agent-event-bus"; then \
 				echo "Service restarted successfully"; \
 			else \
-				echo "Error: Service failed to start. Check ~/.claude/contrib/agent-event-bus/agent-event-bus.err"; \
+				echo "Error: Service failed to start. Check $(ERR_FILE)"; \
 				exit 1; \
 			fi; \
 		else \
@@ -138,11 +142,35 @@ restart:
 		if systemctl --user is-active agent-event-bus &>/dev/null; then \
 			echo "Service restarted successfully"; \
 		else \
-			echo "Error: Service failed to start. Check ~/.claude/contrib/agent-event-bus/agent-event-bus.err"; \
+			echo "Error: Service failed to start. Check $(ERR_FILE)"; \
 			exit 1; \
 		fi; \
 	fi
 
-# Tail the event bus log
+# Tail the event bus log (auto-detects local vs remote bus)
+# Override with BUS_HOST=<tailscale-host> to force a remote tail.
+# Auto-detect parses `claude mcp list` text output (agent-event-bus: URL ...);
+# detection silently falls through to local if that format ever changes.
+# Remote tail path is hardcoded to the canonical default: we can't know the
+# remote bus's AGENT_EVENT_BUS_LOG from here, so a remote override is not
+# honored by `make logs`. Run the tail directly over SSH in that case.
 logs:
-	@tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log
+	@HOST="$(BUS_HOST)"; \
+	if [ -z "$$HOST" ]; then \
+		CLAUDE_CMD=$$(command -v claude || echo "$$HOME/.local/bin/claude"); \
+		if [ -x "$$CLAUDE_CMD" ]; then \
+			URL=$$("$$CLAUDE_CMD" mcp list 2>/dev/null | awk '/^agent-event-bus:/ {print $$2}'); \
+		fi; \
+		if [ -z "$$URL" ]; then \
+			URL="$$AGENT_EVENT_BUS_URL"; \
+		fi; \
+		if echo "$$URL" | grep -qE '^https?://'; then \
+			HOST=$$(echo "$$URL" | sed -E 's|https?://||; s|/.*||; s|:[0-9]+$$||; s|^\[||; s|\]$$||'); \
+		fi; \
+	fi; \
+	if [ -z "$$HOST" ] || [ "$$HOST" = "localhost" ] || [ "$$HOST" = "127.0.0.1" ] || [ "$$HOST" = "::1" ] || [ "$$HOST" = "0.0.0.0" ]; then \
+		tail -f $(LOG_FILE); \
+	else \
+		echo "Tailing remote bus at $$HOST (Ctrl-C to exit)..."; \
+		ssh -t -- "$$HOST" 'tail -f ~/.claude/contrib/agent-event-bus/agent-event-bus.log'; \
+	fi

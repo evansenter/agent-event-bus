@@ -10,6 +10,10 @@ PLIST_TEMPLATE="$SCRIPT_DIR/com.evansenter.agent-event-bus.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/com.evansenter.agent-event-bus.plist"
 LABEL="com.evansenter.agent-event-bus"
 
+# Resolve paths (respect env var overrides, fall back to canonical defaults)
+LOG_FILE="${AGENT_EVENT_BUS_LOG:-$HOME/.claude/contrib/agent-event-bus/agent-event-bus.log}"
+ERR_FILE="${AGENT_EVENT_BUS_ERR:-$HOME/.claude/contrib/agent-event-bus/agent-event-bus.err}"
+
 # Check venv exists
 if [[ ! -f "$VENV_PYTHON" ]]; then
     echo "Error: Virtual environment not found at $PROJECT_DIR/.venv"
@@ -32,6 +36,8 @@ echo "Installing LaunchAgent..."
 sed -e "s|__VENV_PYTHON__|$VENV_PYTHON|g" \
     -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
+    -e "s|__LOG_FILE__|$LOG_FILE|g" \
+    -e "s|__ERR_FILE__|$ERR_FILE|g" \
     "$PLIST_TEMPLATE" > "$PLIST_DEST"
 
 # Load the service
@@ -43,8 +49,8 @@ sleep 1
 if launchctl list | grep -q "$LABEL"; then
     echo ""
     echo "Agent Event Bus installed and running!"
-    echo "  Logs: ~/.claude/contrib/agent-event-bus/agent-event-bus.log"
-    echo "  Errors: ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
+    echo "  Logs: $LOG_FILE"
+    echo "  Errors: $ERR_FILE"
     echo ""
 
     # Also install CLI for use in hooks/scripts
@@ -54,7 +60,7 @@ if launchctl list | grep -q "$LABEL"; then
     echo "To uninstall: $SCRIPT_DIR/uninstall-launchagent.sh"
     osascript -e 'display notification "LaunchAgent installed and running" with title "Agent Event Bus"' 2>/dev/null
 else
-    echo "Error: Service failed to start. Check ~/.claude/contrib/agent-event-bus/agent-event-bus.err"
+    echo "Error: Service failed to start. Check $ERR_FILE"
     osascript -e 'display notification "Failed to start - check logs" with title "Agent Event Bus" sound name "Basso"' 2>/dev/null
     exit 1
 fi

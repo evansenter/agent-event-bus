@@ -3,6 +3,8 @@
 import logging
 import os
 import socket
+import subprocess
+import sys
 from datetime import datetime
 
 import pytest
@@ -1262,3 +1264,83 @@ class TestChannelValidation:
             publish_event("test", "payload", channel="machine:localhost")
 
         assert "Invalid" not in caplog.text
+
+
+class TestMakeLogsHostDetection:
+    """Tests for the host-detection pipeline in the Makefile's `logs` target.
+
+    The grep-then-sed pipeline is at Makefile:166-168. These tests duplicate it
+    via shell subprocess so regressions in the URL → HOST extraction are caught.
+    Keep this in sync if the Makefile pipeline changes.
+    """
+
+    @staticmethod
+    def _resolve_host(url: str) -> str:
+        """Run the Makefile's detection pipeline against a single URL."""
+        script = (
+            'URL="$1"; HOST=""; '
+            "if echo \"$URL\" | grep -qE '^https?://'; then "
+            'HOST=$(echo "$URL" | '
+            "sed -E 's|https?://||; s|/.*||; s|:[0-9]+$||; s|^\\[||; s|\\]$||'); "
+            "fi; "
+            'printf "%s" "$HOST"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "_", url],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            (
+                "https://mac-mini.tailac7b3c.ts.net/agent-event-bus/mcp",
+                "mac-mini.tailac7b3c.ts.net",
+            ),
+            ("http://host.example.com:8080/mcp", "host.example.com"),
+            ("http://127.0.0.1:8080/mcp", "127.0.0.1"),
+            ("http://[::1]:8080/mcp", "::1"),
+            ("https://localhost/mcp", "localhost"),
+            ("stdio://something", ""),  # non-http scheme → HOST unset
+            ("", ""),  # empty URL → HOST unset
+            ("https://-oProxyCommand=id/mcp", "-oProxyCommand=id"),  # mitigated by `ssh --`
+        ],
+    )
+    def test_host_extraction(self, url, expected):
+        assert self._resolve_host(url) == expected
+
+
+class TestLogFileEnvVar:
+    """Tests for AGENT_EVENT_BUS_LOG env var override."""
+
+    def _resolved_log_file(self, env: dict) -> str:
+        """Resolve server.LOG_FILE in a subprocess with the given env.
+
+        Subprocess required because LOG_FILE is set at module import time,
+        and reloading the server module in-process would disrupt other tests.
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", "from agent_event_bus import server; print(server.LOG_FILE)"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        return result.stdout.strip()
+
+    def test_log_file_respects_env_var(self, tmp_path):
+        """LOG_FILE honors AGENT_EVENT_BUS_LOG when set."""
+        custom = tmp_path / "custom.log"
+        env = {**os.environ, "AGENT_EVENT_BUS_LOG": str(custom), "AGENT_EVENT_BUS_TESTING": "1"}
+        assert self._resolved_log_file(env) == str(custom)
+
+    def test_log_file_falls_back_to_default(self):
+        """LOG_FILE uses the canonical default when AGENT_EVENT_BUS_LOG is unset."""
+        env = {k: v for k, v in os.environ.items() if k != "AGENT_EVENT_BUS_LOG"}
+        env["AGENT_EVENT_BUS_TESTING"] = "1"
+        expected = os.path.expanduser("~/.claude/contrib/agent-event-bus/agent-event-bus.log")
+        assert self._resolved_log_file(env) == expected

@@ -39,10 +39,11 @@ from agent_event_bus.session_ids import generate_session_id
 from agent_event_bus.storage import Event, Session, SQLiteStorage, Webhook
 
 # Configure logging
-# Always log to ~/.claude/contrib/agent-event-bus/agent-event-bus.log for tail -f access
-# In dev mode, also log to console
+# Default log path: ~/.claude/contrib/agent-event-bus/agent-event-bus.log
+# Override with AGENT_EVENT_BUS_LOG env var (matches AGENT_EVENT_BUS_DB pattern)
 # Skip file logging during tests to avoid polluting production logs
-LOG_FILE = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "agent-event-bus.log"
+_DEFAULT_LOG_FILE = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "agent-event-bus.log"
+LOG_FILE = Path(os.environ.get("AGENT_EVENT_BUS_LOG", str(_DEFAULT_LOG_FILE)))
 
 logger = logging.getLogger("agent-event-bus")
 logger.setLevel(logging.DEBUG if os.environ.get("DEV_MODE") else logging.INFO)
