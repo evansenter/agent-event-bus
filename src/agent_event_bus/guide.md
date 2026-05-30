@@ -107,6 +107,21 @@ get_events(cursor="42", order="asc")
 ```
 Pass `next_cursor` to subsequent calls. But `resume=True` is simpler.
 
+### Peeking (non-consuming reads)
+`peek=True` reads pending events **without advancing the session cursor**, so the
+same events are still returned by the next normal poll. Use it when something
+other than the main polling loop needs to inspect what's pending and decide
+whether to act — without stealing those events from the loop.
+```
+# Inspect pending events without consuming them
+get_events(session_id=session_id, resume=True, peek=True)
+→ {events: [...], next_cursor: "55"}   # cursor NOT advanced
+
+# A later normal poll still returns them and advances the cursor
+get_events(session_id=session_id, resume=True, order="asc")
+```
+CLI: `agent-event-bus-cli events --session-id ID --resume --peek`
+
 ## Common Patterns
 
 ### Signal when your work is ready

@@ -400,6 +400,7 @@ def get_events(
     channel: str | None = None,
     resume: bool = False,
     event_types: list[str] | None = None,
+    peek: bool = False,
 ) -> dict:
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
@@ -411,6 +412,7 @@ def get_events(
         channel: Filter to specific channel
         resume: Use saved cursor (requires session_id)
         event_types: Filter by types, e.g., ["task_completed"]
+        peek: Read without advancing the session cursor (non-consuming)
     """
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
@@ -421,6 +423,10 @@ def get_events(
         session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
+        elif session and peek:
+            # peek + resume on a cursor-less session: read from the tip without
+            # persisting it, so a non-consuming peek never advances the cursor.
+            cursor = storage.get_cursor()
         elif session:
             # Session exists but has no saved cursor - persist tip so next resume works
             tip = storage.get_cursor()
@@ -462,7 +468,11 @@ def get_events(
     # Note: Updates on any poll - any poll means the session has "seen" events up to this point.
     # Silently ignore unknown session_ids - callers may pass external session IDs
     # (like Claude Code's own UUIDs) that aren't registered with us.
-    if session_id and raw_events:
+    # peek=True reads without advancing: the events stay "unseen" so a later
+    # consuming poll (e.g. the UserPromptSubmit hook) still returns them. This
+    # lets a Stop-hook drain inspect pending events and decide whether to act
+    # without stealing them from the normal pull path.
+    if session_id and raw_events and not peek:
         high_water_mark = str(max(e.id for e in raw_events))
         storage.update_session_cursor(session_id, high_water_mark)
 
