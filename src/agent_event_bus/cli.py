@@ -254,7 +254,7 @@ def cmd_events(args):
         arguments["channel"] = args.channel
     if args.resume:
         arguments["resume"] = True
-    if args.peek:
+    if getattr(args, "peek", False):
         arguments["peek"] = True
     if args.include:
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
