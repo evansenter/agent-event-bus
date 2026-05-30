@@ -9,7 +9,7 @@ Usage:
     agent-event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
     agent-event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--include T1,T2]
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
-                         [--channel CHANNEL] [--resume]
+                         [--channel CHANNEL] [--resume] [--peek]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
 
 Examples:
@@ -43,6 +43,9 @@ Examples:
 
     # Resume from saved cursor (incremental polling - no duplicates)
     agent-event-bus-cli events --session-id abc123 --resume --order asc
+
+    # Peek: read new events without consuming them (cursor stays put)
+    agent-event-bus-cli events --session-id abc123 --resume --peek
 
     # Filter by event type
     agent-event-bus-cli events --include task_completed,ci_completed
@@ -251,6 +254,8 @@ def cmd_events(args):
         arguments["channel"] = args.channel
     if args.resume:
         arguments["resume"] = True
+    if args.peek:
+        arguments["peek"] = True
     if args.include:
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
 
@@ -449,6 +454,11 @@ def main():
         "--resume",
         action="store_true",
         help="Resume from saved cursor position (requires --session-id, ignored if --cursor provided)",
+    )
+    p_events.add_argument(
+        "--peek",
+        action="store_true",
+        help="Read without advancing the session cursor (non-consuming; events stay unseen for the next poll)",
     )
     p_events.add_argument(
         "--include",

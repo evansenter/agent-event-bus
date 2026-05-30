@@ -1000,6 +1000,60 @@ class TestSessionCursorTracking:
             assert f"event_{i}" in all_received, f"event_{i} was dropped"
 
 
+class TestPeek:
+    """Tests for peek mode: read without advancing the session cursor."""
+
+    def test_peek_does_not_advance_cursor(self):
+        """peek=True returns events but leaves the cursor untouched."""
+        reg = register_session(name="peek-test", machine="test-host", client_id="peek-1")
+        session_id = reg["session_id"]
+
+        # Establish a baseline cursor by consuming one event.
+        publish_event("task_completed", "Event 1")
+        get_events(session_id=session_id, resume=True, order="asc")
+        baseline = server.storage.get_session(session_id).last_cursor
+
+        # New event arrives; peek at it.
+        publish_event("help_needed", "Event 2")
+        peeked = get_events(session_id=session_id, resume=True, order="asc", peek=True)
+
+        # The event is returned...
+        assert any(e["event_type"] == "help_needed" for e in peeked["events"])
+        # ...but the cursor did NOT move.
+        assert server.storage.get_session(session_id).last_cursor == baseline
+
+    def test_peek_then_consume_returns_same_events(self):
+        """A peek is non-consuming: a subsequent normal poll still sees the events."""
+        reg = register_session(name="peek-consume", machine="test-host", client_id="peek-2")
+        session_id = reg["session_id"]
+
+        publish_event("task_completed", "Event 1")
+        get_events(session_id=session_id, resume=True, order="asc")
+
+        publish_event("help_needed", "Event 2")
+        peeked = get_events(session_id=session_id, resume=True, order="asc", peek=True)
+        consumed = get_events(session_id=session_id, resume=True, order="asc")
+
+        peeked_ids = [e["id"] for e in peeked["events"]]
+        consumed_ids = [e["id"] for e in consumed["events"]]
+        assert peeked_ids == consumed_ids
+        assert len(consumed_ids) >= 1
+
+        # After consuming, the cursor has advanced: a third poll is empty.
+        assert get_events(session_id=session_id, resume=True, order="asc")["events"] == []
+
+    def test_peek_on_cursorless_session_does_not_persist(self):
+        """peek + resume on a session with no saved cursor must not persist a cursor."""
+        reg = register_session(name="peek-cursorless", machine="test-host", client_id="peek-3")
+        session_id = reg["session_id"]
+        assert server.storage.get_session(session_id).last_cursor is None
+
+        get_events(session_id=session_id, resume=True, order="asc", peek=True)
+
+        # Still no persisted cursor — the peek left the session untouched.
+        assert server.storage.get_session(session_id).last_cursor is None
+
+
 class TestUnregisterByClientId:
     """Tests for unregister_session with client_id lookup."""
 
