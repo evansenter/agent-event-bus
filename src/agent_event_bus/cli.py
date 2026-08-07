@@ -275,6 +275,8 @@ def cmd_events(args):
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
     if getattr(args, "correlation_id", None):
         arguments["correlation_id"] = args.correlation_id
+    if getattr(args, "min_level", None):
+        arguments["min_level"] = args.min_level
 
     result = call_tool(
         "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
@@ -502,6 +504,11 @@ def main():
         help="Comma-separated event types to include (e.g., task_completed,ci_completed)",
     )
     p_events.add_argument("--correlation-id", help="Filter to one correlation thread")
+    p_events.add_argument(
+        "--min-level",
+        choices=["lifecycle", "info", "actionable"],
+        help="Drop events below this signal level (server-side; replaces client denylists)",
+    )
     p_events.set_defaults(func=cmd_events)
 
     # notify

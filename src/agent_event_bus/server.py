@@ -83,6 +83,41 @@ WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
 # are stored as-is with a warning, never rejected.
 VALID_SIGNAL_LEVELS = ("lifecycle", "info", "actionable")
 
+# Signal-level ordering for min_level filtering (#129): one canonical noise
+# policy on the server so clients subscribe by level instead of each
+# maintaining a denylist of low-signal event types.
+SIGNAL_LEVEL_ORDER = {"lifecycle": 0, "info": 1, "actionable": 2}
+
+# event_type -> derived level. Anything not listed is "info".
+EVENT_TYPE_SIGNAL_LEVELS = {
+    # lifecycle: registration/watching/rerun churn
+    "session_registered": "lifecycle",
+    "session_unregistered": "lifecycle",
+    "ci_watching": "lifecycle",
+    "ci_rerun": "lifecycle",
+    "task_started": "lifecycle",
+    "parallel_work_started": "lifecycle",
+    # actionable: things aimed at someone
+    "help_needed": "actionable",
+    "blocker_found": "actionable",
+    "ci_failed": "actionable",
+    "error_broadcast": "actionable",
+}
+
+
+def _get_signal_level(event: Event) -> str:
+    """Effective signal level for an event.
+
+    An explicit publish-time signal_level wins; DMs (session: channels) are
+    always actionable; otherwise the level derives from event_type.
+    """
+    if event.meta and event.meta.get("signal_level") in SIGNAL_LEVEL_ORDER:
+        return event.meta["signal_level"]
+    if event.channel.startswith("session:"):
+        return "actionable"
+    return EVENT_TYPE_SIGNAL_LEVELS.get(event.event_type, "info")
+
+
 # Initialize MCP server
 mcp = FastMCP("agent-event-bus")
 
@@ -497,6 +532,7 @@ def _event_to_dict(e: Event) -> dict:
         "timestamp": e.timestamp.isoformat(),
         "channel": e.channel,
         "correlation_id": e.correlation_id,
+        "signal_level": _get_signal_level(e),
     }
     if e.meta:
         if "title" in e.meta:
@@ -516,6 +552,7 @@ def _get_events_impl(
     event_types: list[str] | None = None,
     peek: bool = False,
     correlation_id: str | None = None,
+    min_level: Literal["lifecycle", "info", "actionable"] | None = None,
 ) -> dict:
     """Sync implementation of get_events (runs in a worker thread)."""
     # Auto-refresh heartbeat when session polls
@@ -585,6 +622,16 @@ def _get_events_impl(
         high_water_mark = str(max(e.id for e in raw_events))
         storage.update_session_cursor(session_id, high_water_mark)
 
+    # Level filtering happens after cursor bookkeeping: filtered-out events
+    # still count as "seen" (they are noise by definition, not missed signal).
+    # A page may therefore return fewer than `limit` events; keep paging by
+    # next_cursor.
+    if min_level:
+        threshold = SIGNAL_LEVEL_ORDER[min_level]
+        raw_events = [
+            e for e in raw_events if SIGNAL_LEVEL_ORDER[_get_signal_level(e)] >= threshold
+        ]
+
     events = [_event_to_dict(e) for e in raw_events]
 
     _dev_notify("get_events", f"{len(events)} events (cursor={cursor})")
@@ -606,6 +653,7 @@ async def get_events(
     event_types: list[str] | None = None,
     peek: bool = False,
     correlation_id: str | None = None,
+    min_level: Literal["lifecycle", "info", "actionable"] | None = None,
 ) -> dict:
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
@@ -619,6 +667,7 @@ async def get_events(
         event_types: Filter by types, e.g., ["task_completed"]
         peek: Read without advancing the session cursor (non-consuming)
         correlation_id: Filter to one correlation thread
+        min_level: Drop events below this signal level (lifecycle < info < actionable)
     """
     return await _run_sync(
         _get_events_impl,
@@ -631,6 +680,7 @@ async def get_events(
         event_types=event_types,
         peek=peek,
         correlation_id=correlation_id,
+        min_level=min_level,
     )
 
 
