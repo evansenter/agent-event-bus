@@ -233,6 +233,15 @@ def cmd_publish(args):
     session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
     if session_id:
         arguments["session_id"] = session_id
+    # Optional structured payload fields (RFC #121)
+    if getattr(args, "title", None):
+        arguments["title"] = args.title
+    if getattr(args, "tags", None):
+        arguments["tags"] = [t.strip() for t in args.tags.split(",")]
+    if getattr(args, "correlation_id", None):
+        arguments["correlation_id"] = args.correlation_id
+    if getattr(args, "signal_level", None):
+        arguments["signal_level"] = args.signal_level
 
     result = call_tool("publish_event", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
@@ -264,6 +273,8 @@ def cmd_events(args):
         arguments["peek"] = True
     if args.include:
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
+    if getattr(args, "correlation_id", None):
+        arguments["correlation_id"] = args.correlation_id
 
     result = call_tool(
         "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
@@ -296,8 +307,13 @@ def cmd_events(args):
             return
         for e in events:
             print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
+            if e.get("title"):
+                print(f"    title: {e['title']}")
             print(f"    {e['payload']}")
-            print(f"    from: {e['session_id']} at {e['timestamp']}")
+            from_line = f"    from: {e['session_id']} at {e['timestamp']}"
+            if e.get("correlation_id"):
+                from_line += f" corr:{e['correlation_id']}"
+            print(from_line)
             print()
 
 
@@ -428,6 +444,14 @@ def main():
     p_publish.add_argument(
         "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
     )
+    p_publish.add_argument("--title", help="Optional short headline for the payload")
+    p_publish.add_argument("--tags", help="Comma-separated tags for downstream filtering")
+    p_publish.add_argument("--correlation-id", help="Thread ID linking a request to its response")
+    p_publish.add_argument(
+        "--signal-level",
+        choices=["lifecycle", "info", "actionable"],
+        help="Signal level override (default: derived from event type)",
+    )
     p_publish.set_defaults(func=cmd_publish)
 
     # events
@@ -477,6 +501,7 @@ def main():
         "--include",
         help="Comma-separated event types to include (e.g., task_completed,ci_completed)",
     )
+    p_events.add_argument("--correlation-id", help="Filter to one correlation thread")
     p_events.set_defaults(func=cmd_events)
 
     # notify

@@ -79,6 +79,10 @@ MAX_PAYLOAD_PREVIEW = 50  # Max chars to show in notification previews
 WEBHOOK_TIMEOUT = 5.0  # Seconds to wait for webhook response
 WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
 
+# Known signal levels (RFC #121 / #129). Validation is soft: unknown values
+# are stored as-is with a warning, never rejected.
+VALID_SIGNAL_LEVELS = ("lifecycle", "info", "actionable")
+
 # Initialize MCP server
 mcp = FastMCP("agent-event-bus")
 
@@ -374,6 +378,10 @@ def _publish_event_impl(
     payload: str,
     session_id: str | None = None,
     channel: str = "all",
+    title: str | None = None,
+    tags: list[str] | None = None,
+    correlation_id: str | None = None,
+    signal_level: str | None = None,
 ) -> dict:
     """Sync implementation of publish_event (runs in a worker thread)."""
     # Auto-refresh heartbeat when session publishes
@@ -389,14 +397,28 @@ def _publish_event_impl(
                     f"Expected '{channel_type}:<value>'"
                 )
 
+    # Soft validation (RFC #121): warn on unknown signal levels, never reject
+    if signal_level and signal_level not in VALID_SIGNAL_LEVELS:
+        logger.warning(
+            f"Unknown signal_level '{signal_level}' (expected one of "
+            f"{', '.join(VALID_SIGNAL_LEVELS)}). Storing as-is."
+        )
+
     # Auto-notify on direct messages (DMs)
     _notify_dm_recipient(channel, payload, session_id)
 
+    meta = {
+        k: v
+        for k, v in {"title": title, "tags": tags, "signal_level": signal_level}.items()
+        if v is not None
+    }
     event = storage.add_event(
         event_type=event_type,
         payload=payload,
         session_id=session_id or "anonymous",
         channel=channel,
+        correlation_id=correlation_id,
+        meta=meta or None,
     )
 
     # Dispatch to matching webhooks (async, non-blocking)
@@ -407,12 +429,15 @@ def _publish_event_impl(
     )
     _dev_notify("publish_event", f"{event_type} [{channel}] {truncated}")
 
-    return {
+    result = {
         "event_id": event.id,
         "event_type": event_type,
         "payload": payload,
         "channel": channel,
     }
+    if correlation_id:
+        result["correlation_id"] = correlation_id
+    return result
 
 
 @mcp.tool()
@@ -421,6 +446,10 @@ async def publish_event(
     payload: str,
     session_id: str | None = None,
     channel: str = "all",
+    title: str | None = None,
+    tags: list[str] | None = None,
+    correlation_id: str | None = None,
+    signal_level: str | None = None,
 ) -> dict:
     """Publish an event. Auto-refreshes heartbeat. Returns event_id.
 
@@ -429,6 +458,10 @@ async def publish_event(
         payload: Event message
         session_id: Your session ID
         channel: "all", "session:{id}", "repo:{name}", or "machine:{name}"
+        title: Optional short headline for the payload
+        tags: Optional list of tags for downstream filtering
+        correlation_id: Optional thread ID linking a request to its response
+        signal_level: Optional "lifecycle", "info", or "actionable"
     """
     return await _run_sync(
         _publish_event_impl,
@@ -436,6 +469,10 @@ async def publish_event(
         payload=payload,
         session_id=session_id,
         channel=channel,
+        title=title,
+        tags=tags,
+        correlation_id=correlation_id,
+        signal_level=signal_level,
     )
 
 
@@ -450,6 +487,25 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     return None
 
 
+def _event_to_dict(e: Event) -> dict:
+    """Convert an Event to its wire representation."""
+    d = {
+        "id": e.id,
+        "event_type": e.event_type,
+        "payload": e.payload,
+        "session_id": e.session_id,
+        "timestamp": e.timestamp.isoformat(),
+        "channel": e.channel,
+        "correlation_id": e.correlation_id,
+    }
+    if e.meta:
+        if "title" in e.meta:
+            d["title"] = e.meta["title"]
+        if "tags" in e.meta:
+            d["tags"] = e.meta["tags"]
+    return d
+
+
 def _get_events_impl(
     cursor: str | None = None,
     limit: int = 50,
@@ -459,6 +515,7 @@ def _get_events_impl(
     resume: bool = False,
     event_types: list[str] | None = None,
     peek: bool = False,
+    correlation_id: str | None = None,
 ) -> dict:
     """Sync implementation of get_events (runs in a worker thread)."""
     # Auto-refresh heartbeat when session polls
@@ -505,7 +562,12 @@ def _get_events_impl(
         channels = _get_implicit_channels(session_id)
 
     raw_events, next_cursor = storage.get_events(
-        cursor=cursor, limit=limit, channels=channels, order=order, event_types=event_types
+        cursor=cursor,
+        limit=limit,
+        channels=channels,
+        order=order,
+        event_types=event_types,
+        correlation_id=correlation_id,
     )
 
     # Persist high-water mark for session-based tracking (enables seamless resume)
@@ -523,17 +585,7 @@ def _get_events_impl(
         high_water_mark = str(max(e.id for e in raw_events))
         storage.update_session_cursor(session_id, high_water_mark)
 
-    events = [
-        {
-            "id": e.id,
-            "event_type": e.event_type,
-            "payload": e.payload,
-            "session_id": e.session_id,
-            "timestamp": e.timestamp.isoformat(),
-            "channel": e.channel,
-        }
-        for e in raw_events
-    ]
+    events = [_event_to_dict(e) for e in raw_events]
 
     _dev_notify("get_events", f"{len(events)} events (cursor={cursor})")
 
@@ -553,6 +605,7 @@ async def get_events(
     resume: bool = False,
     event_types: list[str] | None = None,
     peek: bool = False,
+    correlation_id: str | None = None,
 ) -> dict:
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
@@ -565,6 +618,7 @@ async def get_events(
         resume: Use saved cursor (requires session_id)
         event_types: Filter by types, e.g., ["task_completed"]
         peek: Read without advancing the session cursor (non-consuming)
+        correlation_id: Filter to one correlation thread
     """
     return await _run_sync(
         _get_events_impl,
@@ -576,6 +630,7 @@ async def get_events(
         resume=resume,
         event_types=event_types,
         peek=peek,
+        correlation_id=correlation_id,
     )
 
 
@@ -687,7 +742,12 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
         "session_id": event.session_id,
         "timestamp": event.timestamp.isoformat(),
         "channel": event.channel,
+        "correlation_id": event.correlation_id,
     }
+    if event.meta:
+        for key in ("title", "tags", "signal_level"):
+            if key in event.meta:
+                payload[key] = event.meta[key]
     payload_bytes = json.dumps(payload).encode()
 
     headers = {"Content-Type": "application/json"}
