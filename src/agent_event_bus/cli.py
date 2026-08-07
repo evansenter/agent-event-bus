@@ -54,6 +54,13 @@ Examples:
     agent-event-bus-cli events --include task_completed,ci_completed
     agent-event-bus-cli events --include gotcha_discovered,pattern_found --exclude session_registered
 
+    # Drop lifecycle noise server-side (lifecycle < info < actionable)
+    agent-event-bus-cli events --min-level info
+
+    # Thread a request to its responses with a correlation id
+    agent-event-bus-cli publish --type task_request --payload "Review PR #42?" --correlation-id review-42
+    agent-event-bus-cli events --correlation-id review-42 --order asc
+
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
 """

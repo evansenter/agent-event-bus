@@ -87,9 +87,11 @@ src/agent_event_bus/
 
 ## MCP Tools
 
-`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`
+`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`, `register_webhook`, `list_webhooks`, `unregister_webhook`
 
 **Usage guide**: `agent-event-bus://guide` resource. Keep it updated when changing APIs.
+
+**Concurrency invariant**: FastMCP runs tool functions on the server's event loop, so every tool is an async wrapper that offloads its sync `*_impl` body via `_run_sync` (worker thread). Never put blocking work (SQLite, subprocess) directly in a tool function - it freezes the whole server (#112). `GET /health` bypasses MCP for liveness checks.
 
 ### Tool Docstrings
 
@@ -143,8 +145,11 @@ CLI and MCP expose the same functionality:
 - **Session cleanup**: 24-hour timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` refresh heartbeat
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
+- **High-water cursors**: `next_cursor` is the batch MAX id in both orders; feeding it back never re-serves events
 - **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-trex")
 - **Client deduplication**: `(machine, client_id)` enables session resumption
+- **Structured payload (RFC #121)**: `payload` stays free-form; optional `title`/`tags`/`correlation_id`/`signal_level` ride alongside (soft validation - warn, never reject)
+- **Signal levels (#129)**: lifecycle < info < actionable, derived server-side from event_type (DMs always actionable; explicit `signal_level` wins); filter with `min_level`
 
 ## Operations
 
