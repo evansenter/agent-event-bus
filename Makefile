@@ -24,20 +24,20 @@ clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# Create/sync virtual environment (requires uv)
+# Create/sync virtual environment without dev tools (requires uv)
 venv:
-	uv sync
+	uv sync --no-dev
 
 # Install with dev dependencies (for development)
 dev:
-	uv sync --extra dev
+	uv sync
 
 # Server installation: runs the event bus service locally (idempotent)
 # Use this on the machine that will host the event bus
 # Re-run to pick up code changes (restarts service automatically)
 install-server:
 	@echo "Installing server..."
-	uv sync
+	uv sync --no-dev
 	@echo ""
 	@if [ "$$(uname)" = "Darwin" ]; then \
 		echo "Installing LaunchAgent (macOS)..."; \
@@ -75,7 +75,7 @@ install-client:
 		exit 1; \
 	fi
 	@echo "Installing client (connecting to $(REMOTE_URL))..."
-	uv sync
+	uv sync --no-dev
 	@echo ""
 	@echo "Installing CLI..."
 	./scripts/install-cli.sh

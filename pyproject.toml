@@ -29,7 +29,10 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
-[project.optional-dependencies]
+# PEP 735 dependency group: uv syncs this by default, so a bare `uv run
+# pytest` on a fresh clone gets the project + dev tools instead of falling
+# through to a globally installed pytest that can't import the package.
+[dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
