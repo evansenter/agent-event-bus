@@ -240,8 +240,11 @@ def cmd_publish(args):
 
 def cmd_events(args):
     """Get recent events."""
-    # Validate --resume requires --session-id
-    if args.resume and not args.session_id:
+    # Use explicit --session-id, fall back to env var (matches cmd_publish)
+    session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
+
+    # Validate --resume requires a session id (flag or env var)
+    if args.resume and not session_id:
         print("Error: --resume requires --session-id", file=sys.stderr)
         sys.exit(1)
 
@@ -251,8 +254,8 @@ def cmd_events(args):
         arguments["cursor"] = cursor
     if args.limit is not None:
         arguments["limit"] = args.limit
-    if args.session_id:
-        arguments["session_id"] = args.session_id
+    if session_id:
+        arguments["session_id"] = session_id
     if args.channel:
         arguments["channel"] = args.channel
     if args.resume:
@@ -430,7 +433,10 @@ def main():
     # events
     p_events = subparsers.add_parser("events", help="Get recent events")
     p_events.add_argument("--cursor", help="Cursor from previous call (for pagination)")
-    p_events.add_argument("--session-id", help="Your session ID (for cursor tracking)")
+    p_events.add_argument(
+        "--session-id",
+        help="Your session ID for cursor tracking (default: $AGENT_EVENT_BUS_SESSION_ID)",
+    )
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
         "--exclude",

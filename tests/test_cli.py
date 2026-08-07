@@ -975,3 +975,56 @@ class TestCmdEventsPeek:
 
                 args = mock_cmd.call_args[0][0]
                 assert args.peek is True
+
+
+class TestCmdEventsEnvAttribution:
+    """events falls back to $AGENT_EVENT_BUS_SESSION_ID like publish (#128)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_session_id_from_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args())
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["session_id"] == "env-session-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_explicit_session_id_overrides_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args(session_id="explicit-id"))
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["session_id"] == "explicit-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_no_env_no_flag_omits_session_id(self, mock_call, monkeypatch):
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args())
+
+        call_args = mock_call.call_args[0][1]
+        assert "session_id" not in call_args
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_resume_satisfied_by_env_session_id(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args(resume=True))
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["resume"] is True
+        assert call_args["session_id"] == "env-session-id"
+
+    def test_resume_still_errors_without_any_session_id(self, monkeypatch, capsys):
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+
+        with pytest.raises(SystemExit):
+            cli.cmd_events(make_events_args(resume=True))
+
+        assert "requires --session-id" in capsys.readouterr().err
