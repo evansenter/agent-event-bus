@@ -720,14 +720,13 @@ class SQLiteStorage:
 
             events = [self._row_to_event(row) for row in rows]
 
-            # Compute next_cursor from the events based on order
-            # For DESC: next_cursor is the MIN id (oldest in this batch)
-            # For ASC: next_cursor is the MAX id (newest in this batch)
+            # next_cursor is the high-water mark (MAX id) regardless of order.
+            # The query filters `id > cursor`, so feeding next_cursor back
+            # only ever returns events newer than this batch. (Returning MIN
+            # for desc - the old behavior - re-served the same newest events
+            # on every subsequent call.)
             if events:
-                if order == "desc":
-                    next_cursor = str(min(e.id for e in events))
-                else:
-                    next_cursor = str(max(e.id for e in events))
+                next_cursor = str(max(e.id for e in events))
             else:
                 next_cursor = cursor  # No new events, keep same cursor
 

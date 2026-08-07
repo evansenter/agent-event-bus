@@ -875,3 +875,43 @@ class TestDbLocationMigration:
         row = cursor.fetchone()
         conn.close()
         assert row is None, "New DB should not have old_marker table (wasn't overwritten)"
+
+
+class TestNextCursorHighWater:
+    """next_cursor must never re-serve events, regardless of order."""
+
+    def _add_events(self, storage, n):
+        return [
+            storage.add_event(event_type=f"event_{i}", payload=f"payload {i}", session_id="s1").id
+            for i in range(n)
+        ]
+
+    def test_desc_next_cursor_is_high_water(self, storage):
+        ids = self._add_events(storage, 5)
+
+        events, next_cursor = storage.get_events(order="desc")
+        assert next_cursor == str(max(ids))
+
+    def test_desc_polling_with_next_cursor_never_duplicates(self, storage):
+        """The old MIN-for-desc cursor returned the same newest events on
+        every follow-up call; feeding next_cursor back must yield only new
+        events."""
+        self._add_events(storage, 3)
+        _, cursor = storage.get_events(order="desc")
+
+        # No new events: nothing comes back
+        events, cursor2 = storage.get_events(cursor=cursor, order="desc")
+        assert events == []
+        assert cursor2 == cursor
+
+        # A new event: exactly that event comes back
+        new_id = storage.add_event(event_type="fresh", payload="new", session_id="s1").id
+        events, cursor3 = storage.get_events(cursor=cursor, order="desc")
+        assert [e.id for e in events] == [new_id]
+        assert cursor3 == str(new_id)
+
+    def test_asc_next_cursor_unchanged(self, storage):
+        ids = self._add_events(storage, 5)
+
+        events, next_cursor = storage.get_events(order="asc")
+        assert next_cursor == str(max(ids))
