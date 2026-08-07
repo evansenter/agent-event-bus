@@ -11,6 +11,9 @@ Usage:
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
                          [--channel CHANNEL] [--resume] [--peek]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
+    agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
+    agent-event-bus-cli webhook list [--all]
+    agent-event-bus-cli webhook unregister WEBHOOK_ID
 
 Examples:
     # Register a session
@@ -314,7 +317,11 @@ def cmd_notify(args):
 
 def cmd_webhook_register(args):
     """Register a webhook."""
-    arguments = {"url": args.url}
+    # args.webhook_url is the endpoint to register; args.url stays the bus URL.
+    # These must not share an argparse dest: the subparser's value would
+    # overwrite the global --url and the MCP call would be POSTed to the
+    # webhook target instead of the bus.
+    arguments = {"url": args.webhook_url}
     if args.channel:
         arguments["channel"] = args.channel
     if args.event_types:
@@ -322,7 +329,7 @@ def cmd_webhook_register(args):
     if args.secret:
         arguments["secret"] = args.secret
 
-    result = call_tool("register_webhook", arguments, url=args.bus_url, debug=args.debug)
+    result = call_tool("register_webhook", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
     if "webhook_id" in result:
         print(f"\nWebhook registered: #{result['webhook_id']}", file=sys.stderr)
@@ -331,7 +338,7 @@ def cmd_webhook_register(args):
 def cmd_webhook_list(args):
     """List registered webhooks."""
     arguments = {"active_only": not args.all}
-    result = call_tool("list_webhooks", arguments, url=args.bus_url, debug=args.debug)
+    result = call_tool("list_webhooks", arguments, url=args.url, debug=args.debug)
 
     if not result:
         print("No webhooks registered")
@@ -356,7 +363,7 @@ def cmd_webhook_unregister(args):
     result = call_tool(
         "unregister_webhook",
         {"webhook_id": args.webhook_id},
-        url=args.bus_url,
+        url=args.url,
         debug=args.debug,
     )
     if result.get("success"):
@@ -479,23 +486,27 @@ def main():
 
     # webhook register
     p_wh_register = webhook_subparsers.add_parser("register", help="Register a webhook")
-    p_wh_register.add_argument("--url", required=True, help="Webhook URL to POST events to")
+    # dest must differ from the global --url (bus address) or argparse
+    # overwrites it with the webhook target
+    p_wh_register.add_argument(
+        "--url", dest="webhook_url", required=True, help="Webhook URL to POST events to"
+    )
     p_wh_register.add_argument(
         "--channel", help="Filter to channel (supports prefix, e.g., 'session:')"
     )
     p_wh_register.add_argument("--event-types", help="Comma-separated event types to filter")
     p_wh_register.add_argument("--secret", help="Shared secret for HMAC signing")
-    p_wh_register.set_defaults(func=cmd_webhook_register, bus_url=None)
+    p_wh_register.set_defaults(func=cmd_webhook_register)
 
     # webhook list
     p_wh_list = webhook_subparsers.add_parser("list", help="List webhooks")
     p_wh_list.add_argument("--all", action="store_true", help="Include inactive webhooks")
-    p_wh_list.set_defaults(func=cmd_webhook_list, bus_url=None)
+    p_wh_list.set_defaults(func=cmd_webhook_list)
 
     # webhook unregister
     p_wh_unregister = webhook_subparsers.add_parser("unregister", help="Remove a webhook")
     p_wh_unregister.add_argument("webhook_id", type=int, help="Webhook ID to remove")
-    p_wh_unregister.set_defaults(func=cmd_webhook_unregister, bus_url=None)
+    p_wh_unregister.set_defaults(func=cmd_webhook_unregister)
 
     args = parser.parse_args()
 
@@ -509,8 +520,6 @@ def main():
         if args.webhook_command is None:
             p_webhook.print_help()
             sys.exit(1)
-        # Pass the main URL to webhook subcommands
-        args.bus_url = args.url
 
     args.func(args)
 

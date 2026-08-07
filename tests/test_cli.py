@@ -831,3 +831,147 @@ class TestCmdEventsWithChannel:
 
                 args = mock_cmd.call_args[0][0]
                 assert args.channel == "repo:my-repo"
+
+
+class TestWebhookCommands:
+    """Tests for CLI webhook subcommands.
+
+    Regression coverage: the webhook register subparser's --url (webhook
+    target) used to share an argparse dest with the global --url (bus
+    address), so the MCP registration call was POSTed to the webhook target
+    itself and never reached the bus.
+    """
+
+    def _run_main(self, argv, monkeypatch):
+        """Run cli.main() with argv, capturing call_tool invocations."""
+        import sys as _sys
+
+        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
+        calls = []
+
+        def fake_call_tool(tool_name, arguments, url=None, timeout_ms=None, debug=False):
+            calls.append({"tool": tool_name, "arguments": arguments, "posted_to": url})
+            if tool_name == "list_webhooks":
+                return []
+            return {"webhook_id": 1, "success": True}
+
+        with patch.object(_sys, "argv", ["agent-event-bus-cli", *argv]):
+            with patch.object(cli, "call_tool", fake_call_tool):
+                cli.main()
+        return calls
+
+    def test_register_posts_to_bus_not_webhook_target(self, monkeypatch):
+        calls = self._run_main(
+            ["webhook", "register", "--url", "http://target.example/hook"], monkeypatch
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["tool"] == "register_webhook"
+        # The webhook target goes in the arguments...
+        assert calls[0]["arguments"]["url"] == "http://target.example/hook"
+        # ...and the MCP call itself goes to the bus, not the target
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_register_respects_global_bus_url(self, monkeypatch):
+        calls = self._run_main(
+            [
+                "--url",
+                "http://bus.example:9999/mcp",
+                "webhook",
+                "register",
+                "--url",
+                "http://target.example/hook",
+            ],
+            monkeypatch,
+        )
+
+        assert calls[0]["posted_to"] == "http://bus.example:9999/mcp"
+        assert calls[0]["arguments"]["url"] == "http://target.example/hook"
+
+    def test_register_passes_filters_and_secret(self, monkeypatch):
+        calls = self._run_main(
+            [
+                "webhook",
+                "register",
+                "--url",
+                "http://target.example/hook",
+                "--channel",
+                "repo:",
+                "--event-types",
+                "task_completed, ci_completed",
+                "--secret",
+                "shh",
+            ],
+            monkeypatch,
+        )
+
+        args = calls[0]["arguments"]
+        assert args["channel"] == "repo:"
+        assert args["event_types"] == ["task_completed", "ci_completed"]
+        assert args["secret"] == "shh"
+
+    def test_list_posts_to_bus(self, monkeypatch):
+        calls = self._run_main(["webhook", "list"], monkeypatch)
+
+        assert calls[0]["tool"] == "list_webhooks"
+        assert calls[0]["arguments"] == {"active_only": True}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_list_all_includes_inactive(self, monkeypatch):
+        calls = self._run_main(["webhook", "list", "--all"], monkeypatch)
+
+        assert calls[0]["arguments"] == {"active_only": False}
+
+    def test_unregister_posts_to_bus(self, monkeypatch):
+        calls = self._run_main(["webhook", "unregister", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "unregister_webhook"
+        assert calls[0]["arguments"] == {"webhook_id": 7}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+
+class TestCmdEventsPeek:
+    """CLI-level tests for events --peek (issue #131)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_peek_passes_through(self, mock_call):
+        mock_call.return_value = {"events": [], "next_cursor": None}
+        args = make_events_args(session_id="abc", resume=True, peek=True)
+
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["peek"] is True
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_peek_false_omitted(self, mock_call):
+        mock_call.return_value = {"events": [], "next_cursor": None}
+        args = make_events_args(peek=False)
+
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert "peek" not in call_args
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_peek_attr_absent_defaults_off(self, mock_call):
+        """Namespaces built without a peek attribute (older callers) must not
+        crash and must not send peek - the getattr default path."""
+        mock_call.return_value = {"events": [], "next_cursor": None}
+        args = make_events_args()  # make_events_args does not define peek
+
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert "peek" not in call_args
+
+    def test_peek_flag_parses(self):
+        """--peek wires through argument parsing to cmd_events."""
+        import sys as _sys
+
+        with patch.object(_sys, "argv", ["cli", "events", "--peek"]):
+            with patch("agent_event_bus.cli.cmd_events") as mock_cmd:
+                cli.main()
+
+                args = mock_cmd.call_args[0][0]
+                assert args.peek is True
