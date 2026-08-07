@@ -297,9 +297,10 @@ def cmd_events(args):
             print(f"Error: {result['error']}", file=sys.stderr)
         sys.exit(1)
 
-    # Result is now a dict with "events" and "next_cursor"
+    # Result is now a dict with "events", "next_cursor", and "has_more"
     events = result.get("events", [])
     next_cursor = result.get("next_cursor")
+    has_more = result.get("has_more", False)
 
     # Apply --exclude filter (client-side for flexibility)
     if args.exclude:
@@ -308,7 +309,7 @@ def cmd_events(args):
 
     # Output format
     if args.json:
-        output = {"events": events, "next_cursor": next_cursor}
+        output = {"events": events, "next_cursor": next_cursor, "has_more": has_more}
         print(json.dumps(output))
     else:
         if not events:

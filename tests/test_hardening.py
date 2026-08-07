@@ -170,3 +170,23 @@ class TestHealthEndpoint:
             body = resp.json()
             assert body["status"] == "ok"
             assert body["service"] == "agent-event-bus"
+
+
+class TestDispatchStorageOffLoop:
+    def test_webhook_lookup_runs_off_the_loop_thread(self, monkeypatch):
+        """_dispatch_webhooks runs on the server loop; its SQLite lookup must
+        be offloaded to a worker thread per the #112 invariant."""
+        seen = {}
+
+        def fake_matching(event):
+            seen["thread"] = threading.current_thread()
+            return []
+
+        monkeypatch.setattr(server.storage, "get_matching_webhooks", fake_matching)
+        event = Event(id=1, event_type="t", payload="p", session_id="s", timestamp=datetime.now())
+
+        asyncio.run(server._dispatch_webhooks(event))
+
+        # asyncio.run drove the loop on this thread; the lookup must not have
+        # run there
+        assert seen["thread"] is not threading.current_thread()

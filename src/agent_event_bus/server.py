@@ -579,6 +579,7 @@ def _get_events_impl(
             return {
                 "events": [],
                 "next_cursor": tip,
+                "has_more": False,
             }
         else:
             # Session doesn't exist
@@ -598,7 +599,7 @@ def _get_events_impl(
     else:
         channels = _get_implicit_channels(session_id)
 
-    raw_events, next_cursor = storage.get_events(
+    raw_events, next_cursor, has_more = storage.get_events(
         cursor=cursor,
         limit=limit,
         channels=channels,
@@ -639,6 +640,7 @@ def _get_events_impl(
     return {
         "events": events,
         "next_cursor": next_cursor,
+        "has_more": has_more,
     }
 
 
@@ -768,7 +770,10 @@ def _get_webhook_client() -> httpx.AsyncClient:
     The client's connection pool is bound to the loop it was created on;
     reusing it from a different loop hangs or errors. When the loop changes
     (e.g. dispatch fell back to a fresh thread's loop), a new client is
-    created and the stale one is left for GC.
+    created; the stale one can't be aclosed from here (its loop is usually
+    already dead) and is left for GC. That churn is bounded: production
+    dispatch stays on the server loop, and the thread fallback closes its
+    own client before its loop exits.
     """
     global _webhook_client, _webhook_client_loop
     loop = asyncio.get_running_loop()
@@ -793,9 +798,11 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
         "timestamp": event.timestamp.isoformat(),
         "channel": event.channel,
         "correlation_id": event.correlation_id,
+        # Derived level, matching what get_events reports for the same event
+        "signal_level": _get_signal_level(event),
     }
     if event.meta:
-        for key in ("title", "tags", "signal_level"):
+        for key in ("title", "tags"):
             if key in event.meta:
                 payload[key] = event.meta[key]
     payload_bytes = json.dumps(payload).encode()
@@ -840,7 +847,9 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
 
 async def _dispatch_webhooks(event: Event) -> None:
     """Dispatch event to all matching webhooks (async, fire-and-forget)."""
-    webhooks = storage.get_matching_webhooks(event)
+    # This coroutine runs on the server loop; the webhook lookup hits SQLite,
+    # so it must go to a worker thread like every other blocking call (#112)
+    webhooks = await anyio.to_thread.run_sync(storage.get_matching_webhooks, event)
     if not webhooks:
         return
 
@@ -882,8 +891,26 @@ def _handle_dispatch_task_exception(task: asyncio.Task, event_id: int) -> None:
 
 def _run_dispatch_in_thread(event: Event) -> None:
     """Run webhook dispatch in a new thread with its own event loop."""
+
+    async def dispatch_and_close() -> None:
+        global _webhook_client
+        try:
+            await _dispatch_webhooks(event)
+        finally:
+            # This throwaway loop is about to die; close the client it
+            # created so pooled sockets don't linger until GC. Only touch
+            # the global if it still belongs to this loop.
+            client = _webhook_client
+            if (
+                client is not None
+                and not client.is_closed
+                and _webhook_client_loop is asyncio.get_running_loop()
+            ):
+                _webhook_client = None
+                await client.aclose()
+
     try:
-        asyncio.run(_dispatch_webhooks(event))
+        asyncio.run(dispatch_and_close())
     except Exception as e:
         logger.error(f"Webhook dispatch failed for event {event.id}: {e}")
 

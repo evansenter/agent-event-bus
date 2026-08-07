@@ -124,11 +124,17 @@ session cursor - they count as seen.
 ### Manual Cursor (if needed)
 ```
 get_events(cursor="42", order="asc")
-→ {events: [...], next_cursor: "55"}
+→ {events: [...], next_cursor: "55", has_more: false}
 ```
 Pass `next_cursor` to subsequent calls. But `resume=True` is simpler.
 `next_cursor` is always the newest event ID in the batch (regardless of
 `order`), so feeding it back never returns the same event twice.
+
+`has_more: true` means the batch filled `limit` and the window may hold
+more. With `order="asc"`, keep feeding `next_cursor` back to drain the
+backlog. With `order="desc"` the page is the *newest* slice, so older
+backlog events are skipped by the next cursor call — use `order="asc"`
+when you must not miss events.
 
 ### Peeking (non-consuming reads)
 `peek=True` reads pending events **without advancing the session cursor**, so the

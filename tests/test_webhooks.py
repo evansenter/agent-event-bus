@@ -541,3 +541,82 @@ class TestWebhookIntegration:
 
             # Should return False, not raise
             assert result is False
+
+
+class TestWebhookStructuredPayload:
+    """Webhook payloads must carry the structured fields and the same derived
+    signal_level that get_events reports for the event."""
+
+    def _make_client(self):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=AsyncMock(status_code=200))
+        return mock_client
+
+    def _make_webhook(self):
+        return Webhook(
+            id=1,
+            url="https://example.com/hook",
+            channel_filter=None,
+            event_types=None,
+            created_at=datetime.now(),
+            active=True,
+            secret=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_carries_structured_fields(self):
+        import json
+
+        from agent_event_bus.server import _dispatch_webhook
+
+        event = Event(
+            id=7,
+            event_type="task_request",
+            payload="review?",
+            session_id="s",
+            timestamp=datetime.now(),
+            channel="all",
+            correlation_id="t-1",
+            meta={"title": "T", "tags": ["a"], "signal_level": "shouting"},
+        )
+
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
+            mock_client = self._make_client()
+            mock_get_client.return_value = mock_client
+
+            assert await _dispatch_webhook(self._make_webhook(), event) is True
+
+            body = json.loads(mock_client.post.call_args.kwargs["content"])
+            assert body["correlation_id"] == "t-1"
+            assert body["title"] == "T"
+            assert body["tags"] == ["a"]
+            # Derived level, matching get_events: the unknown explicit level
+            # "shouting" is normalized instead of forwarded verbatim
+            assert body["signal_level"] == "info"
+
+    @pytest.mark.asyncio
+    async def test_payload_signal_level_derived_without_explicit_level(self):
+        import json
+
+        from agent_event_bus.server import _dispatch_webhook
+
+        event = Event(
+            id=8,
+            event_type="help_needed",
+            payload="p",
+            session_id="s",
+            timestamp=datetime.now(),
+            channel="all",
+        )
+
+        with patch("agent_event_bus.server._get_webhook_client") as mock_get_client:
+            mock_client = self._make_client()
+            mock_get_client.return_value = mock_client
+
+            assert await _dispatch_webhook(self._make_webhook(), event) is True
+
+            body = json.loads(mock_client.post.call_args.kwargs["content"])
+            assert body["signal_level"] == "actionable"
+            assert body["correlation_id"] is None
+            assert "title" not in body
+            assert "tags" not in body

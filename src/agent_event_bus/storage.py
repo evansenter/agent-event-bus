@@ -290,13 +290,15 @@ class SQLiteStorage:
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         )
         conn.row_factory = sqlite3.Row
-        # WAL lets concurrent readers proceed while a writer holds the lock,
-        # which is the norm when several agents poll and publish at once
-        # (issue #112). journal_mode is persistent per-database but cheap to
-        # re-assert; busy_timeout is per-connection and must be set each time.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         try:
+            # WAL lets concurrent readers proceed while a writer holds the
+            # lock, which is the norm when several agents poll and publish at
+            # once (issue #112). journal_mode is persistent per-database but
+            # cheap to re-assert; busy_timeout is per-connection and must be
+            # set each time. Inside the try so a PRAGMA failure (e.g. WAL on
+            # a network filesystem) still closes the connection.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             yield conn
             conn.commit()
         finally:
@@ -647,7 +649,7 @@ class SQLiteStorage:
         order: Literal["asc", "desc"] = "desc",
         event_types: list[str] | None = None,
         correlation_id: str | None = None,
-    ) -> tuple[list[Event], str | None]:
+    ) -> tuple[list[Event], str | None, bool]:
         """Get events with cursor-based pagination.
 
         Args:
@@ -659,8 +661,13 @@ class SQLiteStorage:
             correlation_id: Optional correlation thread to filter by (None = all).
 
         Returns:
-            Tuple of (events, next_cursor). Use next_cursor for subsequent calls.
-            next_cursor is the cursor value if there are events, None otherwise.
+            Tuple of (events, next_cursor, has_more). next_cursor is the batch
+            high-water mark (MAX id) in both orders. has_more=True means the
+            window matched at least `limit` events. With order="asc", keep
+            feeding next_cursor back to drain the backlog. With order="desc"
+            the batch is the NEWEST slice of the window, so older backlog
+            events are NOT reachable via next_cursor - drain with "asc" if you
+            must not miss events.
         """
         with self._connect() as conn:
             effective_order = "DESC" if order == "desc" else "ASC"
@@ -730,7 +737,11 @@ class SQLiteStorage:
             else:
                 next_cursor = cursor  # No new events, keep same cursor
 
-            return events, next_cursor
+            # A full page means the window may hold more than `limit` events
+            # (exactly-limit gives a false positive; one extra empty poll).
+            has_more = len(events) == limit
+
+            return events, next_cursor, has_more
 
     def get_cursor(self) -> str | None:
         """Get a cursor pointing to the most recent event.

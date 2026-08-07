@@ -104,6 +104,8 @@ def make_events_args(**overrides):
     """
     from argparse import Namespace
 
+    # Keep in sync with the events subparser in cli.main() - this Namespace
+    # stands in for real argparse output.
     defaults = dict(
         cursor=None,
         session_id=None,
@@ -117,6 +119,9 @@ def make_events_args(**overrides):
         resume=False,
         debug=False,
         include=None,
+        peek=False,
+        correlation_id=None,
+        min_level=None,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

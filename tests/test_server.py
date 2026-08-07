@@ -566,7 +566,7 @@ class TestUnregisterSession:
         unregister_session(session_id)
 
         # Check for unregister event
-        events, _ = server.storage.get_events(cursor=cursor, order="asc")
+        events, _, _ = server.storage.get_events(cursor=cursor, order="asc")
         event_types = [e.event_type for e in events]
         assert "session_unregistered" in event_types
 
@@ -1398,3 +1398,27 @@ class TestLogFileEnvVar:
         env["AGENT_EVENT_BUS_TESTING"] = "1"
         expected = os.path.expanduser("~/.claude/contrib/agent-event-bus/agent-event-bus.log")
         assert self._resolved_log_file(env) == expected
+
+
+class TestGetEventsHasMore:
+    """has_more passthrough on the get_events response."""
+
+    def test_false_when_batch_fits(self):
+        start = server.storage.get_cursor()
+        publish_event(event_type="note", payload="only one")
+
+        result = get_events(cursor=start, order="asc")
+        assert result["has_more"] is False
+
+    def test_true_then_drains_with_asc(self):
+        start = server.storage.get_cursor()
+        for i in range(5):
+            publish_event(event_type="note", payload=str(i))
+
+        result = get_events(cursor=start, order="asc", limit=3)
+        assert result["has_more"] is True
+        assert [e["payload"] for e in result["events"]] == ["0", "1", "2"]
+
+        result2 = get_events(cursor=result["next_cursor"], order="asc", limit=3)
+        assert [e["payload"] for e in result2["events"]] == ["3", "4"]
+        assert result2["has_more"] is False

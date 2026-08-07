@@ -24,7 +24,7 @@ class TestStorageStructuredFields:
         )
         assert created.correlation_id == "thread-42"
 
-        events, _ = storage.get_events(order="asc")
+        events, _, _ = storage.get_events(order="asc")
         assert len(events) == 1
         assert events[0].correlation_id == "thread-42"
         assert events[0].meta == {"title": "Review request", "tags": ["review", "urgent"]}
@@ -32,7 +32,7 @@ class TestStorageStructuredFields:
     def test_plain_events_have_no_meta(self, storage):
         storage.add_event(event_type="note", payload="hi", session_id="s1")
 
-        events, _ = storage.get_events(order="asc")
+        events, _, _ = storage.get_events(order="asc")
         assert events[0].correlation_id is None
         assert events[0].meta is None
 
@@ -40,7 +40,7 @@ class TestStorageStructuredFields:
         created = storage.add_event(event_type="note", payload="hi", session_id="s1", meta={})
         assert created.meta is None
 
-        events, _ = storage.get_events(order="asc")
+        events, _, _ = storage.get_events(order="asc")
         assert events[0].meta is None
 
     def test_filter_by_correlation_id(self, storage):
@@ -55,7 +55,7 @@ class TestStorageStructuredFields:
             event_type="task_request", payload="d", session_id="s1", correlation_id="t-2"
         )
 
-        events, _ = storage.get_events(order="asc", correlation_id="t-1")
+        events, _, _ = storage.get_events(order="asc", correlation_id="t-1")
         assert [e.payload for e in events] == ["a", "c"]
 
     def test_correlation_filter_composes_with_type_filter(self, storage):
@@ -66,7 +66,7 @@ class TestStorageStructuredFields:
             event_type="task_response", payload="b", session_id="s2", correlation_id="t-1"
         )
 
-        events, _ = storage.get_events(
+        events, _, _ = storage.get_events(
             order="asc", correlation_id="t-1", event_types=["task_response"]
         )
         assert [e.payload for e in events] == ["b"]
@@ -76,7 +76,7 @@ class TestStorageStructuredFields:
         with storage._connect() as conn:
             conn.execute("UPDATE events SET payload_meta = 'not-json{'")
 
-        events, _ = storage.get_events(order="asc")
+        events, _, _ = storage.get_events(order="asc")
         assert events[0].meta is None
 
 
@@ -124,7 +124,7 @@ class TestMigrationV4:
         storage = SQLiteStorage(db_path=temp_db)
 
         # Old events survive and read back with None structured fields
-        events, _ = storage.get_events(order="asc")
+        events, _, _ = storage.get_events(order="asc")
         assert len(events) == 1
         assert events[0].payload == "old event"
         assert events[0].correlation_id is None
@@ -195,7 +195,7 @@ class TestServerStructuredPublish:
 
         assert any("Unknown signal_level" in r.message for r in caplog.records)
         # Stored as-is (soft validation)
-        raw_events, _ = server.storage.get_events(order="desc", limit=5)
+        raw_events, _, _ = server.storage.get_events(order="desc", limit=5)
         event = next(e for e in raw_events if e.id == published["event_id"])
         assert event.meta == {"signal_level": "shouting"}
 
