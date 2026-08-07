@@ -13,6 +13,7 @@ Provides tools for cross-session Claude Code communication:
 """
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -25,8 +26,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+import anyio.to_thread
 import httpx
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from agent_event_bus.helpers import (
     _dev_notify,
@@ -80,6 +84,23 @@ mcp = FastMCP("agent-event-bus")
 
 # SQLite-backed storage (persists across restarts)
 storage = SQLiteStorage()
+
+# The server's event loop, captured on the first tool call. Lets code running
+# in worker threads (webhook dispatch) schedule coroutines on the real loop.
+_server_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _run_sync(func, /, **kwargs):
+    """Run a sync tool implementation in a worker thread.
+
+    FastMCP executes tool functions directly on the event loop, so a blocking
+    call (SQLite under contention, a hung notification subprocess) freezes the
+    whole server (issue #112). Offloading to anyio's thread pool keeps the loop
+    free to accept and answer other requests.
+    """
+    global _server_loop
+    _server_loop = asyncio.get_running_loop()
+    return await anyio.to_thread.run_sync(functools.partial(func, **kwargs))
 
 
 @mcp.resource("agent-event-bus://guide", description="Usage guide and best practices")
@@ -185,21 +206,13 @@ def _notify_dm_recipient(
         logger.warning(f"Failed to notify session {target_id} of DM: {e}")
 
 
-@mcp.tool()
-def register_session(
+def _register_session_impl(
     name: str,
     machine: str | None = None,
     cwd: str | None = None,
     client_id: str | None = None,
 ) -> dict:
-    """Register with the event bus. Returns session_id and cursor for polling.
-
-    Args:
-        name: Session name (e.g., branch name, task)
-        machine: Defaults to hostname
-        cwd: Defaults to $PWD
-        client_id: Enables session resumption via (machine, client_id)
-    """
+    """Sync implementation of register_session (runs in a worker thread)."""
     storage.cleanup_stale_sessions()
 
     now = datetime.now()
@@ -283,8 +296,27 @@ def register_session(
 
 
 @mcp.tool()
-def list_sessions() -> list[dict]:
-    """List active sessions, ordered by most recently active."""
+async def register_session(
+    name: str,
+    machine: str | None = None,
+    cwd: str | None = None,
+    client_id: str | None = None,
+) -> dict:
+    """Register with the event bus. Returns session_id and cursor for polling.
+
+    Args:
+        name: Session name (e.g., branch name, task)
+        machine: Defaults to hostname
+        cwd: Defaults to $PWD
+        client_id: Enables session resumption via (machine, client_id)
+    """
+    return await _run_sync(
+        _register_session_impl, name=name, machine=machine, cwd=cwd, client_id=client_id
+    )
+
+
+def _list_sessions_impl() -> list[dict]:
+    """Sync implementation of list_sessions (runs in a worker thread)."""
     results = []
 
     for s in _get_live_sessions():
@@ -309,8 +341,13 @@ def list_sessions() -> list[dict]:
 
 
 @mcp.tool()
-def list_channels() -> list[dict]:
-    """List channels with subscriber counts."""
+async def list_sessions() -> list[dict]:
+    """List active sessions, ordered by most recently active."""
+    return await _run_sync(_list_sessions_impl)
+
+
+def _list_channels_impl() -> list[dict]:
+    """Sync implementation of list_channels (runs in a worker thread)."""
     channel_subscribers: dict[str, int] = {}
 
     for s in _get_live_sessions():
@@ -327,20 +364,18 @@ def list_channels() -> list[dict]:
 
 
 @mcp.tool()
-def publish_event(
+async def list_channels() -> list[dict]:
+    """List channels with subscriber counts."""
+    return await _run_sync(_list_channels_impl)
+
+
+def _publish_event_impl(
     event_type: str,
     payload: str,
     session_id: str | None = None,
     channel: str = "all",
 ) -> dict:
-    """Publish an event. Auto-refreshes heartbeat. Returns event_id.
-
-    Args:
-        event_type: e.g., 'task_completed', 'help_needed'
-        payload: Event message
-        session_id: Your session ID
-        channel: "all", "session:{id}", "repo:{name}", or "machine:{name}"
-    """
+    """Sync implementation of publish_event (runs in a worker thread)."""
     # Auto-refresh heartbeat when session publishes
     _auto_heartbeat(session_id)
 
@@ -380,6 +415,30 @@ def publish_event(
     }
 
 
+@mcp.tool()
+async def publish_event(
+    event_type: str,
+    payload: str,
+    session_id: str | None = None,
+    channel: str = "all",
+) -> dict:
+    """Publish an event. Auto-refreshes heartbeat. Returns event_id.
+
+    Args:
+        event_type: e.g., 'task_completed', 'help_needed'
+        payload: Event message
+        session_id: Your session ID
+        channel: "all", "session:{id}", "repo:{name}", or "machine:{name}"
+    """
+    return await _run_sync(
+        _publish_event_impl,
+        event_type=event_type,
+        payload=payload,
+        session_id=session_id,
+        channel=channel,
+    )
+
+
 def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     """Get the channels a session is implicitly subscribed to.
 
@@ -391,8 +450,7 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     return None
 
 
-@mcp.tool()
-def get_events(
+def _get_events_impl(
     cursor: str | None = None,
     limit: int = 50,
     session_id: str | None = None,
@@ -402,18 +460,7 @@ def get_events(
     event_types: list[str] | None = None,
     peek: bool = False,
 ) -> dict:
-    """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
-
-    Args:
-        cursor: Position from register_session or previous call
-        limit: Max events (default: 50)
-        session_id: Enables cursor auto-tracking
-        order: "desc" (newest first) or "asc"
-        channel: Filter to specific channel
-        resume: Use saved cursor (requires session_id)
-        event_types: Filter by types, e.g., ["task_completed"]
-        peek: Read without advancing the session cursor (non-consuming)
-    """
+    """Sync implementation of get_events (runs in a worker thread)."""
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
 
@@ -497,13 +544,43 @@ def get_events(
 
 
 @mcp.tool()
-def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
-    """Unregister from event bus. session_id takes precedence if both given.
+async def get_events(
+    cursor: str | None = None,
+    limit: int = 50,
+    session_id: str | None = None,
+    order: Literal["asc", "desc"] = "desc",
+    channel: str | None = None,
+    resume: bool = False,
+    event_types: list[str] | None = None,
+    peek: bool = False,
+) -> dict:
+    """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
     Args:
-        session_id: Your session ID
-        client_id: Alternative - looks up by (machine, client_id)
+        cursor: Position from register_session or previous call
+        limit: Max events (default: 50)
+        session_id: Enables cursor auto-tracking
+        order: "desc" (newest first) or "asc"
+        channel: Filter to specific channel
+        resume: Use saved cursor (requires session_id)
+        event_types: Filter by types, e.g., ["task_completed"]
+        peek: Read without advancing the session cursor (non-consuming)
     """
+    return await _run_sync(
+        _get_events_impl,
+        cursor=cursor,
+        limit=limit,
+        session_id=session_id,
+        order=order,
+        channel=channel,
+        resume=resume,
+        event_types=event_types,
+        peek=peek,
+    )
+
+
+def _unregister_session_impl(session_id: str | None = None, client_id: str | None = None) -> dict:
+    """Sync implementation of unregister_session (runs in a worker thread)."""
     # Look up session by client_id if provided
     if client_id and not session_id:
         machine = socket.gethostname()
@@ -541,14 +618,18 @@ def unregister_session(session_id: str | None = None, client_id: str | None = No
 
 
 @mcp.tool()
-def notify(title: str, message: str, sound: bool = False) -> dict:
-    """Send a system notification.
+async def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
+    """Unregister from event bus. session_id takes precedence if both given.
 
     Args:
-        title: Short title
-        message: Body text
-        sound: Play sound (default: False)
+        session_id: Your session ID
+        client_id: Alternative - looks up by (machine, client_id)
     """
+    return await _run_sync(_unregister_session_impl, session_id=session_id, client_id=client_id)
+
+
+def _notify_impl(title: str, message: str, sound: bool = False) -> dict:
+    """Sync implementation of notify (runs in a worker thread)."""
     success = send_notification(title, message, sound)
     return {
         "success": success,
@@ -557,17 +638,38 @@ def notify(title: str, message: str, sound: bool = False) -> dict:
     }
 
 
+@mcp.tool()
+async def notify(title: str, message: str, sound: bool = False) -> dict:
+    """Send a system notification.
+
+    Args:
+        title: Short title
+        message: Body text
+        sound: Play sound (default: False)
+    """
+    return await _run_sync(_notify_impl, title=title, message=message, sound=sound)
+
+
 # Webhook support
 
 # Module-level HTTP client for webhook dispatch (connection pooling)
 _webhook_client: httpx.AsyncClient | None = None
+_webhook_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_webhook_client() -> httpx.AsyncClient:
-    """Get or create the shared webhook HTTP client."""
-    global _webhook_client
-    if _webhook_client is None or _webhook_client.is_closed:
+    """Get or create the shared webhook HTTP client for the current event loop.
+
+    The client's connection pool is bound to the loop it was created on;
+    reusing it from a different loop hangs or errors. When the loop changes
+    (e.g. dispatch fell back to a fresh thread's loop), a new client is
+    created and the stale one is left for GC.
+    """
+    global _webhook_client, _webhook_client_loop
+    loop = asyncio.get_running_loop()
+    if _webhook_client is None or _webhook_client.is_closed or _webhook_client_loop is not loop:
         _webhook_client = httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT)
+        _webhook_client_loop = loop
     return _webhook_client
 
 
@@ -677,35 +779,44 @@ def _run_dispatch_in_thread(event: Event) -> None:
 
 
 def _schedule_webhook_dispatch(event: Event) -> None:
-    """Schedule webhook dispatch in background (non-blocking)."""
+    """Schedule webhook dispatch in background (non-blocking).
+
+    Tool implementations run in worker threads (no running loop), so the
+    normal path hands the coroutine to the server loop captured by _run_sync.
+    The thread fallback only remains for direct sync calls (e.g. tests).
+    """
+    # Capture event.id in closure to avoid issues if event object changes
+    event_id = event.id
+
     try:
         loop = asyncio.get_running_loop()
-        task = loop.create_task(_dispatch_webhooks(event))
-        # Capture event.id in closure to avoid issues if event object changes
-        event_id = event.id
-        task.add_done_callback(lambda t: _handle_dispatch_task_exception(t, event_id))
     except RuntimeError:
-        # No running event loop (sync context) - run in background thread
-        # This shouldn't happen in normal MCP/uvicorn operation but handles edge cases
-        thread = threading.Thread(target=_run_dispatch_in_thread, args=(event,), daemon=True)
-        thread.start()
+        loop = None
+
+    if loop is not None:
+        task = loop.create_task(_dispatch_webhooks(event))
+        task.add_done_callback(lambda t: _handle_dispatch_task_exception(t, event_id))
+        return
+
+    server_loop = _server_loop
+    if server_loop is not None and server_loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(_dispatch_webhooks(event), server_loop)
+        # concurrent.futures.Future has the same cancelled()/exception() API
+        future.add_done_callback(lambda f: _handle_dispatch_task_exception(f, event_id))
+        return
+
+    # No event loop anywhere (direct sync context) - run in background thread
+    thread = threading.Thread(target=_run_dispatch_in_thread, args=(event,), daemon=True)
+    thread.start()
 
 
-@mcp.tool()
-def register_webhook(
+def _register_webhook_impl(
     url: str,
     channel: str | None = None,
     event_types: list[str] | None = None,
     secret: str | None = None,
 ) -> dict:
-    """Register a webhook to receive event notifications via HTTP POST.
-
-    Args:
-        url: HTTP(S) endpoint to POST events to
-        channel: Filter to specific channel (None = all). Supports prefix matching.
-        event_types: Filter to specific event types (None = all)
-        secret: Shared secret for HMAC signing (optional)
-    """
+    """Sync implementation of register_webhook (runs in a worker thread)."""
     webhook = storage.add_webhook(
         url=url,
         channel_filter=channel,
@@ -725,12 +836,27 @@ def register_webhook(
 
 
 @mcp.tool()
-def list_webhooks(active_only: bool = True) -> list[dict]:
-    """List registered webhooks.
+async def register_webhook(
+    url: str,
+    channel: str | None = None,
+    event_types: list[str] | None = None,
+    secret: str | None = None,
+) -> dict:
+    """Register a webhook to receive event notifications via HTTP POST.
 
     Args:
-        active_only: If True, only return active webhooks (default: True)
+        url: HTTP(S) endpoint to POST events to
+        channel: Filter to specific channel (None = all). Supports prefix matching.
+        event_types: Filter to specific event types (None = all)
+        secret: Shared secret for HMAC signing (optional)
     """
+    return await _run_sync(
+        _register_webhook_impl, url=url, channel=channel, event_types=event_types, secret=secret
+    )
+
+
+def _list_webhooks_impl(active_only: bool = True) -> list[dict]:
+    """Sync implementation of list_webhooks (runs in a worker thread)."""
     webhooks = storage.list_webhooks(active_only=active_only)
 
     results = [
@@ -751,12 +877,17 @@ def list_webhooks(active_only: bool = True) -> list[dict]:
 
 
 @mcp.tool()
-def unregister_webhook(webhook_id: int) -> dict:
-    """Remove a webhook registration.
+async def list_webhooks(active_only: bool = True) -> list[dict]:
+    """List registered webhooks.
 
     Args:
-        webhook_id: ID of the webhook to remove
+        active_only: If True, only return active webhooks (default: True)
     """
+    return await _run_sync(_list_webhooks_impl, active_only=active_only)
+
+
+def _unregister_webhook_impl(webhook_id: int) -> dict:
+    """Sync implementation of unregister_webhook (runs in a worker thread)."""
     deleted = storage.delete_webhook(webhook_id)
 
     if deleted:
@@ -764,6 +895,27 @@ def unregister_webhook(webhook_id: int) -> dict:
         return {"success": True, "webhook_id": webhook_id}
     else:
         return {"success": False, "error": "Webhook not found", "webhook_id": webhook_id}
+
+
+@mcp.tool()
+async def unregister_webhook(webhook_id: int) -> dict:
+    """Remove a webhook registration.
+
+    Args:
+        webhook_id: ID of the webhook to remove
+    """
+    return await _run_sync(_unregister_webhook_impl, webhook_id=webhook_id)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Liveness probe that bypasses the MCP handler (issue #112).
+
+    Runs entirely on the event loop with no storage access, so it answers
+    even when worker threads are saturated - a hung /health means the loop
+    itself is blocked.
+    """
+    return JSONResponse({"status": "ok", "service": "agent-event-bus"})
 
 
 def create_app():

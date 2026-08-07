@@ -13,11 +13,11 @@ from agent_event_bus import server
 from agent_event_bus.storage import Session, SQLiteStorage
 
 # Access the underlying functions from FunctionTool wrappers
-register_session = server.register_session.fn
-list_sessions = server.list_sessions.fn
-publish_event = server.publish_event.fn
-get_events = server.get_events.fn
-unregister_session = server.unregister_session.fn
+register_session = server._register_session_impl
+list_sessions = server._list_sessions_impl
+publish_event = server._publish_event_impl
+get_events = server._get_events_impl
+unregister_session = server._unregister_session_impl
 
 
 class TestRegisterSession:
@@ -1103,7 +1103,7 @@ class TestUnregisterByClientId:
 
 
 # Access list_channels from FunctionTool wrapper
-list_channels = server.list_channels.fn
+list_channels = server._list_channels_impl
 
 
 class TestListChannels:

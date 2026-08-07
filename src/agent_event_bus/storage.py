@@ -213,6 +213,12 @@ OLD_CONTRIB_DB_PATH = Path.home() / ".claude" / "contrib" / "event-bus" / "data.
 # in list_sessions()
 SESSION_TIMEOUT = 86400  # 24 hours
 
+# How long a connection waits on a locked database before giving up.
+# Concurrent agents publish and poll simultaneously (issue #112); without an
+# explicit busy_timeout, writers under contention fail fast with
+# "database is locked" instead of queueing briefly.
+BUSY_TIMEOUT_MS = 5000
+
 
 class SQLiteStorage:
     """SQLite-backed storage for sessions and events."""
@@ -262,6 +268,12 @@ class SQLiteStorage:
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         )
         conn.row_factory = sqlite3.Row
+        # WAL lets concurrent readers proceed while a writer holds the lock,
+        # which is the norm when several agents poll and publish at once
+        # (issue #112). journal_mode is persistent per-database but cheap to
+        # re-assert; busy_timeout is per-connection and must be set each time.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         try:
             yield conn
             conn.commit()
