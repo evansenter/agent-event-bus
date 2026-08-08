@@ -170,6 +170,18 @@ class TestHookFiltering:
         big = b'{"payload": "' + b"x" * (2 * 1024 * 1024) + b'"}'
         assert client.post("/hook", content=big).status_code == 413
 
+    def test_oversized_chunked_body_rejected(self, client):
+        """The post-read check is the half an attacker actually hits: a
+        chunked body carries no content-length to precheck. (The body is
+        still buffered once before the 413 - acknowledged residual.)"""
+
+        def chunks():
+            yield b'{"payload": "'
+            yield b"x" * (2 * 1024 * 1024)
+            yield b'"}'
+
+        assert client.post("/hook", content=chunks()).status_code == 413
+
     def test_actionable_dm_delivered_to_spool(self, client, config):
         resp = client.post("/hook", content=json.dumps(make_event()).encode())
 

@@ -246,7 +246,6 @@ class Injector:
 
 def create_bridge_app(
     config: BridgeConfig,
-    injector: Injector | None = None,
     registration_state: dict | None = None,
     registration_stop: threading.Event | None = None,
 ) -> Starlette:
@@ -259,7 +258,7 @@ def create_bridge_app(
     register call already inside its HTTP POST, so without the join a clean
     exit could read webhook_id before the thread writes it and leak the row.
     """
-    injector = injector or Injector(config)
+    injector = Injector(config)
     registration_thread: threading.Thread | None = None
 
     @asynccontextmanager
@@ -620,12 +619,29 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         )
     # The bus POSTs to the hook URL's port while the listener binds --port;
     # a mismatch is legitimate behind a reverse proxy, but name it - it's
-    # otherwise the same silent-inertness failure the guards above close
-    hook_port = urllib.parse.urlsplit(bridge_hook_url(config)).port
+    # otherwise the same silent-inertness failure the guards above close.
+    # SplitResult.port raises for a malformed port - keep that a named
+    # config error like every other input.
+    try:
+        hook_port = urllib.parse.urlsplit(bridge_hook_url(config)).port
+    except ValueError:
+        raise SystemExit(
+            f"Invalid hook URL {bridge_hook_url(config)!r} "
+            "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): bad port"
+        ) from None
     if hook_port is not None and hook_port != config.port:
         logger.warning(
             f"Hook URL advertises port {hook_port} but the listener binds {config.port} - "
             "correct only if something forwards between them"
+        )
+    # Fourth quadrant: a non-loopback bind under a loopback hook URL means
+    # the bridge advertises 127.0.0.1 while nothing listens there - every
+    # dispatch is refused at TCP. Same warn-don't-refuse policy as above.
+    if not _is_host_loopback(bind_host(config)) and _is_loopback(bridge_hook_url(config)):
+        logger.warning(
+            f"Listener binds {bind_host(config)} but the hook URL "
+            f"{bridge_hook_url(config)} advertises loopback - the bus can't reach it; "
+            "set --hook-url to an address on the bound interface"
         )
     return config
 
