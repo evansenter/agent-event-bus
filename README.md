@@ -106,6 +106,11 @@ agent-event-bus-cli unregister --session-id "$SESSION_ID"
 
 Push events to HTTP endpoints instead of polling. Webhooks are called asynchronously when events are published.
 
+`agent-event-bus-bridge` is the experimental local consumer of this
+mechanism: a daemon that wakes idle sessions when an actionable DM arrives
+(RFC #122). See the "Re-awakening Bridge" section of the usage guide
+(`agent-event-bus://guide`).
+
 ### MCP
 
 ```python

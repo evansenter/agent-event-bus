@@ -119,6 +119,12 @@ class Injector:
         self.config = config
         self._lock = threading.Lock()
         self._last_wake: dict[str, float] = {}
+        # Once at construction, not per delivery: keeps the lock hold to the
+        # append itself, and a deliberate later permission change by the
+        # operator isn't silently reverted on the next event. The dir is
+        # private (0o700) - spool files carry full event payloads.
+        self.config.wake_dir.mkdir(parents=True, exist_ok=True)
+        self.config.wake_dir.chmod(0o700)
 
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken:
@@ -138,8 +144,15 @@ class Injector:
                 return "spool"
 
             now = time.monotonic()
+            # Housekeeping: entries past the cooldown can never gate a wake
+            # again, and sessions are ephemeral - don't retain them forever
+            self._last_wake = {
+                sid: ts
+                for sid, ts in self._last_wake.items()
+                if (now - ts) < self.config.cooldown_seconds
+            }
             last = self._last_wake.get(session_id)
-            if last is not None and (now - last) < self.config.cooldown_seconds:
+            if last is not None:
                 return "spool-cooldown"
             # Reserve the window before releasing the lock: two concurrent
             # deliveries for the same session must not both pass the check
@@ -163,11 +176,8 @@ class Injector:
     def _spool(self, session_id: str, event: dict) -> None:
         """Always-on durable path: one JSON line per event, per session.
 
-        Callers must hold self._lock. The wake dir is kept private (0o700):
-        spool files carry full event payloads.
+        Callers must hold self._lock.
         """
-        self.config.wake_dir.mkdir(parents=True, exist_ok=True)
-        self.config.wake_dir.chmod(0o700)
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
         # Defense in depth behind resolve_target_session's charset check: a
         # traversal or absolute component in a wire-supplied id must never
@@ -178,11 +188,24 @@ class Injector:
             f.write(json.dumps(event) + "\n")
 
     def _tmux_pane(self, session_id: str) -> str | None:
-        """Look up the session's tmux pane from <wake_dir>/panes.json."""
+        """Look up the session's tmux pane from <wake_dir>/panes.json.
+
+        The mapping is maintained by an external session-side component, so
+        every failure shape - unreadable file, non-UTF-8 bytes from a torn
+        write, valid JSON that isn't an object - must degrade to "unmapped":
+        an exception escaping here would 500 the webhook and make the bus
+        retry an already-spooled event.
+        """
         panes_file = self.config.wake_dir / "panes.json"
         try:
             panes = json.loads(panes_file.read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as e:
+            logger.warning(f"Unreadable panes.json ({e}); treating as unmapped")
+            return None
+        if not isinstance(panes, dict):
+            logger.warning("panes.json is not an object; treating as unmapped")
             return None
         pane = panes.get(session_id)
         return pane if isinstance(pane, str) and pane else None
@@ -292,8 +315,9 @@ def bridge_hook_url(config: BridgeConfig) -> str:
     return f"http://127.0.0.1:{config.port}/hook"
 
 
-def register_with_bus(config: BridgeConfig) -> int | None:
-    """Register this bridge's webhook on the bus. Returns webhook_id.
+def register_with_bus(config: BridgeConfig) -> int:
+    """Register this bridge's webhook on the bus. Returns webhook_id;
+    raises SystemExit on any failure (bus unreachable, or no id returned).
 
     Idempotent: an unclean exit (SIGKILL, crash, reboot) skips main()'s
     finally, leaving a stale active webhook at this URL - and the bus neither
@@ -324,9 +348,12 @@ def register_with_bus(config: BridgeConfig) -> int | None:
         },
         url=config.bus_url,
     )
-    webhook_id = result.get("webhook_id")
-    if webhook_id is not None:
-        logger.info(f"Registered bridge webhook #{webhook_id} on {config.bus_url}")
+    webhook_id = result.get("webhook_id") if isinstance(result, dict) else None
+    if webhook_id is None:
+        # A bus that answers but returns no id must be a retryable failure,
+        # not silent success - register_with_retry treats SystemExit as retry
+        raise SystemExit(f"register_webhook returned no webhook_id: {result!r}")
+    logger.info(f"Registered bridge webhook #{webhook_id} on {config.bus_url}")
     return webhook_id
 
 
@@ -360,8 +387,10 @@ def register_with_retry(
         try:
             state["webhook_id"] = register_with_bus(config)
             return
-        except SystemExit:
-            logger.warning(f"Bus unreachable at {config.bus_url}; retrying in {delay:.0f}s")
+        except SystemExit as e:
+            logger.warning(
+                f"Registration on {config.bus_url} failed ({e}); retrying in {delay:.0f}s"
+            )
         if stop.wait(delay):
             return
         delay = min(delay * 2, max_delay)

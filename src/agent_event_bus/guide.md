@@ -339,7 +339,10 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   is a follow-up.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
-  session-side must maintain; unmapped sessions just spool.
+  session-side must maintain; unmapped sessions just spool. A stale mapping
+  types the wake prompt into whatever now owns the pane (usually a shell
+  after the session exits), so the maintainer of `panes.json` should prune
+  entries when sessions end.
 - Per-session cooldown (default 30s, `--cooldown`) bounds *successful*
   wake-ups; events during cooldown are spooled, never dropped, and a failed
   tmux attempt doesn't burn the window.

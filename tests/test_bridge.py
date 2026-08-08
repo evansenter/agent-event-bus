@@ -263,6 +263,21 @@ class TestInjectorCooldown:
         assert injector.deliver("target-1", make_event()) == "spool"
         assert injector.deliver("target-1", make_event()) == "spool"
 
+    def test_expired_last_wake_entries_are_pruned(self, tmp_path):
+        """Sessions are ephemeral; entries past the cooldown can never gate
+        a wake again and must not accumulate for the daemon's lifetime."""
+        injector, _ = make_tmux_injector(tmp_path, sessions=("target-1", "target-2"), cooldown=30.0)
+
+        clock = {"now": 1000.0}
+        with patch.object(bridge.time, "monotonic", lambda: clock["now"]):
+            with patch.object(bridge.subprocess, "run", tmux_ok):
+                assert injector.deliver("target-1", make_event()) == "tmux"
+                clock["now"] += 35.0
+                assert injector.deliver("target-2", make_event()) == "tmux"
+
+        assert "target-1" not in injector._last_wake
+        assert "target-2" in injector._last_wake
+
     def test_concurrent_spool_appends_do_not_tear(self, config):
         """Concurrent webhook deliveries append under the lock; every line
         must stay valid JSON even when payloads exceed the IO buffer."""
@@ -346,6 +361,28 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run", tmux_perm):
             assert injector.deliver("target-1", make_event()) == "spool"
 
+    def test_malformed_panes_json_degrades_to_spool(self, tmp_path):
+        """panes.json is maintained by an external component - every failure
+        shape must read as 'unmapped', never escape as a 500."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+
+        for content in (b'["not", "an", "object"]', b'"bare string"', b"null", b"\xff\xfe{}"):
+            panes.write_bytes(content)
+            with patch.object(bridge.subprocess, "run") as mock_run:
+                assert injector.deliver("target-1", make_event()) == "spool"
+            mock_run.assert_not_called()
+
+    def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        (config.wake_dir / "panes.json").mkdir()  # IsADirectoryError on read
+
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            assert injector.deliver("target-1", make_event()) == "spool"
+        mock_run.assert_not_called()
+
 
 class TestBusRegistration:
     def test_registers_webhook_with_bridge_url_and_secret(self, tmp_path):
@@ -427,6 +464,21 @@ class TestBusRegistration:
 
         assert state["webhook_id"] == 42
         assert len(attempts) == 3
+
+    def test_registration_without_id_is_retryable(self, tmp_path):
+        """A bus that answers but returns no webhook_id must be a retryable
+        failure - not a silent success that leaves the bridge receiving
+        nothing for the daemon's lifetime."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            if tool_name == "list_webhooks":
+                return []
+            return {}  # answered, but no webhook_id
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            with pytest.raises(SystemExit, match="no webhook_id"):
+                bridge.register_with_bus(config)
 
     def test_registration_retry_honors_shutdown(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")
