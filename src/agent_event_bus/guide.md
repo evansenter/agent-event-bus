@@ -343,9 +343,12 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   types the wake prompt into whatever now owns the pane (usually a shell
   after the session exits), so the maintainer of `panes.json` should prune
   entries when sessions end.
-- Per-session cooldown (default 30s, `--cooldown`) bounds *successful*
-  wake-ups; events during cooldown are spooled, never dropped, and a failed
-  tmux attempt doesn't burn the window.
+- Per-session cooldown (default 30s, `--cooldown`) bounds *successful tmux
+  injections*; events during cooldown are spooled, never dropped, and a
+  failed tmux attempt doesn't burn the window. In the default spool backend
+  the cooldown never engages - a spool line only becomes a wake when the
+  drain hook acts on it, so loop prevention there is the consuming hook's
+  job: bound how often you act on a drained spool, and dedupe on `event_id`.
 - Startup is idempotent: stale active webhooks at this bridge's URL (from
   unclean exits) are removed before registering, so restarts never stack
   duplicate deliveries.
@@ -355,7 +358,19 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
 Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,
 `--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
-`--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`.
+`--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`,
+`--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`.
+
+**Remote-bus topology**: the defaults assume the bus runs on the same
+machine. With a remote bus (`AGENT_EVENT_BUS_URL` pointing off-host), a
+loopback hook URL would make the bus POST to *itself* - silently - so the
+bridge refuses to start unless `--hook-url` advertises an address the bus
+host can reach (e.g. your Tailscale hostname). The listener then binds
+non-loopback, so set `AGENT_EVENT_BUS_BRIDGE_SECRET`: it becomes the only
+authentication. Note webhooks have no machine scoping - every bridge
+receives every `session:` DM; tmux wakes only work for sessions on the
+bridge's own machine, and spool files for foreign sessions accumulate until
+the pruning follow-up lands. Machine-scoped delivery is a v2 item.
 
 Supervision is deliberately out of scope for the v1 prototype: there is no
 `make install-bridge`, launchd plist, or systemd unit yet - run the bridge in

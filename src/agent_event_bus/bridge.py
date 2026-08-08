@@ -37,6 +37,7 @@ import re
 import subprocess
 import threading
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +76,8 @@ class BridgeConfig:
     secret: str | None = None
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     wake_dir: Path = field(default_factory=lambda: DEFAULT_WAKE_DIR)
+    # URL the bus POSTs to; None means loopback (bus on this machine)
+    hook_url: str | None = None
 
 
 def verify_signature(body: bytes, signature_header: str | None, secret: str) -> bool:
@@ -85,12 +88,14 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
     return hmac.compare_digest(f"sha256={expected}", signature_header)
 
 
-# Session ids are UUIDs or display ids ("brave-trex"); nothing else. The
-# channel string is publisher-controlled wire input and the id becomes a spool
-# filename, so path separators, "..", and any other unexpected byte must never
-# reach the filesystem - the bus warns on malformed channels but does not
-# reject them.
-SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+# Session ids are UUIDs (36 chars) or display ids ("brave-trex"); nothing
+# else. The channel string is publisher-controlled wire input and the id
+# becomes a spool filename, so path separators, "..", and any other
+# unexpected byte must never reach the filesystem - the bus warns on
+# malformed channels but does not reject them. The length bound keeps a
+# too-long name from turning into an unretryable OSError out of the spool
+# open (and caps spool-file blast radius).
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def resolve_target_session(event: dict) -> str | None:
@@ -106,8 +111,7 @@ def resolve_target_session(event: dict) -> str | None:
         return None
     target = channel.split(":", 1)[1]
     if not SESSION_ID_PATTERN.fullmatch(target):
-        if target:
-            logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
+        logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
         return None
     return target
 
@@ -165,12 +169,11 @@ class Injector:
             return "tmux"
         with self._lock:
             # Roll back the reservation so the failure doesn't burn the
-            # window - unless a later delivery already re-claimed it
+            # window - unless a later delivery already re-claimed it. There
+            # is no previous value to restore: any entry that survived the
+            # prune returned spool-cooldown above.
             if self._last_wake.get(session_id) == now:
-                if last is None:
-                    del self._last_wake[session_id]
-                else:
-                    self._last_wake[session_id] = last
+                del self._last_wake[session_id]
         return "spool"
 
     def _spool(self, session_id: str, event: dict) -> None:
@@ -300,7 +303,13 @@ def create_bridge_app(
         return JSONResponse(payload, status_code=status)
 
     async def health(request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "service": "agent-event-bus-bridge"})
+        payload = {"status": "ok", "service": "agent-event-bus-bridge"}
+        if registration_state is not None:
+            # Registration is deliberately non-fatal, so this is the one
+            # place an operator (or a supervisor readiness check) can tell
+            # "working" from "listening but never registered"
+            payload["registered"] = registration_state.get("webhook_id") is not None
+        return JSONResponse(payload)
 
     return Starlette(
         routes=[
@@ -312,7 +321,18 @@ def create_bridge_app(
 
 
 def bridge_hook_url(config: BridgeConfig) -> str:
-    return f"http://127.0.0.1:{config.port}/hook"
+    """The URL the bus POSTs to. Loopback by default (bus on this machine);
+    --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL overrides it with an
+    address the bus host can reach when the bus is remote."""
+    return config.hook_url or f"http://127.0.0.1:{config.port}/hook"
+
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname
+    return host is None or host in LOOPBACK_HOSTS
 
 
 def register_with_bus(config: BridgeConfig) -> int:
@@ -439,6 +459,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
         help="Directory for spool files and panes.json",
     )
+    parser.add_argument(
+        "--hook-url",
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_HOOK_URL") or None,
+        help="URL the bus POSTs events to (default: http://127.0.0.1:<port>/hook; "
+        "must be an address the bus host can reach when the bus is remote)",
+    )
     return parser
 
 
@@ -452,7 +478,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Invalid backend {args.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
             "expected 'spool' or 'tmux'"
         )
-    return BridgeConfig(
+    config = BridgeConfig(
         bus_url=args.bus_url,
         port=args.port,
         backend=args.backend,
@@ -463,7 +489,21 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
         cooldown_seconds=args.cooldown,
         wake_dir=args.wake_dir,
+        hook_url=args.hook_url,
     )
+    # A loopback hook URL registered on a remote bus makes the bus POST to
+    # itself: registration succeeds, /health is green, nothing is ever
+    # delivered - and every machine would claim the same URL string, so the
+    # startup dedupe could remove a live webhook belonging to the bus host.
+    # Refuse the combination instead of failing silently.
+    if not _is_loopback(config.bus_url) and _is_loopback(bridge_hook_url(config)):
+        raise SystemExit(
+            f"Bus at {config.bus_url} is remote but the advertised hook URL "
+            f"{bridge_hook_url(config)} is loopback - the bus would POST to itself. "
+            "Set --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL to an address the bus "
+            "host can reach (and set AGENT_EVENT_BUS_BRIDGE_SECRET)."
+        )
+    return config
 
 
 def main():
@@ -477,10 +517,20 @@ def main():
     state: dict = {}
     stop = threading.Event()
     app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+    # Loopback hook URL -> bind localhost only (the local bus is the sole
+    # caller). A non-loopback hook URL means a remote bus must reach us, so
+    # bind wide - at which point the HMAC secret is the only authentication.
+    if _is_loopback(bridge_hook_url(config)):
+        host = "127.0.0.1"
+    else:
+        host = "0.0.0.0"  # noqa: S104 - deliberate, guarded by warning below
+        if not config.secret:
+            logger.warning(
+                "Hook URL is non-loopback and AGENT_EVENT_BUS_BRIDGE_SECRET is unset - "
+                "anyone who can reach this port can inject wake events"
+            )
     try:
-        # Localhost only: the bus is the sole intended caller, and HMAC (when
-        # a secret is set) authenticates it
-        uvicorn.run(app, host="127.0.0.1", port=config.port)
+        uvicorn.run(app, host=host, port=config.port)
     finally:
         # Lifespan shutdown already stopped and joined the registration
         # thread; the stop here only covers exits that skipped the lifespan

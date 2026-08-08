@@ -101,6 +101,9 @@ class TestPathSafety:
             "session:a/b",
             "session:a\x00b",
             "session:..",
+            # Charset-clean but too long: would be an unretryable OSError
+            # (name too long) out of the spool open
+            "session:" + "a" * 300,
         ):
             assert resolve_target_session(make_event(channel=channel)) is None
 
@@ -518,8 +521,15 @@ class TestDaemonLifecycle:
         stop = threading.Event()
         with patch.object(bridge, "register_with_bus", fake_register):
             app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-            with TestClient(app):
+            with TestClient(app) as client:
                 assert registered.wait(timeout=5), "startup never fired registration"
+                # /health surfaces the registration outcome - the one signal
+                # that separates "working" from "listening but never registered"
+                for _ in range(500):
+                    if client.get("/health").json().get("registered"):
+                        break
+                    time.sleep(0.01)
+                assert client.get("/health").json()["registered"] is True
         # Shutdown stopped and joined the thread, so the result is visible
         assert state["webhook_id"] == 42
         assert stop.is_set()
@@ -547,7 +557,10 @@ class TestDaemonLifecycle:
 
     def test_app_without_registration_has_inert_lifespan(self, config):
         with TestClient(create_bridge_app(config)) as client:
-            assert client.get("/health").status_code == 200
+            payload = client.get("/health").json()
+        assert payload["status"] == "ok"
+        # No registration state -> no claim either way
+        assert "registered" not in payload
 
 
 class TestEnvValidation:
@@ -574,3 +587,54 @@ class TestEnvValidation:
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "30s")
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_COOLDOWN"):
             bridge.build_parser()
+
+
+class TestHookUrlTopology:
+    """A loopback hook URL registered on a remote bus makes the bus POST to
+    itself - a silent no-op with a green health check - and every machine
+    would claim the same URL string, letting one bridge's startup dedupe
+    remove another machine's live webhook."""
+
+    def test_remote_bus_with_loopback_hook_is_refused(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "https://bus.tailnet.example/mcp")
+        with pytest.raises(SystemExit, match="hook-url"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_remote_bus_with_reachable_hook_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "https://bus.tailnet.example/mcp")
+        args = bridge.build_parser().parse_args(
+            ["--hook-url", "http://laptop.tailnet.example:8082/hook"]
+        )
+        config = bridge.config_from_args(args)
+        assert bridge.bridge_hook_url(config) == "http://laptop.tailnet.example:8082/hook"
+
+    def test_local_bus_with_loopback_hook_is_accepted(self, monkeypatch):
+        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert bridge.bridge_hook_url(config).startswith("http://127.0.0.1:")
+
+    def test_hook_url_env_is_adopted(self, monkeypatch):
+        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:9090/hook")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert bridge.bridge_hook_url(config) == "http://box.local:9090/hook"
+
+    def test_registration_advertises_hook_url_override(self, tmp_path):
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            bus_url="https://bus.tailnet.example/mcp",
+            hook_url="http://laptop.tailnet.example:8082/hook",
+        )
+        calls = []
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments})
+            if tool_name == "list_webhooks":
+                return []
+            return {"webhook_id": 44}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            assert bridge.register_with_bus(config) == 44
+
+        register = next(c for c in calls if c["tool"] == "register_webhook")
+        assert register["arguments"]["url"] == "http://laptop.tailnet.example:8082/hook"
