@@ -433,17 +433,19 @@ def register_with_bus(config: BridgeConfig) -> int:
     hook_url = bridge_hook_url(config)
 
     existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url)
-    if isinstance(existing, list):
-        for wh in existing:
-            # Guard the element shape too: an AttributeError here would
-            # escape register_with_retry and kill the registration thread
-            if not isinstance(wh, dict):
-                continue
-            if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
-                call_tool(
-                    "unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url
-                )
-                logger.info(f"Removed stale bridge webhook #{wh['webhook_id']}")
+    if not isinstance(existing, list):
+        # Proceeding without the dedupe would stack the duplicate deliveries
+        # this sweep exists to prevent - retryable failure, like the no-id
+        # case below
+        raise SystemExit(f"list_webhooks returned unexpected result: {existing!r}")
+    for wh in existing:
+        # Guard the element shape too: an AttributeError here would
+        # escape register_with_retry and kill the registration thread
+        if not isinstance(wh, dict):
+            continue
+        if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
+            call_tool("unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url)
+            logger.info(f"Removed stale bridge webhook #{wh['webhook_id']}")
 
     result = call_tool(
         "register_webhook",

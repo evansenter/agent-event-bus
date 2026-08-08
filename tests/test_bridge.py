@@ -383,6 +383,36 @@ class TestInjectorCooldown:
         # Nothing was written while the lock was contended
         assert not (config.wake_dir / "t.jsonl").exists()
 
+    def test_stuck_drainer_does_not_stall_other_sessions(self, config, monkeypatch):
+        """Pins the invariant that _spool runs OUTSIDE the global injector
+        lock: one session's stuck drainer (holding its flock) must not block
+        deliveries for other sessions. Under the pre-fix ordering, session
+        b's delivery would block behind a's full lock deadline."""
+        monkeypatch.setattr(bridge, "SPOOL_LOCK_ATTEMPTS", 100)
+        monkeypatch.setattr(bridge, "SPOOL_LOCK_RETRY_SECONDS", 0.05)  # 5s deadline
+        injector = Injector(config)
+        a_lock = config.wake_dir / "a.lock"
+        a_result: list = []
+
+        with a_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # a's drainer is stuck
+            blocked = threading.Thread(
+                target=lambda: a_result.append(injector.deliver("a", make_event()))
+            )
+            try:
+                blocked.start()
+                start = time.monotonic()
+                assert injector.deliver("b", make_event()) == "spool"
+                elapsed = time.monotonic() - start
+                # b must complete while a is still parked on its flock -
+                # well under a's 5s deadline
+                assert elapsed < 1.0
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+        blocked.join(timeout=10.0)
+        assert not blocked.is_alive()
+        assert a_result == ["spool"]  # a completes once its lock frees
+
     def test_wake_dir_is_private(self, config):
         Injector(config).deliver("target-1", make_event())
         assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
@@ -581,6 +611,21 @@ class TestBusRegistration:
 
         with patch.object(bridge, "call_tool", fake_call_tool):
             assert bridge.register_with_bus(config) == 5
+
+    def test_non_list_webhook_listing_is_retryable(self, tmp_path):
+        """A bus that answers but can't list webhooks must not skip the
+        stale-URL dedupe and register anyway - that stacks the duplicate
+        deliveries the sweep exists to prevent. Retry instead."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            if tool_name == "list_webhooks":
+                return {}  # answered, but not a list
+            return {"webhook_id": 5}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            with pytest.raises(SystemExit, match="list_webhooks"):
+                bridge.register_with_bus(config)
 
     def test_registration_retries_on_unexpected_errors(self, tmp_path):
         """Any surprise inside register_with_bus must degrade to

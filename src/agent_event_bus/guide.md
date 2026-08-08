@@ -338,15 +338,23 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
      already read). The bridge's acquire is bounded (~5s), so keep your
      hold to the renames below - never drain while holding the lock.
   2. Under the lock, claim a batch by rename (renames only, so the hold
-     stays short): any `<sid>.jsonl.draining.<pid>` whose pid is dead is an
-     orphan from a drain that died mid-protocol (hook timeout, session
-     exit, reboot) - rename each onto your own pid. A file whose pid is
-     alive belongs to a drainer still in step 3: leave it. Then
-     `mv <sid>.jsonl <sid>.jsonl.draining.$$` (if it exists) and release
+     stays short). Every claim must target a *unique* name -
+     `<sid>.jsonl.draining.$$.<seq>` with a per-file sequence number -
+     because rename silently replaces an existing target, so two claims
+     onto one name would destroy a batch. Claim any stale
+     `<sid>.jsonl.draining.*` (a drain that died mid-protocol - hook
+     timeout, session exit, reboot - leaves one behind), judging
+     staleness by age (e.g. mtime over a minute old), not pid liveness -
+     pids recycle across reboots, so a dead drainer's pid can read as
+     live forever. Then claim the live spool:
+     `mv <sid>.jsonl <sid>.jsonl.draining.$$.0` (if it exists). Release
      the lock.
-  3. Outside the lock, drain the files you renamed, then delete them. You
-     only ever delete files carrying your own pid, so overlapping drains
-     can never destroy each other's batch.
+  3. Outside the lock, drain the files you claimed
+     (`<sid>.jsonl.draining.$$.*`), then delete them. You only ever
+     delete files you claimed, so overlapping drains can never destroy
+     each other's batch - and if the age test ever claims a merely
+     *stalled* drainer's file, the `event_id` dedupe covers the
+     double-action while deletion stays claimant-only.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Dedupe on `event_id` when
@@ -354,7 +362,10 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   a recovered orphan may overlap with what a dead drain already acted on,
   so the same event can legitimately appear more than once. The wake dir is
   created 0o700 (spool files carry full event payloads); pruning spools and
-  lock files for dead sessions is a follow-up.
+  lock files for dead sessions is a follow-up - with one constraint: flock
+  binds to an inode, so unlink a `<sid>.lock` only while holding its flock
+  and only when no `<sid>.jsonl*` remains, or the next appender locks a
+  fresh inode and mutual exclusion is silently gone.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool. A stale mapping
