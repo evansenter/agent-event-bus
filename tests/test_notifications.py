@@ -8,10 +8,10 @@ import pytest
 from agent_event_bus import server
 
 # Access the underlying functions from FunctionTool wrappers
-register_session = server.register_session.fn
-publish_event = server.publish_event.fn
-get_events = server.get_events.fn
-notify = server.notify.fn
+register_session = server._register_session_impl
+publish_event = server._publish_event_impl
+get_events = server._get_events_impl
+notify = server._notify_impl
 
 
 class TestNotify:

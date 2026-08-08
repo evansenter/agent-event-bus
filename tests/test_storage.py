@@ -382,7 +382,7 @@ class TestEventOperations:
                 session_id="session-123",
             )
 
-        events, next_cursor = storage.get_events()
+        events, next_cursor, _ = storage.get_events()
         assert len(events) == 5
         assert next_cursor is not None
 
@@ -398,7 +398,7 @@ class TestEventOperations:
             event_ids.append(event.id)
 
         # Get events after the third one (cursor is string)
-        events, next_cursor = storage.get_events(cursor=str(event_ids[2]), order="asc")
+        events, next_cursor, _ = storage.get_events(cursor=str(event_ids[2]), order="asc")
         assert len(events) == 2
         assert events[0].event_type == "event_3"
         assert events[1].event_type == "event_4"
@@ -412,7 +412,7 @@ class TestEventOperations:
                 session_id="session-123",
             )
 
-        events, next_cursor = storage.get_events(limit=3)
+        events, next_cursor, _ = storage.get_events(limit=3)
         assert len(events) == 3
 
     def test_get_cursor(self, storage):
@@ -439,15 +439,15 @@ class TestEventOperations:
             )
 
         # Malformed cursor should reset to start (return all events)
-        events, _ = storage.get_events(cursor="not-a-number")
+        events, _, _ = storage.get_events(cursor="not-a-number")
         assert len(events) == 3
 
         # Empty cursor works normally
-        events, _ = storage.get_events(cursor="")
+        events, _, _ = storage.get_events(cursor="")
         assert len(events) == 3
 
         # Valid cursor works normally
-        events, _ = storage.get_events(cursor="1", order="asc")
+        events, _, _ = storage.get_events(cursor="1", order="asc")
         assert len(events) == 2  # Events after id=1
 
 
@@ -464,7 +464,7 @@ class TestEventChannelFiltering:
         storage.add_event("other", "msg5", "s1", channel="session:xyz")
 
         # Filter for specific channels
-        events, _ = storage.get_events(channels=["all", "session:abc", "repo:myrepo"])
+        events, _, _ = storage.get_events(channels=["all", "session:abc", "repo:myrepo"])
         assert len(events) == 3
         types = {e.event_type for e in events}
         assert types == {"broadcast", "direct", "repo"}
@@ -476,7 +476,7 @@ class TestEventChannelFiltering:
         storage.add_event("e3", "msg3", "s1", channel="repo:myrepo")
 
         # No channel filter = all events
-        events, _ = storage.get_events(channels=None)
+        events, _, _ = storage.get_events(channels=None)
         assert len(events) == 3
 
 
@@ -492,7 +492,7 @@ class TestEventTypeFiltering:
         storage.add_event("task_completed", "another task", "s1")
 
         # Filter for specific event types
-        events, _ = storage.get_events(event_types=["task_completed", "ci_completed"])
+        events, _, _ = storage.get_events(event_types=["task_completed", "ci_completed"])
         assert len(events) == 3
         types = {e.event_type for e in events}
         assert types == {"task_completed", "ci_completed"}
@@ -503,10 +503,10 @@ class TestEventTypeFiltering:
         storage.add_event("ci_completed", "CI 1", "s1")
         storage.add_event("task_completed", "task 2", "s1")
 
-        events, _ = storage.get_events(event_types=["gotcha_discovered"])
+        events, _, _ = storage.get_events(event_types=["gotcha_discovered"])
         assert len(events) == 0
 
-        events, _ = storage.get_events(event_types=["task_completed"])
+        events, _, _ = storage.get_events(event_types=["task_completed"])
         assert len(events) == 2
         assert all(e.event_type == "task_completed" for e in events)
 
@@ -517,7 +517,7 @@ class TestEventTypeFiltering:
         storage.add_event("e3", "msg3", "s1")
 
         # No event_types filter = all events
-        events, _ = storage.get_events(event_types=None)
+        events, _, _ = storage.get_events(event_types=None)
         assert len(events) == 3
 
     def test_get_events_combined_filters(self, storage):
@@ -528,7 +528,7 @@ class TestEventTypeFiltering:
         storage.add_event("gotcha_discovered", "gotcha", "s1", channel="repo:myrepo")
 
         # Filter by both channel and event type
-        events, _ = storage.get_events(
+        events, _, _ = storage.get_events(
             channels=["repo:myrepo"], event_types=["task_completed", "ci_completed"]
         )
         assert len(events) == 2
@@ -582,7 +582,7 @@ class TestDatabaseInitialization:
             channel="repo:myrepo",
         )
 
-        events, _ = storage.get_events()
+        events, _, _ = storage.get_events()
         assert len(events) == 1
         assert events[0].channel == "repo:myrepo"
 
@@ -875,3 +875,90 @@ class TestDbLocationMigration:
         row = cursor.fetchone()
         conn.close()
         assert row is None, "New DB should not have old_marker table (wasn't overwritten)"
+
+
+class TestNextCursorHighWater:
+    """next_cursor must never re-serve events, regardless of order."""
+
+    def _add_events(self, storage, n):
+        return [
+            storage.add_event(event_type=f"event_{i}", payload=f"payload {i}", session_id="s1").id
+            for i in range(n)
+        ]
+
+    def test_desc_next_cursor_is_high_water(self, storage):
+        ids = self._add_events(storage, 5)
+
+        events, next_cursor, _ = storage.get_events(order="desc")
+        assert next_cursor == str(max(ids))
+
+    def test_desc_polling_with_next_cursor_never_duplicates(self, storage):
+        """The old MIN-for-desc cursor returned the same newest events on
+        every follow-up call; feeding next_cursor back must yield only new
+        events."""
+        self._add_events(storage, 3)
+        _, cursor, _ = storage.get_events(order="desc")
+
+        # No new events: nothing comes back
+        events, cursor2, _ = storage.get_events(cursor=cursor, order="desc")
+        assert events == []
+        assert cursor2 == cursor
+
+        # A new event: exactly that event comes back
+        new_id = storage.add_event(event_type="fresh", payload="new", session_id="s1").id
+        events, cursor3, _ = storage.get_events(cursor=cursor, order="desc")
+        assert [e.id for e in events] == [new_id]
+        assert cursor3 == str(new_id)
+
+    def test_asc_next_cursor_unchanged(self, storage):
+        ids = self._add_events(storage, 5)
+
+        events, next_cursor, _ = storage.get_events(order="asc")
+        assert next_cursor == str(max(ids))
+
+
+class TestBacklogPaging:
+    """has_more semantics when the unseen backlog exceeds limit."""
+
+    def _add_events(self, storage, n):
+        return [
+            storage.add_event(event_type=f"event_{i}", payload=f"payload {i}", session_id="s1").id
+            for i in range(n)
+        ]
+
+    def test_desc_backlog_beyond_limit_sets_has_more_and_skips(self, storage):
+        ids = self._add_events(storage, 7)
+
+        events, next_cursor, has_more = storage.get_events(limit=5, order="desc")
+        assert [e.id for e in events] == list(reversed(ids[-5:]))
+        assert has_more is True
+        assert next_cursor == str(max(ids))
+
+        # Documented desc trade-off: the page is the newest slice, so feeding
+        # next_cursor back skips the two oldest backlog events. Drain with
+        # order="asc" when no event may be missed.
+        events2, _, has_more2 = storage.get_events(cursor=next_cursor, limit=5, order="desc")
+        assert events2 == []
+        assert has_more2 is False
+
+    def test_asc_drains_backlog_across_pages(self, storage):
+        ids = self._add_events(storage, 7)
+
+        seen = []
+        cursor = None
+        for _ in range(10):
+            events, cursor, has_more = storage.get_events(cursor=cursor, limit=5, order="asc")
+            seen.extend(e.id for e in events)
+            if not has_more:
+                break
+
+        assert seen == ids
+
+    def test_limit_zero_does_not_report_more(self, storage):
+        """limit=0 returns an empty page that never advances the cursor; a
+        keep-polling-while-has_more loop would spin forever if it were True."""
+        self._add_events(storage, 3)
+
+        events, cursor, has_more = storage.get_events(limit=0)
+        assert events == []
+        assert has_more is False

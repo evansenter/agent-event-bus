@@ -6,6 +6,8 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+import anyio.to_thread
+
 if TYPE_CHECKING:
     from agent_event_bus.storage import SQLiteStorage
 
@@ -411,10 +413,16 @@ class RequestLoggingMiddleware:
 
         await self.app(scope, receive_wrapper, send_wrapper)
 
-        # Log after request completes
+        # Log after the response has been sent. The formatting helpers hit
+        # SQLite (display-id lookups) and the logger blocks on disk, so the
+        # whole block runs in a worker thread to keep the event loop free
+        # (#112 invariant - same class of fix as the tool bodies).
         request_body = b"".join(body_parts)
         response_body = b"".join(response_parts)
+        await anyio.to_thread.run_sync(self._log_tool_call, request_body, response_body)
 
+    def _log_tool_call(self, request_body: bytes, response_body: bytes) -> None:
+        """Parse and log one MCP tool call (runs in a worker thread)."""
         try:
             req_json = json.loads(request_body) if request_body else {}
             req_method = req_json.get("method", "?")

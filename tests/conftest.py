@@ -104,6 +104,8 @@ def make_events_args(**overrides):
     """
     from argparse import Namespace
 
+    # Keep in sync with the events subparser in cli.main() - this Namespace
+    # stands in for real argparse output.
     defaults = dict(
         cursor=None,
         session_id=None,
@@ -117,6 +119,34 @@ def make_events_args(**overrides):
         resume=False,
         debug=False,
         include=None,
+        peek=False,
+        correlation_id=None,
+        min_level=None,
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+def make_publish_args(**overrides):
+    """Namespace matching the publish subparser's output - keep in sync.
+
+    Usage:
+        args = make_publish_args()  # All defaults
+        args = make_publish_args(title="T", tags="a,b")  # Override fields
+    """
+    from argparse import Namespace
+
+    defaults = dict(
+        type="test_event",
+        payload="hello",
+        channel="all",  # The publish subparser defaults --channel to "all"
+        session_id=None,
+        title=None,
+        tags=None,
+        correlation_id=None,
+        signal_level=None,
+        url=None,
+        debug=False,
     )
     defaults.update(overrides)
     return Namespace(**defaults)

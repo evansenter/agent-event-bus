@@ -151,9 +151,14 @@ Webhooks receive a POST with JSON body:
   "payload": "Finished building feature X",
   "session_id": "abc-123",
   "timestamp": "2026-01-31T08:00:00",
-  "channel": "repo:my-project"
+  "channel": "repo:my-project",
+  "correlation_id": null,
+  "signal_level": "info"
 }
 ```
+
+`correlation_id` and `signal_level` are always present (`signal_level` is
+server-derived); `title` and `tags` appear only when the event carries them.
 
 If a `secret` is configured, requests include an `X-Event-Bus-Signature` header:
 
@@ -210,7 +215,10 @@ Requires `terminal-notifier` for custom icon: `brew install terminal-notifier`
 
 ## Data
 
-All data in `~/.claude/contrib/agent-event-bus/`: `data.db`, `agent-event-bus.log`, `agent-event-bus.err`
+All data in `~/.claude/contrib/agent-event-bus/`: `data.db` (plus its WAL
+sidecars `data.db-wal` and `data.db-shm`, which are **part of the database**),
+`agent-event-bus.log`, `agent-event-bus.err`. Never copy `data.db` alone -
+use `sqlite3 data.db ".backup <dest>"` for a consistent backup.
 
 ## Related
 

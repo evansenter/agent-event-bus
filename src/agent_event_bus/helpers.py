@@ -8,6 +8,11 @@ import subprocess
 
 logger = logging.getLogger("agent-event-bus")
 
+# Notification subprocesses (terminal-notifier/osascript/notify-send) can hang
+# indefinitely; a bounded timeout keeps a stuck notifier from wedging the
+# worker that called it (issue #112).
+NOTIFY_TIMEOUT = 5.0  # seconds
+
 
 def _sanitize_name(name: str) -> str:
     """Sanitize a name by replacing problematic characters."""
@@ -103,7 +108,7 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
                 if icon_path and os.path.exists(icon_path):
                     cmd.extend(["-appIcon", icon_path])
 
-                subprocess.run(cmd, check=True, capture_output=True)
+                subprocess.run(cmd, check=True, capture_output=True, timeout=NOTIFY_TIMEOUT)
                 return True
 
             # Fallback to osascript (no custom icon support)
@@ -117,6 +122,7 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
                 ["osascript", "-e", script],
                 check=True,
                 capture_output=True,
+                timeout=NOTIFY_TIMEOUT,
             )
             return True
 
@@ -128,7 +134,7 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
             # Check for notify-send
             if shutil.which("notify-send"):
                 cmd = ["notify-send", title, message]
-                subprocess.run(cmd, check=True, capture_output=True)
+                subprocess.run(cmd, check=True, capture_output=True, timeout=NOTIFY_TIMEOUT)
                 return True
             else:
                 return False  # notify-send not available
@@ -136,6 +142,9 @@ def send_notification(title: str, message: str, sound: bool = False) -> bool:
         else:
             return False  # Unsupported platform
 
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Notification command timed out after {NOTIFY_TIMEOUT}s: {e.cmd}")
+        return False
     except subprocess.CalledProcessError as e:
         # Include stderr/stdout for debugging
         stderr = e.stderr.decode() if e.stderr else "no stderr"

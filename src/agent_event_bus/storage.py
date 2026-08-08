@@ -1,5 +1,6 @@
 """SQLite storage backend for event bus persistence."""
 
+import json
 import logging
 import os
 import shutil
@@ -15,7 +16,7 @@ logger = logging.getLogger("agent-event-bus")
 
 # Schema version for migrations
 # Increment this when adding new migrations
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Migration function type: takes a connection, returns nothing
 MigrationFunc = Callable[[sqlite3.Connection], None]
@@ -121,6 +122,25 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
     """)
 
 
+# Migration for structured payload fields (RFC #121)
+@migration(4, "structured_payload_fields")
+def migrate_v4(conn: sqlite3.Connection) -> None:
+    """Add correlation_id and payload_meta columns to events.
+
+    correlation_id gets its own indexed column so request/response threading
+    (#107, #97) can be filtered efficiently. The remaining optional structured
+    fields (title, tags, signal_level) share a single JSON payload_meta column.
+    """
+    cursor = conn.execute("PRAGMA table_info(events)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    if "correlation_id" not in existing_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN correlation_id TEXT")
+    if "payload_meta" not in existing_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN payload_meta TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id)")
+
+
 # Register datetime adapters/converters (required for Python 3.12+)
 # See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
 
@@ -186,6 +206,8 @@ class Event:
     session_id: str
     timestamp: datetime
     channel: str = "all"  # Target channel for the event
+    correlation_id: str | None = None  # Threads a request to its response
+    meta: dict | None = None  # Optional structured fields: title, tags, signal_level
 
 
 @dataclass
@@ -213,6 +235,12 @@ OLD_CONTRIB_DB_PATH = Path.home() / ".claude" / "contrib" / "event-bus" / "data.
 # in list_sessions()
 SESSION_TIMEOUT = 86400  # 24 hours
 
+# How long a connection waits on a locked database before giving up.
+# Concurrent agents publish and poll simultaneously (issue #112); without an
+# explicit busy_timeout, writers under contention fail fast with
+# "database is locked" instead of queueing briefly.
+BUSY_TIMEOUT_MS = 5000
+
 
 class SQLiteStorage:
     """SQLite-backed storage for sessions and events."""
@@ -237,6 +265,11 @@ class SQLiteStorage:
 
         Old: ~/.claude/event-bus.db or ~/.claude/contrib/event-bus/data.db
         New: ~/.claude/contrib/agent-event-bus/data.db
+
+        Moving only data.db is safe here ONLY because the old paths predate
+        WAL mode (single-file databases). Do not reuse this pattern for a
+        WAL-era path: data.db-wal / data.db-shm are part of the database and
+        would be left behind.
         """
         if self.db_path.exists():
             return  # Already at new location, nothing to do
@@ -263,6 +296,17 @@ class SQLiteStorage:
         )
         conn.row_factory = sqlite3.Row
         try:
+            # WAL lets concurrent readers proceed while a writer holds the
+            # lock, which is the norm when several agents poll and publish at
+            # once (issue #112). journal_mode is persistent per-database but
+            # cheap to re-assert; busy_timeout is per-connection and must be
+            # set each time - and set FIRST, so the one-time WAL conversion
+            # of a legacy DB queues briefly under contention instead of
+            # failing fast with SQLITE_BUSY. Inside the try so a PRAGMA
+            # failure (e.g. WAL on a network filesystem) still closes the
+            # connection.
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA journal_mode=WAL")
             yield conn
             conn.commit()
         finally:
@@ -348,7 +392,9 @@ class SQLiteStorage:
                     payload TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     timestamp TIMESTAMP NOT NULL,
-                    channel TEXT NOT NULL DEFAULT 'all'
+                    channel TEXT NOT NULL DEFAULT 'all',
+                    correlation_id TEXT,
+                    payload_meta TEXT
                 )
             """)
             # Add channel column if upgrading from older schema
@@ -360,6 +406,8 @@ class SQLiteStorage:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)
             """)
+            # idx_events_correlation is created by migration v4, which runs for
+            # fresh installs too (version 0 -> SCHEMA_VERSION)
             # Index for efficient session ordering by activity
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat)
@@ -540,17 +588,33 @@ class SQLiteStorage:
     # Event operations
 
     def add_event(
-        self, event_type: str, payload: str, session_id: str, channel: str = "all"
+        self,
+        event_type: str,
+        payload: str,
+        session_id: str,
+        channel: str = "all",
+        correlation_id: str | None = None,
+        meta: dict | None = None,
     ) -> Event:
         """Add a new event and return it with assigned ID."""
         now = datetime.now()
+        meta = meta or None  # Normalize empty dict to None
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO events (event_type, payload, session_id, timestamp, channel)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO events
+                (event_type, payload, session_id, timestamp, channel, correlation_id, payload_meta)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (event_type, payload, session_id, now, channel),
+                (
+                    event_type,
+                    payload,
+                    session_id,
+                    now,
+                    channel,
+                    correlation_id,
+                    json.dumps(meta) if meta else None,
+                ),
             )
             event_id = cursor.lastrowid
 
@@ -561,7 +625,29 @@ class SQLiteStorage:
                 session_id=session_id,
                 timestamp=now,
                 channel=channel,
+                correlation_id=correlation_id,
+                meta=meta,
             )
+
+    def _row_to_event(self, row: sqlite3.Row) -> Event:
+        """Convert a database row to an Event object."""
+        keys = row.keys()
+        meta = None
+        if "payload_meta" in keys and row["payload_meta"]:
+            try:
+                meta = json.loads(row["payload_meta"])
+            except (json.JSONDecodeError, TypeError):
+                meta = None  # Corrupt meta is dropped, never fatal
+        return Event(
+            id=row["id"],
+            event_type=row["event_type"],
+            payload=row["payload"],
+            session_id=row["session_id"],
+            timestamp=row["timestamp"],
+            channel=row["channel"] if "channel" in keys else "all",
+            correlation_id=row["correlation_id"] if "correlation_id" in keys else None,
+            meta=meta,
+        )
 
     def get_events(
         self,
@@ -570,7 +656,8 @@ class SQLiteStorage:
         channels: list[str] | None = None,
         order: Literal["asc", "desc"] = "desc",
         event_types: list[str] | None = None,
-    ) -> tuple[list[Event], str | None]:
+        correlation_id: str | None = None,
+    ) -> tuple[list[Event], str | None, bool]:
         """Get events with cursor-based pagination.
 
         Args:
@@ -579,10 +666,16 @@ class SQLiteStorage:
             channels: Optional list of channels to filter by (None = all events).
             order: "desc" (newest first, default) or "asc" (oldest first).
             event_types: Optional list of event types to filter by (None = all types).
+            correlation_id: Optional correlation thread to filter by (None = all).
 
         Returns:
-            Tuple of (events, next_cursor). Use next_cursor for subsequent calls.
-            next_cursor is the cursor value if there are events, None otherwise.
+            Tuple of (events, next_cursor, has_more). next_cursor is the batch
+            high-water mark (MAX id) in both orders. has_more=True means the
+            window matched at least `limit` events. With order="asc", keep
+            feeding next_cursor back to drain the backlog. With order="desc"
+            the batch is the NEWEST slice of the window, so older backlog
+            events are NOT reachable via next_cursor - drain with "asc" if you
+            must not miss events.
         """
         with self._connect() as conn:
             effective_order = "DESC" if order == "desc" else "ASC"
@@ -622,6 +715,14 @@ class SQLiteStorage:
                     where_clause = f"WHERE {type_filter}"
                 params_base = (*params_base, *event_types)
 
+            if correlation_id:
+                corr_filter = "correlation_id = ?"
+                if where_clause:
+                    where_clause += f" AND {corr_filter}"
+                else:
+                    where_clause = f"WHERE {corr_filter}"
+                params_base = (*params_base, correlation_id)
+
             params = (*params_base, limit)
 
             query = f"""
@@ -632,30 +733,25 @@ class SQLiteStorage:
             """
             rows = conn.execute(query, params).fetchall()
 
-            events = [
-                Event(
-                    id=row["id"],
-                    event_type=row["event_type"],
-                    payload=row["payload"],
-                    session_id=row["session_id"],
-                    timestamp=row["timestamp"],
-                    channel=row["channel"] if "channel" in row.keys() else "all",
-                )
-                for row in rows
-            ]
+            events = [self._row_to_event(row) for row in rows]
 
-            # Compute next_cursor from the events based on order
-            # For DESC: next_cursor is the MIN id (oldest in this batch)
-            # For ASC: next_cursor is the MAX id (newest in this batch)
+            # next_cursor is the high-water mark (MAX id) regardless of order.
+            # The query filters `id > cursor`, so feeding next_cursor back
+            # only ever returns events newer than this batch. (Returning MIN
+            # for desc - the old behavior - re-served the same newest events
+            # on every subsequent call.)
             if events:
-                if order == "desc":
-                    next_cursor = str(min(e.id for e in events))
-                else:
-                    next_cursor = str(max(e.id for e in events))
+                next_cursor = str(max(e.id for e in events))
             else:
                 next_cursor = cursor  # No new events, keep same cursor
 
-            return events, next_cursor
+            # A full page means the window may hold more than `limit` events
+            # (exactly-limit gives a false positive; one extra empty poll).
+            # limit=0 must not report more: its empty page never advances the
+            # cursor, so a keep-polling-while-has_more loop would spin forever.
+            has_more = limit > 0 and len(events) == limit
+
+            return events, next_cursor, has_more
 
     def get_cursor(self) -> str | None:
         """Get a cursor pointing to the most recent event.

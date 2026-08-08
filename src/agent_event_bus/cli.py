@@ -7,10 +7,16 @@ Usage:
     agent-event-bus-cli sessions
     agent-event-bus-cli channels
     agent-event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
+                         [--title TITLE] [--tags T1,T2] [--correlation-id ID]
+                         [--signal-level lifecycle|info|actionable]
     agent-event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--include T1,T2]
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
-                         [--channel CHANNEL] [--resume] [--peek]
+                         [--channel CHANNEL] [--resume] [--peek] [--correlation-id ID]
+                         [--min-level lifecycle|info|actionable]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
+    agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
+    agent-event-bus-cli webhook list [--all]
+    agent-event-bus-cli webhook unregister WEBHOOK_ID
 
 Examples:
     # Register a session
@@ -50,6 +56,13 @@ Examples:
     # Filter by event type
     agent-event-bus-cli events --include task_completed,ci_completed
     agent-event-bus-cli events --include gotcha_discovered,pattern_found --exclude session_registered
+
+    # Drop lifecycle noise server-side (lifecycle < info < actionable)
+    agent-event-bus-cli events --min-level info
+
+    # Thread a request to its responses with a correlation id
+    agent-event-bus-cli publish --type task_request --payload "Review PR #42?" --correlation-id review-42
+    agent-event-bus-cli events --correlation-id review-42 --order asc
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -230,6 +243,15 @@ def cmd_publish(args):
     session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
     if session_id:
         arguments["session_id"] = session_id
+    # Optional structured payload fields (RFC #121)
+    if args.title:
+        arguments["title"] = args.title
+    if args.tags:
+        arguments["tags"] = [t.strip() for t in args.tags.split(",")]
+    if args.correlation_id:
+        arguments["correlation_id"] = args.correlation_id
+    if args.signal_level:
+        arguments["signal_level"] = args.signal_level
 
     result = call_tool("publish_event", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
@@ -237,8 +259,11 @@ def cmd_publish(args):
 
 def cmd_events(args):
     """Get recent events."""
-    # Validate --resume requires --session-id
-    if args.resume and not args.session_id:
+    # Use explicit --session-id, fall back to env var (matches cmd_publish)
+    session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
+
+    # Validate --resume requires a session id (flag or env var)
+    if args.resume and not session_id:
         print("Error: --resume requires --session-id", file=sys.stderr)
         sys.exit(1)
 
@@ -248,16 +273,20 @@ def cmd_events(args):
         arguments["cursor"] = cursor
     if args.limit is not None:
         arguments["limit"] = args.limit
-    if args.session_id:
-        arguments["session_id"] = args.session_id
+    if session_id:
+        arguments["session_id"] = session_id
     if args.channel:
         arguments["channel"] = args.channel
     if args.resume:
         arguments["resume"] = True
-    if getattr(args, "peek", False):
+    if args.peek:
         arguments["peek"] = True
     if args.include:
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
+    if args.correlation_id:
+        arguments["correlation_id"] = args.correlation_id
+    if args.min_level:
+        arguments["min_level"] = args.min_level
 
     result = call_tool(
         "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
@@ -271,9 +300,10 @@ def cmd_events(args):
             print(f"Error: {result['error']}", file=sys.stderr)
         sys.exit(1)
 
-    # Result is now a dict with "events" and "next_cursor"
+    # Result is now a dict with "events", "next_cursor", and "has_more"
     events = result.get("events", [])
     next_cursor = result.get("next_cursor")
+    has_more = result.get("has_more", False)
 
     # Apply --exclude filter (client-side for flexibility)
     if args.exclude:
@@ -282,17 +312,34 @@ def cmd_events(args):
 
     # Output format
     if args.json:
-        output = {"events": events, "next_cursor": next_cursor}
+        output = {"events": events, "next_cursor": next_cursor, "has_more": has_more}
         print(json.dumps(output))
     else:
         if not events:
             print("No events")
-            return
         for e in events:
-            print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
+            header = f"[{e['id']}] {e['event_type']} ({e['channel']})"
+            if e.get("signal_level"):
+                header += f" [{e['signal_level']}]"
+            print(header)
+            if e.get("title"):
+                print(f"    title: {e['title']}")
             print(f"    {e['payload']}")
-            print(f"    from: {e['session_id']} at {e['timestamp']}")
+            from_line = f"    from: {e['session_id']} at {e['timestamp']}"
+            if e.get("correlation_id"):
+                from_line += f" corr:{e['correlation_id']}"
+            if e.get("tags"):
+                from_line += f" tags:{','.join(e['tags'])}"
+            print(from_line)
             print()
+        if has_more:
+            # Without this hint a large backlog gets silently truncated on
+            # screen; the actionable next step depends on the order
+            if args.order == "asc":
+                hint = f"More events available; re-poll with --cursor {next_cursor}."
+            else:
+                hint = "More events available; use --order asc with --cursor to drain the backlog."
+            print(hint, file=sys.stderr)
 
 
 def cmd_notify(args):
@@ -314,7 +361,11 @@ def cmd_notify(args):
 
 def cmd_webhook_register(args):
     """Register a webhook."""
-    arguments = {"url": args.url}
+    # args.webhook_url is the endpoint to register; args.url stays the bus URL.
+    # These must not share an argparse dest: the subparser's value would
+    # overwrite the global --url and the MCP call would be POSTed to the
+    # webhook target instead of the bus.
+    arguments = {"url": args.webhook_url}
     if args.channel:
         arguments["channel"] = args.channel
     if args.event_types:
@@ -322,7 +373,7 @@ def cmd_webhook_register(args):
     if args.secret:
         arguments["secret"] = args.secret
 
-    result = call_tool("register_webhook", arguments, url=args.bus_url, debug=args.debug)
+    result = call_tool("register_webhook", arguments, url=args.url, debug=args.debug)
     print(json.dumps(result, indent=2))
     if "webhook_id" in result:
         print(f"\nWebhook registered: #{result['webhook_id']}", file=sys.stderr)
@@ -331,7 +382,7 @@ def cmd_webhook_register(args):
 def cmd_webhook_list(args):
     """List registered webhooks."""
     arguments = {"active_only": not args.all}
-    result = call_tool("list_webhooks", arguments, url=args.bus_url, debug=args.debug)
+    result = call_tool("list_webhooks", arguments, url=args.url, debug=args.debug)
 
     if not result:
         print("No webhooks registered")
@@ -356,7 +407,7 @@ def cmd_webhook_unregister(args):
     result = call_tool(
         "unregister_webhook",
         {"webhook_id": args.webhook_id},
-        url=args.bus_url,
+        url=args.url,
         debug=args.debug,
     )
     if result.get("success"):
@@ -418,12 +469,23 @@ def main():
     p_publish.add_argument(
         "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
     )
+    p_publish.add_argument("--title", help="Optional short headline for the payload")
+    p_publish.add_argument("--tags", help="Comma-separated tags for downstream filtering")
+    p_publish.add_argument("--correlation-id", help="Thread ID linking a request to its response")
+    p_publish.add_argument(
+        "--signal-level",
+        choices=["lifecycle", "info", "actionable"],
+        help="Signal level override (default: derived from event type)",
+    )
     p_publish.set_defaults(func=cmd_publish)
 
     # events
     p_events = subparsers.add_parser("events", help="Get recent events")
     p_events.add_argument("--cursor", help="Cursor from previous call (for pagination)")
-    p_events.add_argument("--session-id", help="Your session ID (for cursor tracking)")
+    p_events.add_argument(
+        "--session-id",
+        help="Your session ID for cursor tracking (default: $AGENT_EVENT_BUS_SESSION_ID)",
+    )
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
         "--exclude",
@@ -448,7 +510,8 @@ def main():
     )
     p_events.add_argument(
         "--channel",
-        help="Filter to a specific channel (e.g., 'repo:my-project', 'all')",
+        help="Filter to a specific channel (e.g., 'repo:my-project', 'all') "
+        "(non-consuming: does not advance the session cursor)",
     )
     p_events.add_argument(
         "--resume",
@@ -462,7 +525,18 @@ def main():
     )
     p_events.add_argument(
         "--include",
-        help="Comma-separated event types to include (e.g., task_completed,ci_completed)",
+        help="Comma-separated event types to include (e.g., task_completed,ci_completed) "
+        "(non-consuming: does not advance the session cursor)",
+    )
+    p_events.add_argument(
+        "--correlation-id",
+        help="Filter to one correlation thread "
+        "(non-consuming: does not advance the session cursor)",
+    )
+    p_events.add_argument(
+        "--min-level",
+        choices=["lifecycle", "info", "actionable"],
+        help="Drop events below this signal level (server-side; replaces client denylists)",
     )
     p_events.set_defaults(func=cmd_events)
 
@@ -479,23 +553,27 @@ def main():
 
     # webhook register
     p_wh_register = webhook_subparsers.add_parser("register", help="Register a webhook")
-    p_wh_register.add_argument("--url", required=True, help="Webhook URL to POST events to")
+    # dest must differ from the global --url (bus address) or argparse
+    # overwrites it with the webhook target
+    p_wh_register.add_argument(
+        "--url", dest="webhook_url", required=True, help="Webhook URL to POST events to"
+    )
     p_wh_register.add_argument(
         "--channel", help="Filter to channel (supports prefix, e.g., 'session:')"
     )
     p_wh_register.add_argument("--event-types", help="Comma-separated event types to filter")
     p_wh_register.add_argument("--secret", help="Shared secret for HMAC signing")
-    p_wh_register.set_defaults(func=cmd_webhook_register, bus_url=None)
+    p_wh_register.set_defaults(func=cmd_webhook_register)
 
     # webhook list
     p_wh_list = webhook_subparsers.add_parser("list", help="List webhooks")
     p_wh_list.add_argument("--all", action="store_true", help="Include inactive webhooks")
-    p_wh_list.set_defaults(func=cmd_webhook_list, bus_url=None)
+    p_wh_list.set_defaults(func=cmd_webhook_list)
 
     # webhook unregister
     p_wh_unregister = webhook_subparsers.add_parser("unregister", help="Remove a webhook")
     p_wh_unregister.add_argument("webhook_id", type=int, help="Webhook ID to remove")
-    p_wh_unregister.set_defaults(func=cmd_webhook_unregister, bus_url=None)
+    p_wh_unregister.set_defaults(func=cmd_webhook_unregister)
 
     args = parser.parse_args()
 
@@ -509,8 +587,6 @@ def main():
         if args.webhook_command is None:
             p_webhook.print_help()
             sys.exit(1)
-        # Pass the main URL to webhook subcommands
-        args.bus_url = args.url
 
     args.func(args)
 

@@ -16,8 +16,8 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 | `register_session(name, client_id?)` | Register yourself, get session_id + cursor |
 | `list_sessions()` | See active sessions |
 | `list_channels()` | See active channels |
-| `publish_event(type, payload, channel?)` | Send event |
-| `get_events(session_id?, resume?, order?, event_types?)` | Poll for events |
+| `publish_event(type, payload, channel?, correlation_id?, ...)` | Send event |
+| `get_events(session_id?, resume?, order?, event_types?, min_level?)` | Poll for events |
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
 | `register_webhook(url, channel?, event_types?, secret?)` | Register HTTP endpoint for push notifications |
@@ -100,12 +100,54 @@ Useful for focused polling (e.g., only discoveries):
 get_events(event_types=["gotcha_discovered", "pattern_found", "improvement_suggested"])
 ```
 
+Narrowing filters (`channel`, `event_types`, `correlation_id`) are
+**non-consuming**: they never advance your session cursor, so events that
+didn't match your filter stay unread for the next normal poll. (`min_level`
+is the exception - noise it hides still counts as seen.)
+
+The flip side: a filtered poll is a *pure read* - with `resume=True` it
+returns the same matching events on every call, forever. And on a session
+that has never polled unfiltered (no saved cursor yet), a narrowed resume
+returns nothing at all: the read starts from the tip. Don't build a
+notification loop on `--include ... --resume`. To make progress, page
+manually with `cursor`/`next_cursor`, or consume unfiltered and narrow with
+`min_level` (which advances the cursor) or client-side `--exclude`.
+
+### Filter by Signal Level
+
+Every event carries a server-derived `signal_level`, so consumers don't need
+to maintain their own denylists of noisy event types:
+
+| Level | Meaning | Examples |
+|-------|---------|----------|
+| `lifecycle` | Registration/watching churn | `session_registered`, `ci_watching`, `task_started` |
+| `info` | Ambient broadcasts worth seeing | `gotcha_discovered`, `pattern_found` (and any unlisted type) |
+| `actionable` | Aimed at someone | `help_needed`, `blocker_found`, `ci_failed`, any DM (`session:` channel) |
+
+```
+get_events(min_level="info")        # drop lifecycle churn
+get_events(min_level="actionable")  # only things aimed at someone
+```
+CLI: `agent-event-bus-cli events --min-level info`
+
+Publishers can override the derived level with `signal_level` on
+`publish_event`. Events filtered out by `min_level` still advance your
+session cursor - they count as seen.
+
 ### Manual Cursor (if needed)
 ```
 get_events(cursor="42", order="asc")
-→ {events: [...], next_cursor: "55"}
+→ {events: [...], next_cursor: "55", has_more: false}
 ```
 Pass `next_cursor` to subsequent calls. But `resume=True` is simpler.
+`next_cursor` is always the newest event ID in the batch (regardless of
+`order`), so feeding it back never returns the same event twice.
+
+`has_more: true` means the batch filled `limit` and the window may hold
+more. With `order="asc"`, keep feeding `next_cursor` back to drain the
+backlog. With `order="desc"` the page is the *newest* slice, so older
+backlog events are skipped by the next cursor call — use `order="asc"`
+when you must not miss events.
 
 ### Peeking (non-consuming reads)
 `peek=True` reads pending events **without advancing the session cursor**, so the
@@ -121,6 +163,41 @@ get_events(session_id=session_id, resume=True, peek=True)
 get_events(session_id=session_id, resume=True, order="asc")
 ```
 CLI: `agent-event-bus-cli events --session-id ID --resume --peek`
+
+## Structured Payload Fields
+
+`payload` stays a free-form string, but `publish_event` accepts optional
+structured fields (all additive, all backward-compatible):
+
+| Field | Purpose |
+|-------|---------|
+| `title` | Short headline so consumers can scan without parsing the payload |
+| `tags` | List of strings for downstream filtering/analytics |
+| `correlation_id` | Thread ID linking a request to its response(s) |
+| `signal_level` | Override the derived level: `lifecycle`, `info`, `actionable` |
+
+These come back on `get_events` results (`correlation_id` and
+`signal_level` always; `title`/`tags` when present) and in webhook payloads.
+
+### Request/response threading
+```
+publish_event("task_request", "Review PR #42?", correlation_id="review-42",
+              channel=f"session:{target_id}")
+
+# The responder echoes the correlation_id:
+publish_event("task_response", "LGTM, one nit inline", correlation_id="review-42")
+
+# Either side reads the whole thread:
+get_events(correlation_id="review-42", order="asc")
+```
+CLI: `agent-event-bus-cli events --correlation-id review-42`
+
+### Link, don't inline
+
+The bus is for coordination signals, not artifact transfer. If a payload is
+more than a couple of paragraphs, store the artifact elsewhere (a memory
+file, an issue, a note) and publish a `title` + summary + link instead.
+This is a guideline, not an enforced cap.
 
 ## Common Patterns
 
@@ -157,6 +234,15 @@ For multi-machine setups via Tailscale:
 
 See `docs/TAILSCALE_SETUP.md` for full setup instructions.
 
+## Health Check
+
+`GET /health` answers `{"status": "ok"}` without touching the MCP handler or
+storage - use it for monitoring. It sits behind the same auth as everything
+else: reachable from localhost, or remotely via `tailscale serve` (which
+injects the identity headers). If `/health` responds but tool calls hang,
+the worker pool is saturated; if `/health` itself hangs, the event loop is
+blocked.
+
 ## Webhooks (Push Notifications)
 
 Instead of polling, you can register HTTP endpoints to receive events via POST.
@@ -181,9 +267,15 @@ When events match, your endpoint receives a POST with:
     "payload": "PR #42 merged",
     "session_id": "abc123",
     "timestamp": "2026-01-31T12:00:00",
-    "channel": "repo:my-project"
+    "channel": "repo:my-project",
+    "correlation_id": null,
+    "signal_level": "info"
 }
 ```
+`correlation_id` and `signal_level` are always present - `signal_level` is
+server-derived, matching what `get_events` reports for the same event, so
+webhook consumers can filter on it. `title` and `tags` appear only when the
+event carries them.
 
 ### HMAC Signature Verification
 If you provide a `secret`, requests include `X-Event-Bus-Signature` header:
@@ -230,24 +322,27 @@ Webhooks retry up to 2 times with exponential backoff if the endpoint returns 4x
 2. **Use resume=True for polling** - Simplest incremental approach
 3. **Include session_id in get_events** - Enables cursor tracking + heartbeat
 4. **Use meaningful channels** - `repo:` or `session:` for context
-5. **Keep payloads short** - Coordination, not data transfer
-6. **Unregister on exit** - Keeps session list clean
+5. **Keep payloads lean** - Big artifacts get a `title` + summary + link ("link, don't inline")
+6. **Use correlation_id for request/response** - Don't invent per-protocol threading
+7. **Filter with min_level** - Instead of maintaining event-type denylists
+8. **Unregister on exit** - Keeps session list clean
 
 ## Event Type Conventions
 
 Use consistent event types for discoverability:
 
-| Event Type | When to Use |
-|------------|-------------|
-| `task_started` | Work begun on issue/task |
-| `task_completed` | Significant task finished |
-| `ci_completed` | CI finished (pass or fail) |
-| `help_needed` | Request for assistance |
-| `gotcha_discovered` | Non-obvious issue found |
-| `pattern_found` | Useful pattern discovered |
-| `test_flaky` | Flaky test identified |
-| `blocker_found` | Blocking issue discovered |
-| `error_broadcast` | Rate limits, outages |
+| Event Type | When to Use | Signal Level |
+|------------|-------------|--------------|
+| `task_started` | Work begun on issue/task | lifecycle |
+| `task_completed` | Significant task finished | info |
+| `ci_completed` | CI finished (pass or fail) | info |
+| `ci_failed` | CI failure needing attention | actionable |
+| `help_needed` | Request for assistance | actionable |
+| `gotcha_discovered` | Non-obvious issue found | info |
+| `pattern_found` | Useful pattern discovered | info |
+| `test_flaky` | Flaky test identified | info |
+| `blocker_found` | Blocking issue discovered | actionable |
+| `error_broadcast` | Rate limits, outages | actionable |
 
 **Naming**: Use `snake_case`, be specific (`ci_completed` not `done`), include context in payload.
 

@@ -43,9 +43,15 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 - `make install-server` - Idempotent, restarts service automatically
 - Schema migrations via `@migration` decorator (increment `SCHEMA_VERSION` when adding)
 
+### WAL mode:
+The database runs in WAL mode: `data.db-wal` and `data.db-shm` are **part of
+the database**. Never copy or move `data.db` alone (a plain `cp` can silently
+miss recently committed events sitting in the WAL) - use `sqlite3 .backup`,
+which is WAL-aware and safe against a running server.
+
 ### Before schema changes:
 ```bash
-cp ~/.claude/contrib/agent-event-bus/data.db ~/.claude/contrib/agent-event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)
+sqlite3 ~/.claude/contrib/agent-event-bus/data.db ".backup $HOME/.claude/contrib/agent-event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)"
 ```
 
 ## Commands
@@ -87,9 +93,11 @@ src/agent_event_bus/
 
 ## MCP Tools
 
-`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`
+`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`, `register_webhook`, `list_webhooks`, `unregister_webhook`
 
 **Usage guide**: `agent-event-bus://guide` resource. Keep it updated when changing APIs.
+
+**Concurrency invariant**: FastMCP runs tool functions on the server's event loop, so every tool is an async wrapper that offloads its sync `*_impl` body via `_run_sync` (worker thread). Never put blocking work (SQLite, subprocess) directly in a tool function - it freezes the whole server (#112). `GET /health` bypasses MCP for liveness checks.
 
 ### Tool Docstrings
 
@@ -143,8 +151,12 @@ CLI and MCP expose the same functionality:
 - **Session cleanup**: 24-hour timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` refresh heartbeat
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
+- **Non-consuming narrowed reads**: `channel`/`event_types`/`correlation_id` filters never advance the session cursor (their SQL-filtered max would mark non-matching events as seen); `min_level` filters post-bookkeeping and does
+- **High-water cursors**: `next_cursor` is the batch MAX id in both orders; feeding it back never re-serves events
 - **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-trex")
 - **Client deduplication**: `(machine, client_id)` enables session resumption
+- **Structured payload (RFC #121)**: `payload` stays free-form; optional `title`/`tags`/`correlation_id`/`signal_level` ride alongside (soft validation - warn, never reject)
+- **Signal levels (#129)**: lifecycle < info < actionable, derived server-side from event_type (DMs always actionable; explicit `signal_level` wins); filter with `min_level`
 
 ## Operations
 

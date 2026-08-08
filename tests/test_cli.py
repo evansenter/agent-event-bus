@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_event_bus import cli
-from conftest import make_events_args
+from conftest import make_events_args, make_publish_args
 
 
 class TestCallTool:
@@ -241,14 +241,12 @@ class TestCmdPublish:
         """Test basic publish."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event", payload="hello", channel=None, session_id=None, url=None, debug=False
-        )
+        args = make_publish_args()
         cli.cmd_publish(args)
 
         mock_call.assert_called_once_with(
             "publish_event",
-            {"event_type": "test_event", "payload": "hello"},
+            {"event_type": "test_event", "payload": "hello", "channel": "all"},
             url=None,
             debug=False,
         )
@@ -258,14 +256,7 @@ class TestCmdPublish:
         """Test publish with channel."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event",
-            payload="hello",
-            channel="repo:my-repo",
-            session_id="abc123",
-            url=None,
-            debug=False,
-        )
+        args = make_publish_args(channel="repo:my-repo", session_id="abc123")
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -278,9 +269,7 @@ class TestCmdPublish:
         """Test publish uses session_id from env var when not provided."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event", payload="hello", channel=None, session_id=None, url=None, debug=False
-        )
+        args = make_publish_args()
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -292,14 +281,7 @@ class TestCmdPublish:
         """Test explicit --session-id overrides env var."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event",
-            payload="hello",
-            channel=None,
-            session_id="explicit-123",
-            url=None,
-            debug=False,
-        )
+        args = make_publish_args(session_id="explicit-123")
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -831,3 +813,274 @@ class TestCmdEventsWithChannel:
 
                 args = mock_cmd.call_args[0][0]
                 assert args.channel == "repo:my-repo"
+
+
+class TestWebhookCommands:
+    """Tests for CLI webhook subcommands.
+
+    Regression coverage: the webhook register subparser's --url (webhook
+    target) used to share an argparse dest with the global --url (bus
+    address), so the MCP registration call was POSTed to the webhook target
+    itself and never reached the bus.
+    """
+
+    def _run_main(self, argv, monkeypatch):
+        """Run cli.main() with argv, capturing call_tool invocations."""
+        import sys as _sys
+
+        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
+        calls = []
+
+        def fake_call_tool(tool_name, arguments, url=None, timeout_ms=None, debug=False):
+            calls.append({"tool": tool_name, "arguments": arguments, "posted_to": url})
+            if tool_name == "list_webhooks":
+                return []
+            return {"webhook_id": 1, "success": True}
+
+        with patch.object(_sys, "argv", ["agent-event-bus-cli", *argv]):
+            with patch.object(cli, "call_tool", fake_call_tool):
+                cli.main()
+        return calls
+
+    def test_register_posts_to_bus_not_webhook_target(self, monkeypatch):
+        calls = self._run_main(
+            ["webhook", "register", "--url", "http://target.example/hook"], monkeypatch
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["tool"] == "register_webhook"
+        # The webhook target goes in the arguments...
+        assert calls[0]["arguments"]["url"] == "http://target.example/hook"
+        # ...and the MCP call itself goes to the bus, not the target
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_register_respects_global_bus_url(self, monkeypatch):
+        calls = self._run_main(
+            [
+                "--url",
+                "http://bus.example:9999/mcp",
+                "webhook",
+                "register",
+                "--url",
+                "http://target.example/hook",
+            ],
+            monkeypatch,
+        )
+
+        assert calls[0]["posted_to"] == "http://bus.example:9999/mcp"
+        assert calls[0]["arguments"]["url"] == "http://target.example/hook"
+
+    def test_register_passes_filters_and_secret(self, monkeypatch):
+        calls = self._run_main(
+            [
+                "webhook",
+                "register",
+                "--url",
+                "http://target.example/hook",
+                "--channel",
+                "repo:",
+                "--event-types",
+                "task_completed, ci_completed",
+                "--secret",
+                "shh",
+            ],
+            monkeypatch,
+        )
+
+        args = calls[0]["arguments"]
+        assert args["channel"] == "repo:"
+        assert args["event_types"] == ["task_completed", "ci_completed"]
+        assert args["secret"] == "shh"
+
+    def test_list_posts_to_bus(self, monkeypatch):
+        calls = self._run_main(["webhook", "list"], monkeypatch)
+
+        assert calls[0]["tool"] == "list_webhooks"
+        assert calls[0]["arguments"] == {"active_only": True}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_list_all_includes_inactive(self, monkeypatch):
+        calls = self._run_main(["webhook", "list", "--all"], monkeypatch)
+
+        assert calls[0]["arguments"] == {"active_only": False}
+
+    def test_unregister_posts_to_bus(self, monkeypatch):
+        calls = self._run_main(["webhook", "unregister", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "unregister_webhook"
+        assert calls[0]["arguments"] == {"webhook_id": 7}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+
+class TestCmdEventsPeek:
+    """CLI-level tests for events --peek (issue #131)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_peek_passes_through(self, mock_call):
+        mock_call.return_value = {"events": [], "next_cursor": None}
+        args = make_events_args(session_id="abc", resume=True, peek=True)
+
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["peek"] is True
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_peek_false_omitted(self, mock_call):
+        mock_call.return_value = {"events": [], "next_cursor": None}
+        args = make_events_args(peek=False)
+
+        cli.cmd_events(args)
+
+        call_args = mock_call.call_args[0][1]
+        assert "peek" not in call_args
+
+    def test_peek_flag_parses(self):
+        """--peek wires through argument parsing to cmd_events."""
+        import sys as _sys
+
+        with patch.object(_sys, "argv", ["cli", "events", "--peek"]):
+            with patch("agent_event_bus.cli.cmd_events") as mock_cmd:
+                cli.main()
+
+                args = mock_cmd.call_args[0][0]
+                assert args.peek is True
+
+
+class TestCmdEventsEnvAttribution:
+    """events falls back to $AGENT_EVENT_BUS_SESSION_ID like publish (#128)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_session_id_from_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args())
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["session_id"] == "env-session-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_explicit_session_id_overrides_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args(session_id="explicit-id"))
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["session_id"] == "explicit-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_no_env_no_flag_omits_session_id(self, mock_call, monkeypatch):
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args())
+
+        call_args = mock_call.call_args[0][1]
+        assert "session_id" not in call_args
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_resume_satisfied_by_env_session_id(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args(resume=True))
+
+        call_args = mock_call.call_args[0][1]
+        assert call_args["resume"] is True
+        assert call_args["session_id"] == "env-session-id"
+
+    def test_resume_still_errors_without_any_session_id(self, monkeypatch, capsys):
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+
+        with pytest.raises(SystemExit):
+            cli.cmd_events(make_events_args(resume=True))
+
+        assert "requires --session-id" in capsys.readouterr().err
+
+
+class TestCmdEventsHasMoreHint:
+    """Human-readable output must surface has_more (the default desc order
+    silently truncates a large backlog otherwise)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_hint_printed_when_more_available(self, mock_call, capsys):
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 1,
+                    "event_type": "note",
+                    "channel": "all",
+                    "payload": "p",
+                    "session_id": "s",
+                    "timestamp": "t",
+                }
+            ],
+            "next_cursor": "50",
+            "has_more": True,
+        }
+
+        cli.cmd_events(make_events_args())
+
+        captured = capsys.readouterr()
+        assert "More events available" in captured.err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_hint_with_empty_filtered_page(self, mock_call, capsys):
+        # Reachable with --min-level: a full page of lifecycle churn filters
+        # to zero events but has_more is true
+        mock_call.return_value = {"events": [], "next_cursor": "50", "has_more": True}
+
+        cli.cmd_events(make_events_args(min_level="actionable"))
+
+        captured = capsys.readouterr()
+        assert "No events" in captured.out
+        assert "More events available" in captured.err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_no_hint_without_more(self, mock_call, capsys):
+        mock_call.return_value = {"events": [], "next_cursor": None, "has_more": False}
+
+        cli.cmd_events(make_events_args())
+
+        assert capsys.readouterr().err == ""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_asc_hint_points_at_cursor(self, mock_call, capsys):
+        mock_call.return_value = {"events": [], "next_cursor": "50", "has_more": True}
+
+        cli.cmd_events(make_events_args(order="asc"))
+
+        err = capsys.readouterr().err
+        assert "More events available" in err
+        assert "--cursor 50" in err
+
+
+class TestCmdEventsStructuredDisplay:
+    @patch("agent_event_bus.cli.call_tool")
+    def test_signal_level_and_tags_shown(self, mock_call, capsys):
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 42,
+                    "event_type": "help_needed",
+                    "channel": "all",
+                    "payload": "p",
+                    "session_id": "s",
+                    "timestamp": "t",
+                    "signal_level": "actionable",
+                    "correlation_id": "rev-1",
+                    "tags": ["review", "urgent"],
+                }
+            ],
+            "next_cursor": "42",
+            "has_more": False,
+        }
+
+        cli.cmd_events(make_events_args())
+
+        out = capsys.readouterr().out
+        assert "[42] help_needed (all) [actionable]" in out
+        assert "corr:rev-1" in out
+        assert "tags:review,urgent" in out
