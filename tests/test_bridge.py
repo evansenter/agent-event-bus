@@ -1,5 +1,6 @@
 """Tests for the webhook-to-injection bridge (RFC #122 prototype)."""
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -362,6 +363,26 @@ class TestInjectorCooldown:
         # The cross-process drain lock exists alongside the spool
         assert (config.wake_dir / "t.lock").exists()
 
+    def test_spool_lock_contention_raises_after_deadline(self, config, monkeypatch):
+        """The flock acquire is bounded: a stuck drainer holding the lock
+        must produce an error (nothing is spooled yet, so the bus retry is
+        meaningful) - not park a threadpool worker forever."""
+        monkeypatch.setattr(bridge, "SPOOL_LOCK_ATTEMPTS", 3)
+        monkeypatch.setattr(bridge, "SPOOL_LOCK_RETRY_SECONDS", 0.01)
+        injector = Injector(config)
+        lock_file = config.wake_dir / "t.lock"
+
+        with lock_file.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)  # a stuck drainer
+            try:
+                with pytest.raises(OSError, match="Could not lock spool"):
+                    injector.deliver("t", make_event())
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+
+        # Nothing was written while the lock was contended
+        assert not (config.wake_dir / "t.jsonl").exists()
+
     def test_wake_dir_is_private(self, config):
         Injector(config).deliver("target-1", make_event())
         assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
@@ -547,6 +568,39 @@ class TestBusRegistration:
             with pytest.raises(SystemExit, match="no webhook_id"):
                 bridge.register_with_bus(config)
 
+    def test_non_dict_webhook_rows_are_skipped(self, tmp_path):
+        """A malformed list_webhooks element must not AttributeError out of
+        the dedupe loop - that would kill the registration thread with no
+        retry, unlike every other registration failure."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            if tool_name == "list_webhooks":
+                return ["garbage", None, 42]
+            return {"webhook_id": 5}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            assert bridge.register_with_bus(config) == 5
+
+    def test_registration_retries_on_unexpected_errors(self, tmp_path):
+        """Any surprise inside register_with_bus must degrade to
+        backoff-and-retry, not a dead thread and a deaf daemon."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        attempts = []
+
+        def flaky_register(cfg):
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise ValueError("unexpected shape")
+            return 42
+
+        state: dict = {}
+        with patch.object(bridge, "register_with_bus", flaky_register):
+            bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
+
+        assert state["webhook_id"] == 42
+        assert len(attempts) == 2
+
     def test_registration_retry_honors_shutdown(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         stop = threading.Event()
@@ -702,6 +756,14 @@ class TestHookUrlTopology:
         loopback, silently skipping the topology guard."""
         monkeypatch.setenv("AGENT_EVENT_BUS_URL", "bus.example:8080/mcp")
         with pytest.raises(SystemExit, match="http"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_hostless_bus_url_is_refused(self, monkeypatch):
+        """http:///mcp has a valid scheme but hostname None, which would
+        read as a *local* bus, skip the topology guard, and leave the
+        registration thread retrying an unroutable URL forever."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "http:///mcp")
+        with pytest.raises(SystemExit, match="bus URL"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 
     def test_schemeless_hook_url_is_refused(self, monkeypatch):

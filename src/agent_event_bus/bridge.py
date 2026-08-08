@@ -71,6 +71,15 @@ REGISTRATION_JOIN_TIMEOUT = 35.0
 # be checked, so bound what an unauthenticated peer can make us buffer
 MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
+# Bound the wait for the per-session spool flock. The drain contract keeps
+# the drainer's hold down to a couple of renames, so seconds of contention
+# means a stuck drainer (SIGSTOP, network mount) - and an unbounded block
+# here parks a threadpool worker per pending event until /hook starves.
+# Raising after the deadline is correct: nothing is durably stored yet, so
+# the bus retry is meaningful (unlike post-spool errors).
+SPOOL_LOCK_ATTEMPTS = 50
+SPOOL_LOCK_RETRY_SECONDS = 0.1
+
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
 
@@ -210,13 +219,25 @@ class Injector:
         # produce a write outside the wake dir
         if spool_file.resolve().parent != self.config.wake_dir.resolve():
             raise ValueError(f"Spool path escapes wake dir: {session_id!r}")
-        # flock a sibling lock file around the append: self._lock serializes
-        # OUR writers, but the drain hook is another process - without this,
-        # its rename could slip between our open and our flush and the line
-        # would land in a file the drainer already read (and will delete)
+        # flock a sibling lock file around the append: flock contends per
+        # open file description, so it serializes writers in this process and
+        # the drain hook (another process) alike - without it, the drainer's
+        # rename could slip between our open and our flush and the line would
+        # land in a file the drainer already read (and will delete)
         lock_file = self.config.wake_dir / f"{session_id}.lock"
         with lock_file.open("a") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            for _ in range(SPOOL_LOCK_ATTEMPTS):
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(SPOOL_LOCK_RETRY_SECONDS)
+            else:
+                raise OSError(
+                    f"Could not lock spool for {session_id} within "
+                    f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
+                    "(stuck drainer?)"
+                )
             try:
                 with spool_file.open("a") as f:
                     f.write(json.dumps(event) + "\n")
@@ -414,6 +435,10 @@ def register_with_bus(config: BridgeConfig) -> int:
     existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url)
     if isinstance(existing, list):
         for wh in existing:
+            # Guard the element shape too: an AttributeError here would
+            # escape register_with_retry and kill the registration thread
+            if not isinstance(wh, dict):
+                continue
             if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
                 call_tool(
                     "unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url
@@ -472,9 +497,12 @@ def register_with_retry(
         try:
             state["webhook_id"] = register_with_bus(config)
             return
-        except SystemExit as e:
+        # SystemExit is call_tool's failure shape; Exception covers anything
+        # unexpected inside register_with_bus - either way the thread must
+        # back off and retry, never die silently
+        except (SystemExit, Exception) as e:
             logger.warning(
-                f"Registration on {config.bus_url} failed ({e}); retrying in {delay:.0f}s"
+                f"Registration on {config.bus_url} failed ({e!r}); retrying in {delay:.0f}s"
             )
         if stop.wait(delay):
             return
@@ -585,11 +613,13 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Invalid wake dir {config.wake_dir} "
             "(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): must be an absolute path"
         )
-    # A scheme-less bus URL ("bus.example:8080/mcp") parses with no hostname
-    # and would read as loopback, skipping the topology guard below - catch
-    # the misconfiguration here instead of in a later connection error
-    if urllib.parse.urlsplit(config.bus_url).scheme not in ("http", "https"):
-        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http:// or https://")
+    # A scheme-less bus URL ("bus.example:8080/mcp") or hostless one
+    # ("http:///mcp") parses with no hostname and would read as loopback,
+    # skipping the topology guard below - catch the misconfiguration here
+    # instead of in a later connection error
+    parsed_bus = urllib.parse.urlsplit(config.bus_url)
+    if parsed_bus.scheme not in ("http", "https") or not parsed_bus.hostname:
+        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http(s)://host[:port]/path")
     # Same check for the hook URL - it is what BOTH topology guards below
     # read: a scheme-less value parses to hostname None, reads as loopback,
     # skips the guards, and registers a URL the bus can never POST to

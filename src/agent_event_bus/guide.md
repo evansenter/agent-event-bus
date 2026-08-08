@@ -335,22 +335,26 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
      without the lock a just-appended line could land in a file the drainer
-     already read).
-  2. Under the lock: if `<sid>.jsonl.draining` already exists, drain and
-     delete it first - a drain that died mid-protocol (hook timeout,
-     session exit, reboot) leaves one behind, and nothing else will ever
-     read it. Doing this under the lock keeps two overlapping drains from
-     clobbering each other's batch. Then `mv <sid>.jsonl
-     <sid>.jsonl.draining` and release the lock.
-  3. Drain the renamed file (outside the lock), then delete it.
+     already read). The bridge's acquire is bounded (~5s), so keep your
+     hold to the renames below - never drain while holding the lock.
+  2. Under the lock, claim a batch by rename (renames only, so the hold
+     stays short): any `<sid>.jsonl.draining.<pid>` whose pid is dead is an
+     orphan from a drain that died mid-protocol (hook timeout, session
+     exit, reboot) - rename each onto your own pid. A file whose pid is
+     alive belongs to a drainer still in step 3: leave it. Then
+     `mv <sid>.jsonl <sid>.jsonl.draining.$$` (if it exists) and release
+     the lock.
+  3. Outside the lock, drain the files you renamed, then delete them. You
+     only ever delete files carrying your own pid, so overlapping drains
+     can never destroy each other's batch.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Dedupe on `event_id` when
   acting: a delivery that spools but then errors is retried by the bus, and
-  a recovered `.draining` may overlap with what a dead drain already acted
-  on, so the same event can legitimately appear more than once. The wake
-  dir is created 0o700 (spool files carry full event payloads); pruning
-  spools and lock files for dead sessions is a follow-up.
+  a recovered orphan may overlap with what a dead drain already acted on,
+  so the same event can legitimately appear more than once. The wake dir is
+  created 0o700 (spool files carry full event payloads); pruning spools and
+  lock files for dead sessions is a follow-up.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool. A stale mapping
