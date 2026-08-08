@@ -1,8 +1,6 @@
 """Tests for the webhook-to-injection bridge (RFC #122 prototype)."""
 
 import fcntl
-import hashlib
-import hmac
 import json
 import threading
 import time
@@ -19,10 +17,14 @@ from agent_event_bus.bridge import (
     resolve_target_session,
     verify_signature,
 )
+from agent_event_bus.server import _compute_signature
 
 
 def sign(body: bytes, secret: str) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    # Built from the BUS's signing function, not a local copy: these are
+    # contract tests, and a bus-side change to the canonical form must
+    # fail them rather than leave real deliveries 401ing silently
+    return "sha256=" + _compute_signature(body, secret)
 
 
 def make_event(**overrides) -> dict:
@@ -827,6 +829,16 @@ class TestHookUrlTopology:
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_HOOK_URL"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 
+    def test_malformed_hook_port_is_refused(self, monkeypatch):
+        """A hook URL port outside 0-65535 raises ValueError out of
+        SplitResult.port - it must surface as a named config error, not a
+        bare traceback. Secret set so the exposure refusal doesn't fire
+        first (box.example is a non-loopback hook host)."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.example:99999/hook")
+        with pytest.raises(SystemExit, match="bad port"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
     def test_out_of_range_port_is_refused(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "99999")
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
@@ -924,10 +936,19 @@ class TestBindHost:
             with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
                 bridge.config_from_args(args)
 
-    def test_non_loopback_bind_with_secret_is_accepted(self, monkeypatch):
+    def test_non_loopback_bind_with_secret_is_accepted(self, monkeypatch, caplog):
+        """Accepted - but this is also the fourth quadrant (wide bind,
+        loopback hook URL): the bus POSTs to 127.0.0.1 where nothing
+        listens, so the warning must actually fire."""
+        import logging
+
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
-        config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "0.0.0.0"]))
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            config = bridge.config_from_args(
+                bridge.build_parser().parse_args(["--bind", "0.0.0.0"])
+            )
         assert bridge.bind_host(config) == "0.0.0.0"
+        assert any("0.0.0.0" in r.message and "127.0.0.1" in r.message for r in caplog.records)
 
     def test_loopback_bind_is_accepted_without_secret(self):
         config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "127.0.0.1"]))
