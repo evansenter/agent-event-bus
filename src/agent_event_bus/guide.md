@@ -331,16 +331,18 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
 - **spool**: every wake event is appended to
   `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to
   drain. This durable path is always on, in every backend. Drain contract:
-  1. If `<sid>.jsonl.draining` already exists, drain and delete it first - a
-     drain that died mid-protocol (hook timeout, session exit, reboot)
-     leaves one behind, and nothing else will ever read it.
-  2. Take an exclusive `flock` on `<sid>.lock`, `mv <sid>.jsonl
-     <sid>.jsonl.draining`, release the lock. The bridge holds the same
-     flock around every append, so the rename can't slip between the
+  1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
+     flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
      without the lock a just-appended line could land in a file the drainer
      already read).
-  3. Drain the renamed file, then delete it.
+  2. Under the lock: if `<sid>.jsonl.draining` already exists, drain and
+     delete it first - a drain that died mid-protocol (hook timeout,
+     session exit, reboot) leaves one behind, and nothing else will ever
+     read it. Doing this under the lock keeps two overlapping drains from
+     clobbering each other's batch. Then `mv <sid>.jsonl
+     <sid>.jsonl.draining` and release the lock.
+  3. Drain the renamed file (outside the lock), then delete it.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Dedupe on `event_id` when

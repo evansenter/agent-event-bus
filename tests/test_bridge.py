@@ -115,6 +115,12 @@ class TestTargetResolution:
         assert resolve_target_session(make_event(channel=f"session:{uuid}")) == uuid
         assert resolve_target_session(make_event(channel="session:brave_trex-2")) == "brave_trex-2"
 
+    def test_non_string_channel_has_no_target(self):
+        """A non-string channel inside an otherwise valid event must resolve
+        to no target, not raise .startswith into a 500."""
+        for channel in (123, True, ["session:x"], {"c": 1}, None):
+            assert resolve_target_session(make_event(channel=channel)) is None
+
 
 class TestPathSafety:
     """The session id comes verbatim off the wire (the event's channel string,
@@ -159,6 +165,11 @@ class TestHookFiltering:
 
     def test_untargeted_actionable_ignored(self, client):
         resp = client.post("/hook", content=json.dumps(make_event(channel="repo:myrepo")).encode())
+        assert resp.json() == {"status": "ignored", "reason": "no target session"}
+
+    def test_non_string_channel_ignored_not_500(self, client):
+        resp = client.post("/hook", content=json.dumps(make_event(channel=123)).encode())
+        assert resp.status_code == 200
         assert resp.json() == {"status": "ignored", "reason": "no target session"}
 
     def test_invalid_json_rejected(self, client):
@@ -699,6 +710,13 @@ class TestHookUrlTopology:
         and registers a URL the bus can never POST to (silently inert with
         /health reporting registered)."""
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "laptop.example:8082/hook")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_HOOK_URL"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_hostless_hook_url_is_refused(self, monkeypatch):
+        """A scheme with no host (http:///hook) also parses to hostname
+        None - same silent-inertness escape, different malformation."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http:///hook")
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_HOOK_URL"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 

@@ -61,9 +61,11 @@ DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wa
 # a hung tmux must not wedge the bridge
 TMUX_TIMEOUT = 5.0
 
-# Bound on joining the registration thread at shutdown: long enough for an
-# in-flight register call to commit, short enough not to hang exit
-REGISTRATION_JOIN_TIMEOUT = 10.0
+# Bound on joining the registration thread at shutdown. register_with_bus
+# makes up to three sequential call_tool requests (list, unregister stale,
+# register), each under the CLI's 10s timeout - so cover the worst-case
+# chain. A still-slower bus can leak a row; the startup dedupe reclaims it.
+REGISTRATION_JOIN_TIMEOUT = 35.0
 
 # Real bus payloads are a few KB; the body must be read before the HMAC can
 # be checked, so bound what an unauthenticated peer can make us buffer
@@ -120,8 +122,11 @@ def resolve_target_session(event: dict) -> str | None:
     events (help_needed on a repo channel, ...) have no single target and
     are left for normal polling.
     """
-    channel = event.get("channel") or ""
-    if not channel.startswith("session:"):
+    # channel is a field inside a wire-supplied object - a non-string value
+    # (123, true, a list) must resolve to no target, not raise .startswith
+    # into a 500 with bus retries behind it
+    channel = event.get("channel")
+    if not isinstance(channel, str) or not channel.startswith("session:"):
         return None
     target = channel.split(":", 1)[1]
     if not SESSION_ID_PATTERN.fullmatch(target):
@@ -153,14 +158,17 @@ class Injector:
         burn the window - the next event should retry (e.g. after a
         SessionStart hook repairs the pane mapping).
         """
+        # The per-session flock inside _spool serializes appends on its own
+        # (flock contends per open file description, in-process included),
+        # and it can block on an external drainer holding the drain lock -
+        # so it must NOT run under the global lock, or one stalled drain
+        # would stall every session's delivery
+        self._spool(session_id, event)
+
+        if self.config.backend != "tmux":
+            return "spool"
+
         with self._lock:
-            # Locked append: concurrent webhook deliveries would otherwise
-            # interleave buffered writes and tear a JSON line
-            self._spool(session_id, event)
-
-            if self.config.backend != "tmux":
-                return "spool"
-
             now = time.monotonic()
             # Housekeeping: entries past the cooldown can never gate a wake
             # again, and sessions are ephemeral - don't retain them forever
@@ -193,7 +201,8 @@ class Injector:
     def _spool(self, session_id: str, event: dict) -> None:
         """Always-on durable path: one JSON line per event, per session.
 
-        Callers must hold self._lock.
+        Serialized by the per-session flock below - against other threads in
+        this process and against the drain hook alike.
         """
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
         # Defense in depth behind resolve_target_session's charset check: a
@@ -584,13 +593,16 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # Same check for the hook URL - it is what BOTH topology guards below
     # read: a scheme-less value parses to hostname None, reads as loopback,
     # skips the guards, and registers a URL the bus can never POST to
-    if config.hook_url is not None and (
-        urllib.parse.urlsplit(config.hook_url).scheme not in ("http", "https")
-    ):
-        raise SystemExit(
-            f"Invalid hook URL {config.hook_url!r} "
-            "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): expected http:// or https://"
-        )
+    if config.hook_url is not None:
+        parsed_hook = urllib.parse.urlsplit(config.hook_url)
+        # Require a hostname too: "http:///hook" parses to hostname None,
+        # which reads as loopback and would skip every topology guard
+        if parsed_hook.scheme not in ("http", "https") or not parsed_hook.hostname:
+            raise SystemExit(
+                f"Invalid hook URL {config.hook_url!r} "
+                "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): "
+                "expected http(s)://host[:port]/path"
+            )
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
     # delivered - and every machine would claim the same URL string, so the
