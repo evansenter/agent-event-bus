@@ -747,7 +747,9 @@ class SQLiteStorage:
 
             # A full page means the window may hold more than `limit` events
             # (exactly-limit gives a false positive; one extra empty poll).
-            has_more = len(events) == limit
+            # limit=0 must not report more: its empty page never advances the
+            # cursor, so a keep-polling-while-has_more loop would spin forever.
+            has_more = limit > 0 and len(events) == limit
 
             return events, next_cursor, has_more
 

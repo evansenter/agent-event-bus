@@ -3,11 +3,11 @@
 migration."""
 
 import sqlite3
-from argparse import Namespace
 from datetime import datetime
 from unittest.mock import patch
 
 from agent_event_bus import cli, server
+from conftest import make_publish_args
 
 publish_event = server._publish_event_impl
 get_events = server._get_events_impl
@@ -204,17 +204,13 @@ class TestCLIStructuredFlags:
     @patch("agent_event_bus.cli.call_tool")
     def test_publish_passes_structured_fields(self, mock_call):
         mock_call.return_value = {"event_id": 1}
-        args = Namespace(
+        args = make_publish_args(
             type="task_request",
             payload="please review",
-            channel="all",
-            session_id=None,
             title="Review request",
             tags="review, urgent",
             correlation_id="thread-1",
             signal_level="actionable",
-            url=None,
-            debug=False,
         )
 
         cli.cmd_publish(args)
@@ -228,18 +224,7 @@ class TestCLIStructuredFlags:
     @patch("agent_event_bus.cli.call_tool")
     def test_publish_omits_absent_structured_fields(self, mock_call):
         mock_call.return_value = {"event_id": 1}
-        args = Namespace(
-            type="note",
-            payload="hi",
-            channel="all",
-            session_id=None,
-            title=None,
-            tags=None,
-            correlation_id=None,
-            signal_level=None,
-            url=None,
-            debug=False,
-        )
+        args = make_publish_args(type="note", payload="hi")
 
         cli.cmd_publish(args)
 

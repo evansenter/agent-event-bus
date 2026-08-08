@@ -953,3 +953,12 @@ class TestBacklogPaging:
                 break
 
         assert seen == ids
+
+    def test_limit_zero_does_not_report_more(self, storage):
+        """limit=0 returns an empty page that never advances the cursor; a
+        keep-polling-while-has_more loop would spin forever if it were True."""
+        self._add_events(storage, 3)
+
+        events, cursor, has_more = storage.get_events(limit=0)
+        assert events == []
+        assert has_more is False

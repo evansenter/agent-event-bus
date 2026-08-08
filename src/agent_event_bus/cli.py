@@ -315,22 +315,28 @@ def cmd_events(args):
         if not events:
             print("No events")
         for e in events:
-            print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
+            header = f"[{e['id']}] {e['event_type']} ({e['channel']})"
+            if e.get("signal_level"):
+                header += f" [{e['signal_level']}]"
+            print(header)
             if e.get("title"):
                 print(f"    title: {e['title']}")
             print(f"    {e['payload']}")
             from_line = f"    from: {e['session_id']} at {e['timestamp']}"
             if e.get("correlation_id"):
                 from_line += f" corr:{e['correlation_id']}"
+            if e.get("tags"):
+                from_line += f" tags:{','.join(e['tags'])}"
             print(from_line)
             print()
         if has_more:
-            # The default desc order serves the newest slice; without this
-            # hint a large backlog gets silently truncated on screen
-            print(
-                "More events available; use --order asc with --cursor to drain the backlog.",
-                file=sys.stderr,
-            )
+            # Without this hint a large backlog gets silently truncated on
+            # screen; the actionable next step depends on the order
+            if args.order == "asc":
+                hint = f"More events available; re-poll with --cursor {next_cursor}."
+            else:
+                hint = "More events available; use --order asc with --cursor to drain the backlog."
+            print(hint, file=sys.stderr)
 
 
 def cmd_notify(args):

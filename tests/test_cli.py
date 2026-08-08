@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_event_bus import cli
-from conftest import make_events_args
+from conftest import make_events_args, make_publish_args
 
 
 class TestCallTool:
@@ -231,24 +231,6 @@ class TestCmdSessions:
         assert "abc123" in captured.out
         assert "test-session" in captured.out
         assert "my-repo" in captured.out
-
-
-def make_publish_args(**overrides):
-    """Namespace matching the publish subparser's output - keep in sync."""
-    defaults = dict(
-        type="test_event",
-        payload="hello",
-        channel=None,
-        session_id=None,
-        title=None,
-        tags=None,
-        correlation_id=None,
-        signal_level=None,
-        url=None,
-        debug=False,
-    )
-    defaults.update(overrides)
-    return Namespace(**defaults)
 
 
 class TestCmdPublish:
@@ -1063,3 +1045,42 @@ class TestCmdEventsHasMoreHint:
         cli.cmd_events(make_events_args())
 
         assert capsys.readouterr().err == ""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_asc_hint_points_at_cursor(self, mock_call, capsys):
+        mock_call.return_value = {"events": [], "next_cursor": "50", "has_more": True}
+
+        cli.cmd_events(make_events_args(order="asc"))
+
+        err = capsys.readouterr().err
+        assert "More events available" in err
+        assert "--cursor 50" in err
+
+
+class TestCmdEventsStructuredDisplay:
+    @patch("agent_event_bus.cli.call_tool")
+    def test_signal_level_and_tags_shown(self, mock_call, capsys):
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 42,
+                    "event_type": "help_needed",
+                    "channel": "all",
+                    "payload": "p",
+                    "session_id": "s",
+                    "timestamp": "t",
+                    "signal_level": "actionable",
+                    "correlation_id": "rev-1",
+                    "tags": ["review", "urgent"],
+                }
+            ],
+            "next_cursor": "42",
+            "has_more": False,
+        }
+
+        cli.cmd_events(make_events_args())
+
+        out = capsys.readouterr().out
+        assert "[42] help_needed (all) [actionable]" in out
+        assert "corr:rev-1" in out
+        assert "tags:review,urgent" in out

@@ -105,6 +105,12 @@ Narrowing filters (`channel`, `event_types`, `correlation_id`) are
 didn't match your filter stay unread for the next normal poll. (`min_level`
 is the exception - noise it hides still counts as seen.)
 
+The flip side: a filtered poll is a *pure read* - with `resume=True` it
+returns the same matching events on every call, forever. Don't build a
+notification loop on `--include ... --resume`. To make progress, page
+manually with `cursor`/`next_cursor`, or consume unfiltered and narrow with
+`min_level` (which advances the cursor) or client-side `--exclude`.
+
 ### Filter by Signal Level
 
 Every event carries a server-derived `signal_level`, so consumers don't need

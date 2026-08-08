@@ -564,9 +564,10 @@ def _get_events_impl(
         session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
-        elif session and peek:
-            # peek + resume on a cursor-less session: read from the tip without
-            # persisting it, so a non-consuming peek never advances the cursor.
+        elif session and (peek or channel or event_types or correlation_id):
+            # Non-consuming reads (peek or narrowed) on a cursor-less session:
+            # read from the tip without persisting it. Persisting here would
+            # let a narrowed resume mark the entire backlog as seen.
             cursor = storage.get_cursor()
         elif session:
             # Session exists but has no saved cursor - persist tip so next resume works

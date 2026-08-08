@@ -1483,3 +1483,19 @@ class TestNarrowedReadsDoNotConsumeCursor:
         get_events(session_id=sid, resume=True, order="asc")
 
         assert server.storage.get_session(sid).last_cursor == str(published["event_id"])
+
+    def test_narrowed_resume_on_cursorless_session_does_not_initialize(self):
+        """A fresh session has last_cursor=NULL; the resume-initialization
+        branch must not persist the tip for a narrowed read - that would mark
+        the entire backlog (DMs included) as seen."""
+        reg = register_session(name="narrow-init", client_id="narrow-init-client")
+        sid = reg["session_id"]
+        assert server.storage.get_session(sid).last_cursor is None
+
+        publish_event(event_type="help_needed", payload="dm", channel=f"session:{sid}")
+
+        result = get_events(session_id=sid, resume=True, correlation_id="rev-99", order="asc")
+        assert result["events"] == []
+
+        # The narrowed resume read from the tip without persisting it
+        assert server.storage.get_session(sid).last_cursor is None
