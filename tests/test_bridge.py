@@ -81,6 +81,12 @@ class TestSignature:
         assert verify_signature(body, None, "s3cret") is False
         assert verify_signature(body, "not-a-signature", "s3cret") is False
 
+    def test_non_ascii_signature_header_rejected_not_raised(self):
+        """str compare_digest raises TypeError on non-ASCII input, and
+        Starlette decodes headers as latin-1 - a hostile header byte above
+        0x7f must be a clean reject (401), not an escape into a 500."""
+        assert verify_signature(b'{"x": 1}', "sha256=caf\xe9", "s3cret") is False
+
     def test_hook_rejects_unsigned_when_secret_configured(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", secret="s3cret")
         client = TestClient(create_bridge_app(config))
@@ -342,6 +348,8 @@ class TestInjectorCooldown:
         assert len(lines) == 8
         for line in lines:
             json.loads(line)
+        # The cross-process drain lock exists alongside the spool
+        assert (config.wake_dir / "t.lock").exists()
 
     def test_wake_dir_is_private(self, config):
         Injector(config).deliver("target-1", make_event())
@@ -705,6 +713,20 @@ class TestHookUrlTopology:
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "-5")
         with pytest.raises(SystemExit, match="COOLDOWN"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_empty_wake_dir_env_falls_back_to_default(self, monkeypatch):
+        """An empty env var would make Path('') == cwd - the bridge would
+        chmod and spool into whatever directory launched it, while the
+        drain hook reads the real wake dir and finds nothing."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_WAKE_DIR", "")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.wake_dir == bridge.DEFAULT_WAKE_DIR
+
+    def test_relative_wake_dir_is_refused(self):
+        """A daemon's cwd is whatever its supervisor hands it."""
+        args = bridge.build_parser().parse_args(["--wake-dir", "wake"])
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_WAKE_DIR"):
+            bridge.config_from_args(args)
 
     def test_hook_url_env_is_adopted(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:9090/hook")

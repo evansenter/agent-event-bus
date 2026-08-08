@@ -28,6 +28,7 @@ AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
 """
 
 import argparse
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -92,7 +93,13 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header)
+    # Compare as bytes: str compare_digest raises TypeError on non-ASCII
+    # input, and Starlette decodes headers as latin-1 - a hostile header
+    # byte above 0x7f must be a 401, not a 500. bytes keeps constant-time.
+    return hmac.compare_digest(
+        f"sha256={expected}".encode(),
+        signature_header.encode("latin-1", errors="replace"),
+    )
 
 
 # Session ids are UUIDs (36 chars) or display ids ("brave-trex"); nothing
@@ -194,8 +201,18 @@ class Injector:
         # produce a write outside the wake dir
         if spool_file.resolve().parent != self.config.wake_dir.resolve():
             raise ValueError(f"Spool path escapes wake dir: {session_id!r}")
-        with spool_file.open("a") as f:
-            f.write(json.dumps(event) + "\n")
+        # flock a sibling lock file around the append: self._lock serializes
+        # OUR writers, but the drain hook is another process - without this,
+        # its rename could slip between our open and our flush and the line
+        # would land in a file the drainer already read (and will delete)
+        lock_file = self.config.wake_dir / f"{session_id}.lock"
+        with lock_file.open("a") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                with spool_file.open("a") as f:
+                    f.write(json.dumps(event) + "\n")
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
     def _tmux_pane(self, session_id: str) -> str | None:
         """Look up the session's tmux pane from <wake_dir>/panes.json.
@@ -495,7 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wake-dir",
         type=Path,
-        default=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
+        # `or`: an empty env var would make Path("") == cwd - the bridge
+        # would chmod and spool into whatever directory launched it
+        default=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR") or str(DEFAULT_WAKE_DIR)),
         help="Directory for spool files and panes.json",
     )
     parser.add_argument(
@@ -549,6 +568,13 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         raise SystemExit(
             f"Invalid cooldown {config.cooldown_seconds} "
             "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): must be >= 0"
+        )
+    # A daemon's cwd is whatever its supervisor hands it - a relative wake
+    # dir would silently relocate the durable path (and its chmod)
+    if not config.wake_dir.is_absolute():
+        raise SystemExit(
+            f"Invalid wake dir {config.wake_dir} "
+            "(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): must be an absolute path"
         )
     # A scheme-less bus URL ("bus.example:8080/mcp") parses with no hostname
     # and would read as loopback, skipping the topology guard below - catch
