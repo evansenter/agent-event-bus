@@ -316,6 +316,29 @@ unregister_webhook(webhook_id=1)
 ### Retry Behavior
 Webhooks retry up to 2 times with exponential backoff if the endpoint returns 4xx/5xx or times out.
 
+## Re-awakening Bridge (experimental)
+
+`agent-event-bus-bridge` closes the pull-only delivery gap (RFC #122): a
+small localhost daemon that registers a webhook on the bus, filters to
+**actionable** events on **`session:` channels** (DMs), and wakes the target
+session. Broadcast events stay pull-only.
+
+```
+agent-event-bus-bridge                    # spool backend (default)
+agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
+```
+
+- **spool**: every wake event is appended to
+  `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to
+  drain. This durable path is always on, in every backend.
+- **tmux**: additionally runs `tmux send-keys` into the session's pane, using
+  the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
+  session-side must maintain; unmapped sessions just spool.
+- Per-session cooldown (default 30s, `--cooldown`) bounds wake-ups; events
+  during cooldown are spooled, never dropped.
+- Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
+  hop (the bridge registers its webhook with the same secret).
+
 ## Best Practices
 
 1. **Register with client_id** - Enables session resumption

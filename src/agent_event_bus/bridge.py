@@ -1,0 +1,287 @@
+"""Webhook-to-injection bridge: re-awaken idle Claude Code sessions (RFC #122).
+
+EXPERIMENTAL prototype. The bus has a push subsystem (webhooks) that nothing
+consumes, while delivery to sessions is pull-only - a DM to an idle session
+sits unread until its human happens to prompt. This daemon closes the loop:
+
+    publish_event(channel="session:X", ...)
+        -> bus webhook POST -> bridge (localhost)
+        -> filter to actionable signal
+        -> inject a wake-up for session X
+
+Injection backends:
+  spool  (default) append the event as a JSON line to
+         <wake_dir>/<session_id>.jsonl - portable; a Stop/UserPromptSubmit
+         hook can drain the spool at its next opportunity
+  tmux   `tmux send-keys` a wake prompt into the session's pane, then fall
+         back to spool when no pane mapping exists. Pane mappings are read
+         from <wake_dir>/panes.json ({session_id: pane_id}), which something
+         session-side (e.g. a SessionStart hook publishing $TMUX_PANE) must
+         maintain.
+
+Loop prevention: a per-session cooldown (default 30s) bounds injections; an
+event that arrives during cooldown is spooled instead, so nothing is lost.
+
+Run:  agent-event-bus-bridge [--backend tmux] [--port 8082] ...
+The bridge registers its own webhook on the bus at startup (HMAC-signed when
+AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
+"""
+
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import os
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from agent_event_bus.cli import DEFAULT_URL, call_tool
+
+logger = logging.getLogger("agent-event-bus-bridge")
+
+DEFAULT_BRIDGE_PORT = 8082
+DEFAULT_COOLDOWN_SECONDS = 30.0
+DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wake"
+
+# tmux send-keys is bounded like the notifier subprocesses in helpers.py -
+# a hung tmux must not wedge the bridge
+TMUX_TIMEOUT = 5.0
+
+WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
+
+
+@dataclass
+class BridgeConfig:
+    """Runtime configuration for the bridge daemon."""
+
+    bus_url: str = DEFAULT_URL
+    port: int = DEFAULT_BRIDGE_PORT
+    backend: str = "spool"  # "spool" | "tmux"
+    secret: str | None = None
+    cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
+    wake_dir: Path = field(default_factory=lambda: DEFAULT_WAKE_DIR)
+
+
+def verify_signature(body: bytes, signature_header: str | None, secret: str) -> bool:
+    """Check the bus's X-Event-Bus-Signature HMAC against the raw body."""
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(f"sha256={expected}", signature_header)
+
+
+def resolve_target_session(event: dict) -> str | None:
+    """Which session should this event wake?
+
+    v1 wakes only for direct messages (session:<id> channels) - the
+    unambiguous "aimed at exactly this session" case. Broadcast actionable
+    events (help_needed on a repo channel, ...) have no single target and
+    are left for normal polling.
+    """
+    channel = event.get("channel") or ""
+    if channel.startswith("session:") and len(channel) > len("session:"):
+        return channel.split(":", 1)[1]
+    return None
+
+
+class Injector:
+    """Delivers wake-ups, bounded by a per-session cooldown."""
+
+    def __init__(self, config: BridgeConfig):
+        self.config = config
+        self._lock = threading.Lock()
+        self._last_wake: dict[str, float] = {}
+
+    def deliver(self, session_id: str, event: dict) -> str:
+        """Wake session_id for event. Returns the action taken:
+        "tmux", "spool", or "spool-cooldown"."""
+        self._spool(session_id, event)
+
+        with self._lock:
+            now = time.monotonic()
+            last = self._last_wake.get(session_id)
+            if last is not None and (now - last) < self.config.cooldown_seconds:
+                # Spooled above; the previous wake-up covers it
+                return "spool-cooldown"
+            self._last_wake[session_id] = now
+
+        if self.config.backend == "tmux" and self._tmux_wake(session_id):
+            return "tmux"
+        return "spool"
+
+    def _spool(self, session_id: str, event: dict) -> None:
+        """Always-on durable path: one JSON line per event, per session."""
+        self.config.wake_dir.mkdir(parents=True, exist_ok=True)
+        spool_file = self.config.wake_dir / f"{session_id}.jsonl"
+        with spool_file.open("a") as f:
+            f.write(json.dumps(event) + "\n")
+
+    def _tmux_pane(self, session_id: str) -> str | None:
+        """Look up the session's tmux pane from <wake_dir>/panes.json."""
+        panes_file = self.config.wake_dir / "panes.json"
+        try:
+            panes = json.loads(panes_file.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        pane = panes.get(session_id)
+        return pane if isinstance(pane, str) and pane else None
+
+    def _tmux_wake(self, session_id: str) -> bool:
+        """Type the wake prompt into the session's pane. False on any miss."""
+        pane = self._tmux_pane(session_id)
+        if pane is None:
+            logger.info(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
+            return False
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", pane, WAKE_PROMPT, "Enter"],
+                check=True,
+                capture_output=True,
+                timeout=TMUX_TIMEOUT,
+            )
+            logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
+            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning(f"tmux wake failed for {session_id[:8]}... ({e}); spooled only")
+            return False
+
+
+def create_bridge_app(config: BridgeConfig, injector: Injector | None = None) -> Starlette:
+    """Build the ASGI app: POST /hook (webhook receiver) + GET /health."""
+    injector = injector or Injector(config)
+
+    def process(body: bytes, signature: str | None) -> tuple[dict, int]:
+        """Sync webhook handling (runs in a worker thread - the file appends
+        and tmux subprocess must stay off the event loop, same invariant as
+        the bus server's #112 fix)."""
+        if config.secret is not None and not verify_signature(body, signature, config.secret):
+            return {"error": "bad signature"}, 401
+
+        try:
+            event = json.loads(body)
+        except json.JSONDecodeError:
+            return {"error": "invalid JSON"}, 400
+
+        # The bus always sends the derived signal_level; only actionable
+        # events (DMs, help_needed, blockers, CI failures) justify a wake
+        if event.get("signal_level") != "actionable":
+            return {"status": "ignored", "reason": "below actionable"}, 200
+
+        target = resolve_target_session(event)
+        if target is None:
+            return {"status": "ignored", "reason": "no target session"}, 200
+
+        action = injector.deliver(target, event)
+        return {"status": "delivered", "action": action, "session_id": target}, 200
+
+    async def hook_endpoint(request: Request) -> JSONResponse:
+        from starlette.concurrency import run_in_threadpool
+
+        body = await request.body()
+        signature = request.headers.get("x-event-bus-signature")
+        payload, status = await run_in_threadpool(process, body, signature)
+        return JSONResponse(payload, status_code=status)
+
+    async def health(request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "service": "agent-event-bus-bridge"})
+
+    return Starlette(
+        routes=[
+            Route("/hook", hook_endpoint, methods=["POST"]),
+            Route("/health", health, methods=["GET"]),
+        ]
+    )
+
+
+def register_with_bus(config: BridgeConfig) -> int | None:
+    """Register this bridge's webhook on the bus. Returns webhook_id."""
+    result = call_tool(
+        "register_webhook",
+        {
+            "url": f"http://127.0.0.1:{config.port}/hook",
+            # No server-side filter: payloads carry the derived signal_level,
+            # and the bridge filters to actionable locally. (Webhook filters
+            # only cover channel/event_types; "actionable" spans both DMs and
+            # specific broadcast types.)
+            **({"secret": config.secret} if config.secret else {}),
+        },
+        url=config.bus_url,
+    )
+    webhook_id = result.get("webhook_id")
+    if webhook_id is not None:
+        logger.info(f"Registered bridge webhook #{webhook_id} on {config.bus_url}")
+    return webhook_id
+
+
+def unregister_from_bus(config: BridgeConfig, webhook_id: int) -> None:
+    """Best-effort webhook cleanup on shutdown."""
+    try:
+        call_tool("unregister_webhook", {"webhook_id": webhook_id}, url=config.bus_url)
+        logger.info(f"Unregistered bridge webhook #{webhook_id}")
+    except SystemExit:
+        # call_tool exits on connection errors; shutdown must not care
+        logger.warning(f"Could not unregister webhook #{webhook_id} (bus unreachable)")
+
+
+def main():
+    """Run the bridge daemon."""
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="agent-event-bus re-awakening bridge (RFC #122)")
+    parser.add_argument(
+        "--bus-url",
+        default=os.environ.get("AGENT_EVENT_BUS_URL", DEFAULT_URL),
+        help="Bus MCP endpoint to register the webhook on",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("AGENT_EVENT_BUS_BRIDGE_PORT", DEFAULT_BRIDGE_PORT)),
+        help=f"Localhost port to listen on (default: {DEFAULT_BRIDGE_PORT})",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["spool", "tmux"],
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BACKEND", "spool"),
+        help="Wake mechanism: spool file only, or tmux send-keys + spool",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
+        default=float(os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", DEFAULT_COOLDOWN_SECONDS)),
+        help="Minimum seconds between wakes per session (loop prevention)",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    config = BridgeConfig(
+        bus_url=args.bus_url,
+        port=args.port,
+        backend=args.backend,
+        secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET"),
+        cooldown_seconds=args.cooldown,
+        wake_dir=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
+    )
+
+    webhook_id = register_with_bus(config)
+    try:
+        # Localhost only: the bus is the sole intended caller, and HMAC (when
+        # a secret is set) authenticates it
+        uvicorn.run(create_bridge_app(config), host="127.0.0.1", port=config.port)
+    finally:
+        if webhook_id is not None:
+            unregister_from_bus(config, webhook_id)
+
+
+if __name__ == "__main__":
+    main()

@@ -46,6 +46,7 @@ dev = [
 [project.scripts]
 agent-event-bus = "agent_event_bus.server:main"
 agent-event-bus-cli = "agent_event_bus.cli:main"
+agent-event-bus-bridge = "agent_event_bus.bridge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_event_bus"]

@@ -17,7 +17,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Repo | `agent-event-bus` |
 | Python package | `agent_event_bus` |
 | MCP server name | `agent-event-bus` |
-| CLI commands | `agent-event-bus`, `agent-event-bus-cli` |
+| CLI commands | `agent-event-bus`, `agent-event-bus-cli`, `agent-event-bus-bridge` |
 | Resource URI | `agent-event-bus://guide` |
 | Data directory | `~/.claude/contrib/agent-event-bus/` |
 | Database | `~/.claude/contrib/agent-event-bus/data.db` |
@@ -88,6 +88,7 @@ src/agent_event_bus/
 ├── middleware.py  # Request logging → ~/.claude/contrib/agent-event-bus/agent-event-bus.log
 ├── session_ids.py # Dinosaur-themed display_id generation
 ├── cli.py         # CLI wrapper for shell scripts
+├── bridge.py      # Webhook→injection re-awakening bridge (RFC #122, experimental)
 └── guide.md       # Usage guide (agent-event-bus://guide resource)
 ```
 
