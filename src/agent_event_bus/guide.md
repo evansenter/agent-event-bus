@@ -335,8 +335,10 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
      without the lock a just-appended line could land in a file the drainer
-     already read). The bridge's acquire is bounded (~5s), so keep your
-     hold to the renames below - never drain while holding the lock.
+     already read). The bridge's acquire is bounded (~2s - it must stay
+     under the bus's 5s webhook timeout), so keep your hold to the
+     renames below - never drain while holding the lock; even a ~2s hold
+     turns a concurrent delivery into a bus-side timeout and retry.
   2. Under the lock, claim a batch by rename (renames only, so the hold
      stays short). Pick a claim id `<uniq>` unique to THIS drain - pid
      plus a timestamp, or an mktemp-style suffix. Pid alone is NOT
@@ -397,6 +399,12 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   the bus keeps dispatching to the dead address forever.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
+- `GET /health` reports `registered`: whether the *startup* registration
+  succeeded. The row is not re-verified afterwards, so unregistering the
+  webhook by hand (or restoring the bus DB from a backup) leaves
+  `registered: true` on a bridge the bus no longer dispatches to - restart
+  the bridge after manual webhook surgery. Periodic re-assertion is a
+  follow-up.
 
 Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,

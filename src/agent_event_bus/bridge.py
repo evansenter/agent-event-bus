@@ -59,8 +59,12 @@ DEFAULT_COOLDOWN_SECONDS = 30.0
 DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wake"
 
 # tmux send-keys is bounded like the notifier subprocesses in helpers.py -
-# a hung tmux must not wedge the bridge
-TMUX_TIMEOUT = 5.0
+# a hung tmux must not wedge the bridge. Sized under the bus's
+# WEBHOOK_TIMEOUT (5s per attempt, server.py): the bus's clock starts
+# before ours, so a bound at or above its timeout means the bus never
+# sees the response this bound exists to produce - just a timeout plus
+# retries (and a duplicate spool line per retry).
+TMUX_TIMEOUT = 2.0
 
 # Bound on joining the registration thread at shutdown. register_with_bus
 # makes up to three sequential call_tool requests (list, unregister stale,
@@ -77,8 +81,11 @@ MAX_BODY_BYTES = 1_048_576  # 1 MiB
 # means a stuck drainer (SIGSTOP, network mount) - and an unbounded block
 # here parks a threadpool worker per pending event until /hook starves.
 # Raising after the deadline is correct: nothing is durably stored yet, so
-# the bus retry is meaningful (unlike post-spool errors).
-SPOOL_LOCK_ATTEMPTS = 50
+# the bus retry is meaningful (unlike post-spool errors). Like TMUX_TIMEOUT,
+# the deadline (attempts x retry) must stay under the bus's WEBHOOK_TIMEOUT
+# (5s per attempt) - and their SUM must too, or a slow-lock-then-slow-tmux
+# request times out bus-side even though each bound individually held.
+SPOOL_LOCK_ATTEMPTS = 20
 SPOOL_LOCK_RETRY_SECONDS = 0.1
 
 # Must stay a fixed multi-word constant: the send-keys call passes it as
@@ -324,10 +331,16 @@ def create_bridge_app(
                 daemon=True,
             )
             registration_thread.start()
-        yield
-        if registration_thread is not None:
-            registration_stop.set()
-            registration_thread.join(timeout=REGISTRATION_JOIN_TIMEOUT)
+        # try/finally: a cancelled or erroring lifespan (forced shutdown,
+        # timeout_graceful_shutdown) is thrown in AT the yield - without the
+        # guard the stop-and-join is skipped and the row leaks exactly the
+        # way the join was added to prevent
+        try:
+            yield
+        finally:
+            if registration_thread is not None:
+                registration_stop.set()
+                registration_thread.join(timeout=REGISTRATION_JOIN_TIMEOUT)
 
     def process(body: bytes, signature: str | None) -> tuple[dict, int]:
         """Sync webhook handling (runs in a worker thread - the file appends
@@ -340,14 +353,16 @@ def create_bridge_app(
             event = json.loads(body)
         # ValueError, not just JSONDecodeError: json.loads(bytes) DECODES
         # before parsing, and invalid UTF-8 raises UnicodeDecodeError (a
-        # ValueError but not a JSONDecodeError) - it must be a 400, not a
-        # 500 with bus retries behind it
+        # ValueError but not a JSONDecodeError). The bus retries any >=400
+        # identically, so a 400 buys a clean named error in both logs
+        # instead of a traceback per attempt - not fewer retries.
         except ValueError:
             return {"error": "invalid JSON"}, 400
         if not isinstance(event, dict):
-            # Valid JSON that isn't an object (123, [], "x") must be a 400,
-            # not an AttributeError-turned-500 - this endpoint is network
-            # reachable, more so once it binds beyond loopback
+            # Valid JSON that isn't an object (123, [], "x"): a named 400,
+            # not an AttributeError traceback (retried by the bus either
+            # way) - this endpoint is network reachable, more so once it
+            # binds beyond loopback
             return {"error": "expected a JSON object"}, 400
 
         # The bus always sends the derived signal_level; only actionable

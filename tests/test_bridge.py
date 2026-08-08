@@ -159,6 +159,22 @@ class TestPathSafety:
         assert not (config.wake_dir.parent / "escape.jsonl").exists()
 
 
+class TestBusTimingContract:
+    def test_internal_deadlines_leave_headroom_under_bus_webhook_timeout(self):
+        """The bus's per-attempt clock (WEBHOOK_TIMEOUT) starts before the
+        bridge's, so a bridge-side bound at or above it guarantees the bus
+        times out and retries instead of ever seeing the bounded response
+        (500 for a stuck spool lock, 200 for a failed tmux wake). Pin the
+        headroom - including the sum, since one request can hit lock
+        contention AND a slow tmux."""
+        from agent_event_bus.server import WEBHOOK_TIMEOUT
+
+        spool_deadline = bridge.SPOOL_LOCK_ATTEMPTS * bridge.SPOOL_LOCK_RETRY_SECONDS
+        assert spool_deadline < WEBHOOK_TIMEOUT
+        assert bridge.TMUX_TIMEOUT < WEBHOOK_TIMEOUT
+        assert spool_deadline + bridge.TMUX_TIMEOUT < WEBHOOK_TIMEOUT
+
+
 class TestHookFiltering:
     def test_session_dm_signal_level_contract(self):
         """The bridge filters on the literal 'actionable' - pin that the bus
@@ -552,6 +568,25 @@ class TestBusRegistration:
         # v1 only acts on DMs, so the bus drops broadcast traffic server-side
         assert register["arguments"]["channel"] == "session:"
         assert register["url"] == "http://bus/mcp"
+
+    def test_unregister_calls_unregister_webhook_with_id_and_url(self, tmp_path):
+        """Pin the wire call unregister_from_bus makes (tool name, id, bus
+        URL) - a wrong argument here only ever surfaces as a stale row that
+        the next startup sweep silently reclaims, so no other test would
+        catch it."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
+        calls = []
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments, "url": url})
+            return {"success": True}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            bridge.unregister_from_bus(config, 42)
+
+        assert calls == [
+            {"tool": "unregister_webhook", "arguments": {"webhook_id": 42}, "url": "http://bus/mcp"}
+        ]
 
     def test_startup_removes_stale_webhooks_at_same_url(self, tmp_path):
         """Unclean exits leave active webhooks behind; each would duplicate
