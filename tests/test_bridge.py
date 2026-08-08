@@ -46,6 +46,7 @@ BRIDGE_ENV = (
     "AGENT_EVENT_BUS_BRIDGE_COOLDOWN",
     "AGENT_EVENT_BUS_BRIDGE_SECRET",
     "AGENT_EVENT_BUS_BRIDGE_HOOK_URL",
+    "AGENT_EVENT_BUS_BRIDGE_BIND",
     "AGENT_EVENT_BUS_WAKE_DIR",
 )
 
@@ -666,6 +667,27 @@ class TestHookUrlTopology:
         with pytest.raises(SystemExit, match="http"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 
+    def test_schemeless_hook_url_is_refused(self, monkeypatch):
+        """The hook URL is what BOTH topology guards read - a scheme-less
+        value parses to hostname None, reads as loopback, skips the guards,
+        and registers a URL the bus can never POST to (silently inert with
+        /health reporting registered)."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "laptop.example:8082/hook")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_HOOK_URL"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_out_of_range_port_is_refused(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "99999")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_negative_cooldown_is_refused(self, monkeypatch):
+        """A negative cooldown casts cleanly but silently disables the
+        cooldown entirely (now - ts < -5 is never true)."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "-5")
+        with pytest.raises(SystemExit, match="COOLDOWN"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
     def test_hook_url_env_is_adopted(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:9090/hook")
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
@@ -702,3 +724,59 @@ class TestHookUrlTopology:
 
         register = next(c for c in calls if c["tool"] == "register_webhook")
         assert register["arguments"]["url"] == "http://laptop.tailnet.example:8082/hook"
+
+
+class TestBindHost:
+    """The bind decision gates whether the wake-injection endpoint is
+    reachable off-box - both directions must be pinned, not just the config
+    guard that shares its predicate."""
+
+    def test_loopback_hook_binds_localhost(self, tmp_path):
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        assert bridge.bind_host(config) == "127.0.0.1"
+
+    def test_reachable_hook_binds_wide(self, tmp_path):
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake", hook_url="http://box.example:8082/hook", secret="s3cret"
+        )
+        assert bridge.bind_host(config) == "0.0.0.0"
+
+    def test_bind_override_pins_interface(self, tmp_path):
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://box.example:8082/hook",
+            secret="s3cret",
+            bind="100.100.1.2",
+        )
+        assert bridge.bind_host(config) == "100.100.1.2"
+
+    def test_main_passes_bind_through_and_unregisters(self, monkeypatch, tmp_path):
+        """End-to-end main(): the default local config binds loopback, the
+        lifespan registers, and the finally unregisters the committed id."""
+        import sys
+
+        import uvicorn
+
+        monkeypatch.setattr(
+            sys, "argv", ["agent-event-bus-bridge", "--wake-dir", str(tmp_path / "wake")]
+        )
+        seen = {}
+        unregistered = []
+
+        def fake_run(app, host=None, port=None):
+            seen["host"] = host
+            seen["port"] = port
+            # Run the lifespan the way uvicorn would, so registration fires
+            with TestClient(app):
+                pass
+
+        with patch.object(uvicorn, "run", fake_run):
+            with patch.object(bridge, "register_with_bus", lambda cfg: 99):
+                with patch.object(
+                    bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+                ):
+                    bridge.main()
+
+        assert seen["host"] == "127.0.0.1"
+        assert seen["port"] == bridge.DEFAULT_BRIDGE_PORT
+        assert unregistered == [99]

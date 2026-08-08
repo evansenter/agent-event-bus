@@ -79,6 +79,8 @@ class BridgeConfig:
     wake_dir: Path = field(default_factory=lambda: DEFAULT_WAKE_DIR)
     # URL the bus POSTs to; None means loopback (bus on this machine)
     hook_url: str | None = None
+    # Interface to bind; None derives it from the hook URL (see bind_host)
+    bind: str | None = None
 
 
 def verify_signature(body: bytes, signature_header: str | None, secret: str) -> bool:
@@ -348,6 +350,18 @@ def _is_loopback(url: str) -> bool:
         return host in LOOPBACK_HOSTS
 
 
+def bind_host(config: BridgeConfig) -> str:
+    """Which interface the listener binds. A loopback hook URL means the
+    local bus is the sole caller -> localhost only. A reachable hook URL
+    means a remote bus must reach us -> all interfaces, unless --bind pins
+    one (config_from_args guarantees an HMAC secret on that path)."""
+    if config.bind:
+        return config.bind
+    if _is_loopback(bridge_hook_url(config)):
+        return "127.0.0.1"
+    return "0.0.0.0"  # noqa: S104 - deliberate; secret enforced at config time
+
+
 def register_with_bus(config: BridgeConfig) -> int:
     """Register this bridge's webhook on the bus. Returns webhook_id;
     raises SystemExit on any failure (bus unreachable, or no id returned).
@@ -478,6 +492,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="URL the bus POSTs events to (default: http://127.0.0.1:<port>/hook; "
         "must be an address the bus host can reach when the bus is remote)",
     )
+    parser.add_argument(
+        "--bind",
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BIND") or None,
+        help="Interface to bind (default: 127.0.0.1 for a loopback hook URL, "
+        "0.0.0.0 otherwise; pin e.g. your tailnet address to narrow exposure)",
+    )
     return parser
 
 
@@ -503,12 +523,36 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         cooldown_seconds=args.cooldown,
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
+        bind=args.bind,
     )
+    # Range checks cover CLI and env alike: an out-of-range port would be a
+    # uvicorn traceback naming neither, and a negative cooldown would
+    # silently disable the cooldown (now - ts < -5 is never true)
+    if not (1 <= config.port <= 65535):
+        raise SystemExit(
+            f"Invalid port {config.port} (check --port / AGENT_EVENT_BUS_BRIDGE_PORT): "
+            "expected 1-65535"
+        )
+    if config.cooldown_seconds < 0:
+        raise SystemExit(
+            f"Invalid cooldown {config.cooldown_seconds} "
+            "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): must be >= 0"
+        )
     # A scheme-less bus URL ("bus.example:8080/mcp") parses with no hostname
     # and would read as loopback, skipping the topology guard below - catch
     # the misconfiguration here instead of in a later connection error
     if urllib.parse.urlsplit(config.bus_url).scheme not in ("http", "https"):
         raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http:// or https://")
+    # Same check for the hook URL - it is what BOTH topology guards below
+    # read: a scheme-less value parses to hostname None, reads as loopback,
+    # skips the guards, and registers a URL the bus can never POST to
+    if config.hook_url is not None and (
+        urllib.parse.urlsplit(config.hook_url).scheme not in ("http", "https")
+    ):
+        raise SystemExit(
+            f"Invalid hook URL {config.hook_url!r} "
+            "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): expected http:// or https://"
+        )
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
     # delivered - and every machine would claim the same URL string, so the
@@ -519,7 +563,9 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Bus at {config.bus_url} is remote but the advertised hook URL "
             f"{bridge_hook_url(config)} is loopback - the bus would POST to itself. "
             "Set --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL to an address the bus "
-            "host can reach (and set AGENT_EVENT_BUS_BRIDGE_SECRET)."
+            "host can reach (and set AGENT_EVENT_BUS_BRIDGE_SECRET). If the bus is "
+            "on THIS machine, address it as 127.0.0.1 or localhost - a hostname "
+            "that resolves to 127.0.1.1 reads as remote."
         )
     # A non-loopback hook URL means binding beyond localhost, where the HMAC
     # is the only authentication: an unsigned endpoint would let anyone who
@@ -555,15 +601,8 @@ def main():
     state: dict = {}
     stop = threading.Event()
     app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-    # Loopback hook URL -> bind localhost only (the local bus is the sole
-    # caller). A non-loopback hook URL means a remote bus must reach us, so
-    # bind wide - config_from_args guarantees an HMAC secret on this path.
-    if _is_loopback(bridge_hook_url(config)):
-        host = "127.0.0.1"
-    else:
-        host = "0.0.0.0"  # noqa: S104 - deliberate; secret enforced at config time
     try:
-        uvicorn.run(app, host=host, port=config.port)
+        uvicorn.run(app, host=bind_host(config), port=config.port)
     finally:
         # Lifespan shutdown already stopped and joined the registration
         # thread; the stop here only covers exits that skipped the lifespan

@@ -359,7 +359,8 @@ Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,
 `--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
 `--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`,
-`--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`.
+`--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`,
+`--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`.
 
 **Remote-bus topology**: the defaults assume the bus runs on the same
 machine. With a remote bus (`AGENT_EVENT_BUS_URL` pointing off-host), a
@@ -368,9 +369,12 @@ bridge refuses to start unless `--hook-url` advertises an address the bus
 host can reach (e.g. your Tailscale hostname). The listener then binds
 non-loopback, and the bridge refuses to start without
 `AGENT_EVENT_BUS_BRIDGE_SECRET`: the HMAC signature is the only
-authentication on that hop. Keep `--port` and the port in `--hook-url` in
-agreement unless a proxy genuinely forwards between them (a mismatch is
-logged). Note webhooks have no machine scoping - every bridge receives
+authentication on that hop - and it authenticates but neither encrypts nor
+expires, so run the hop over an encrypted transport (your tailnet, or a TLS
+terminator); replay freshness is an RFC-level follow-up. `--bind` can pin
+the listener to a single interface (e.g. the tailnet address) instead of
+all interfaces. Keep `--port` and the port in `--hook-url` in agreement
+unless a proxy genuinely forwards between them (a mismatch is logged). Note webhooks have no machine scoping - every bridge receives
 every `session:` DM; tmux wakes only work for sessions on the bridge's own
 machine, and spool files for foreign sessions accumulate until the pruning
 follow-up lands. Machine-scoped delivery is a v2 item.
