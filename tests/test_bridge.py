@@ -39,6 +39,26 @@ def make_event(**overrides) -> dict:
     return event
 
 
+BRIDGE_ENV = (
+    "AGENT_EVENT_BUS_URL",
+    "AGENT_EVENT_BUS_BRIDGE_PORT",
+    "AGENT_EVENT_BUS_BRIDGE_BACKEND",
+    "AGENT_EVENT_BUS_BRIDGE_COOLDOWN",
+    "AGENT_EVENT_BUS_BRIDGE_SECRET",
+    "AGENT_EVENT_BUS_BRIDGE_HOOK_URL",
+    "AGENT_EVENT_BUS_WAKE_DIR",
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_bridge_env(monkeypatch):
+    """Config tests parse the real environment via build_parser defaults, and
+    client machines are told to export AGENT_EVENT_BUS_URL - the suite must
+    not change meaning based on the developer's shell profile."""
+    for name in BRIDGE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def config(tmp_path):
     return BridgeConfig(wake_dir=tmp_path / "wake", cooldown_seconds=30.0)
@@ -136,6 +156,12 @@ class TestHookFiltering:
 
     def test_invalid_json_rejected(self, client):
         assert client.post("/hook", content=b"not-json{").status_code == 400
+
+    def test_non_object_json_rejected(self, client):
+        """Valid JSON that isn't an object must be a 400, not an
+        AttributeError-turned-500 with bus retries behind it."""
+        for body in (b"123", b'["x"]', b'"bare"', b"null"):
+            assert client.post("/hook", content=body).status_code == 400
 
     def test_actionable_dm_delivered_to_spool(self, client, config):
         resp = client.post("/hook", content=json.dumps(make_event()).encode())
@@ -602,22 +628,60 @@ class TestHookUrlTopology:
 
     def test_remote_bus_with_reachable_hook_is_accepted(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_URL", "https://bus.tailnet.example/mcp")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
         args = bridge.build_parser().parse_args(
             ["--hook-url", "http://laptop.tailnet.example:8082/hook"]
         )
         config = bridge.config_from_args(args)
         assert bridge.bridge_hook_url(config) == "http://laptop.tailnet.example:8082/hook"
 
-    def test_local_bus_with_loopback_hook_is_accepted(self, monkeypatch):
-        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
+    def test_non_loopback_hook_without_secret_is_refused(self, monkeypatch):
+        """Binding beyond localhost with no HMAC secret would let anyone who
+        reaches the port append attacker-authored lines to a session spool -
+        a hard refusal, matching the loopback-vs-remote guard (the bus
+        itself defaults to auth-required)."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "https://bus.tailnet.example/mcp")
+        args = bridge.build_parser().parse_args(
+            ["--hook-url", "http://laptop.tailnet.example:8082/hook"]
+        )
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
+            bridge.config_from_args(args)
+
+    def test_local_bus_with_loopback_hook_is_accepted(self):
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert bridge.bridge_hook_url(config).startswith("http://127.0.0.1:")
 
+    def test_loopback_range_bus_is_local(self, monkeypatch):
+        """127.0.0.0/8 is all loopback - Debian/Ubuntu resolve the machine's
+        hostname to 127.0.1.1, so a bus URL built from `hostname` must not
+        read as remote."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "http://127.0.1.1:8080/mcp")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert bridge.bridge_hook_url(config).startswith("http://127.0.0.1:")
+
+    def test_schemeless_bus_url_is_refused(self, monkeypatch):
+        """A scheme-less URL parses with no hostname and would read as
+        loopback, silently skipping the topology guard."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "bus.example:8080/mcp")
+        with pytest.raises(SystemExit, match="http"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
     def test_hook_url_env_is_adopted(self, monkeypatch):
-        monkeypatch.delenv("AGENT_EVENT_BUS_URL", raising=False)
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:9090/hook")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert bridge.bridge_hook_url(config) == "http://box.local:9090/hook"
+
+    def test_hook_port_mismatch_warns(self, monkeypatch, caplog):
+        """The bus POSTs to the hook URL's port while the listener binds
+        --port; a mismatch is legitimate behind a proxy but must be named."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:9090/hook")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert any("9090" in r.message and "8082" in r.message for r in caplog.records)
 
     def test_registration_advertises_hook_url_override(self, tmp_path):
         config = BridgeConfig(

@@ -30,6 +30,7 @@ AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -281,6 +282,11 @@ def create_bridge_app(
             event = json.loads(body)
         except json.JSONDecodeError:
             return {"error": "invalid JSON"}, 400
+        if not isinstance(event, dict):
+            # Valid JSON that isn't an object (123, [], "x") must be a 400,
+            # not an AttributeError-turned-500 - this endpoint is network
+            # reachable, more so once it binds beyond loopback
+            return {"error": "expected a JSON object"}, 400
 
         # The bus always sends the derived signal_level; only actionable
         # events (DMs, help_needed, blockers, CI failures) justify a wake
@@ -327,12 +333,19 @@ def bridge_hook_url(config: BridgeConfig) -> str:
     return config.hook_url or f"http://127.0.0.1:{config.port}/hook"
 
 
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOOPBACK_HOSTS = {"localhost"}
 
 
 def _is_loopback(url: str) -> bool:
+    """Loopback is all of 127.0.0.0/8 plus ::1 (Debian/Ubuntu resolve the
+    machine's own hostname to 127.0.1.1), not just the literal 127.0.0.1."""
     host = urllib.parse.urlsplit(url).hostname
-    return host is None or host in LOOPBACK_HOSTS
+    if host is None:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host in LOOPBACK_HOSTS
 
 
 def register_with_bus(config: BridgeConfig) -> int:
@@ -491,6 +504,11 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
     )
+    # A scheme-less bus URL ("bus.example:8080/mcp") parses with no hostname
+    # and would read as loopback, skipping the topology guard below - catch
+    # the misconfiguration here instead of in a later connection error
+    if urllib.parse.urlsplit(config.bus_url).scheme not in ("http", "https"):
+        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http:// or https://")
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
     # delivered - and every machine would claim the same URL string, so the
@@ -502,6 +520,26 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"{bridge_hook_url(config)} is loopback - the bus would POST to itself. "
             "Set --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL to an address the bus "
             "host can reach (and set AGENT_EVENT_BUS_BRIDGE_SECRET)."
+        )
+    # A non-loopback hook URL means binding beyond localhost, where the HMAC
+    # is the only authentication: an unsigned endpoint would let anyone who
+    # can reach the port append attacker-authored lines to a session spool.
+    # Hard requirement, matching the refusal above - the bus itself defaults
+    # to auth-required, and the bridge must not invert that.
+    if not _is_loopback(bridge_hook_url(config)) and not config.secret:
+        raise SystemExit(
+            "Hook URL is non-loopback, so the listener must bind beyond localhost - "
+            "set AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
+            "authentication on this hop)."
+        )
+    # The bus POSTs to the hook URL's port while the listener binds --port;
+    # a mismatch is legitimate behind a reverse proxy, but name it - it's
+    # otherwise the same silent-inertness failure the guards above close
+    hook_port = urllib.parse.urlsplit(bridge_hook_url(config)).port
+    if hook_port is not None and hook_port != config.port:
+        logger.warning(
+            f"Hook URL advertises port {hook_port} but the listener binds {config.port} - "
+            "correct only if something forwards between them"
         )
     return config
 
@@ -519,16 +557,11 @@ def main():
     app = create_bridge_app(config, registration_state=state, registration_stop=stop)
     # Loopback hook URL -> bind localhost only (the local bus is the sole
     # caller). A non-loopback hook URL means a remote bus must reach us, so
-    # bind wide - at which point the HMAC secret is the only authentication.
+    # bind wide - config_from_args guarantees an HMAC secret on this path.
     if _is_loopback(bridge_hook_url(config)):
         host = "127.0.0.1"
     else:
-        host = "0.0.0.0"  # noqa: S104 - deliberate, guarded by warning below
-        if not config.secret:
-            logger.warning(
-                "Hook URL is non-loopback and AGENT_EVENT_BUS_BRIDGE_SECRET is unset - "
-                "anyone who can reach this port can inject wake events"
-            )
+        host = "0.0.0.0"  # noqa: S104 - deliberate; secret enforced at config time
     try:
         uvicorn.run(app, host=host, port=config.port)
     finally:

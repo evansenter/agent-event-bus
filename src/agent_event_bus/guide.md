@@ -366,11 +366,14 @@ machine. With a remote bus (`AGENT_EVENT_BUS_URL` pointing off-host), a
 loopback hook URL would make the bus POST to *itself* - silently - so the
 bridge refuses to start unless `--hook-url` advertises an address the bus
 host can reach (e.g. your Tailscale hostname). The listener then binds
-non-loopback, so set `AGENT_EVENT_BUS_BRIDGE_SECRET`: it becomes the only
-authentication. Note webhooks have no machine scoping - every bridge
-receives every `session:` DM; tmux wakes only work for sessions on the
-bridge's own machine, and spool files for foreign sessions accumulate until
-the pruning follow-up lands. Machine-scoped delivery is a v2 item.
+non-loopback, and the bridge refuses to start without
+`AGENT_EVENT_BUS_BRIDGE_SECRET`: the HMAC signature is the only
+authentication on that hop. Keep `--port` and the port in `--hook-url` in
+agreement unless a proxy genuinely forwards between them (a mismatch is
+logged). Note webhooks have no machine scoping - every bridge receives
+every `session:` DM; tmux wakes only work for sessions on the bridge's own
+machine, and spool files for foreign sessions accumulate until the pruning
+follow-up lands. Machine-scoped delivery is a v2 item.
 
 Supervision is deliberately out of scope for the v1 prototype: there is no
 `make install-bridge`, launchd plist, or systemd unit yet - run the bridge in
