@@ -108,7 +108,9 @@ Push events to HTTP endpoints instead of polling. Webhooks are called asynchrono
 
 `agent-event-bus-bridge` is the experimental local consumer of this
 mechanism: a daemon that wakes idle sessions when an actionable DM arrives
-(RFC #122). See the "Re-awakening Bridge" section of the usage guide
+(RFC #122). Run it as `uv run agent-event-bus-bridge` from the checkout -
+unlike the CLI, nothing symlinks it onto PATH until the supervision story
+lands. See the "Re-awakening Bridge" section of the usage guide
 (`agent-event-bus://guide`).
 
 ### MCP

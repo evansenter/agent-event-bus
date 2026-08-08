@@ -321,7 +321,10 @@ Webhooks retry up to 2 times with exponential backoff if the endpoint returns 4x
 `agent-event-bus-bridge` closes the pull-only delivery gap (RFC #122): a
 small localhost daemon that registers a webhook on the bus, filters to
 **actionable** events on **`session:` channels** (DMs), and wakes the target
-session. Broadcast events stay pull-only.
+session. Broadcast events stay pull-only. Address DMs by **`session_id`**
+(the UUID) - `display_id` is display-only bus-wide, so a
+`session:<display-id>` event still spools (every `session:` channel is
+actionable) but into a file no drain hook ever reads.
 
 ```
 uv run agent-event-bus-bridge                    # spool backend (default)

@@ -138,13 +138,16 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
     )
 
 
-# Session ids are UUIDs (36 chars) or display ids ("brave-trex"); nothing
-# else. The channel string is publisher-controlled wire input and the id
-# becomes a spool filename, so path separators, "..", and any other
-# unexpected byte must never reach the filesystem - the bus warns on
-# malformed channels but does not reject them. The length bound keeps a
-# too-long name from turning into an unretryable OSError out of the spool
-# open (and caps spool-file blast radius).
+# PATH SAFETY, not addressability: the channel string is
+# publisher-controlled wire input and the id becomes a spool filename, so
+# path separators, "..", and any other unexpected byte must never reach
+# the filesystem - the bus warns on malformed channels but does not reject
+# them. The length bound keeps a too-long name from turning into an
+# unretryable OSError out of the spool open (and caps spool-file blast
+# radius). The charset happens to cover display ids ("brave-trex") as well
+# as the UUIDs sessions are actually addressed by - but the bus resolves
+# DMs by session_id only (display_id is display-only bus-wide), so a
+# session:<display-id> DM spools to a file no drain hook will ever read.
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # The unsafe-id rejection below is publisher-drivable (the bus warns on

@@ -282,14 +282,21 @@ class TestHookFiltering:
 
         assert client.post("/hook", content=chunks()).status_code == 413
 
-    def test_actionable_dm_delivered_to_spool(self, client, config):
-        resp = client.post("/hook", content=json.dumps(make_event()).encode())
+    def test_actionable_dm_delivered_to_spool(self, client, config, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="agent-event-bus-bridge"):
+            resp = client.post("/hook", content=json.dumps(make_event()).encode())
 
         assert resp.json()["status"] == "delivered"
         assert resp.json()["action"] == "spool"
         lines = (config.wake_dir / "target-1.jsonl").read_text().splitlines()
         assert len(lines) == 1
         assert json.loads(lines[0])["payload"] == "need a review"
+        # The happy-path breadcrumb is an operability guarantee - the spool
+        # backend's terminal must show more than the registration line, so
+        # pin the INFO line carrying the event id like the warnings around it
+        assert any("Spooled event 1" in r.message for r in caplog.records)
 
     def test_health(self, client):
         assert client.get("/health").json()["status"] == "ok"
