@@ -967,6 +967,17 @@ class TestEnvValidation:
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert config.backend == "tmux"
 
+    def test_empty_backend_and_bus_url_env_fall_back_to_defaults(self, monkeypatch):
+        """The last two env vars without the `or DEFAULT` normalization: an
+        accidentally empty export must mean the default, not a refused
+        empty string - same accident the secret and wake-dir already
+        handle."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "")
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.backend == "spool"
+        assert config.bus_url == bridge.DEFAULT_URL
+
     def test_env_port_typo_is_a_config_error(self, monkeypatch):
         """Named error at CONFIG time - parser-build must stay clean so
         --help keeps working under a typo'd env var."""
@@ -1224,19 +1235,32 @@ class TestBindHost:
             with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
                 bridge.config_from_args(args)
 
-    def test_non_loopback_bind_with_secret_is_accepted(self, monkeypatch, caplog):
-        """Accepted - but this is also the fourth quadrant (wide bind,
-        loopback hook URL): the bus POSTs to 127.0.0.1 where nothing
-        listens, so the warning must actually fire."""
+    def test_wildcard_bind_with_loopback_hook_is_quiet(self, monkeypatch, caplog):
+        """A wildcard bind listens on loopback TOO, so the local bus's POST
+        to 127.0.0.1 lands exactly as advertised - the fourth-quadrant
+        warning must NOT fire (its advice would replace a working
+        loopback-only hop with an externally routable one). The secret is
+        still required: 0.0.0.0 genuinely exposes the port."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        for bind in ("0.0.0.0", "::"):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+                config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", bind]))
+            assert bridge.bind_host(config) == bind
+            assert not any("advertises loopback" in r.message for r in caplog.records)
+
+    def test_pinned_bind_with_loopback_hook_warns(self, monkeypatch, caplog):
+        """The real fourth quadrant: a PINNED non-loopback bind does not
+        listen on 127.0.0.1, so the advertised loopback hook URL is refused
+        at TCP - the warning must fire naming both values."""
         import logging
 
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
         with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
-            config = bridge.config_from_args(
-                bridge.build_parser().parse_args(["--bind", "0.0.0.0"])
-            )
-        assert bridge.bind_host(config) == "0.0.0.0"
-        assert any("0.0.0.0" in r.message and "127.0.0.1" in r.message for r in caplog.records)
+            bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "100.100.1.2"]))
+        assert any("100.100.1.2" in r.message and "127.0.0.1" in r.message for r in caplog.records)
 
     def test_loopback_bind_is_accepted_without_secret(self):
         config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "127.0.0.1"]))

@@ -530,6 +530,18 @@ def _is_host_loopback(host: str) -> bool:
         return host in LOOPBACK_HOSTS
 
 
+def _is_host_wildcard(host: str) -> bool:
+    """0.0.0.0 / :: are unspecified, not loopback, to ipaddress - but a
+    wildcard bind listens on every interface INCLUDING loopback, so a
+    loopback hook URL is perfectly reachable under one. Exempt them from
+    the advertises-loopback mismatch (they still count as exposed for the
+    secret requirement - that part is genuinely true)."""
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
 def _is_loopback(url: str) -> bool:
     host = urllib.parse.urlsplit(url).hostname
     return True if host is None else _is_host_loopback(host)
@@ -680,7 +692,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="agent-event-bus re-awakening bridge (RFC #122)")
     parser.add_argument(
         "--bus-url",
-        default=os.environ.get("AGENT_EVENT_BUS_URL", DEFAULT_URL),
+        # `or`, matching every sibling: an accidentally empty export must
+        # fall back to the default, not become a refused empty URL
+        default=os.environ.get("AGENT_EVENT_BUS_URL") or DEFAULT_URL,
         help="Bus MCP endpoint to register the webhook on",
     )
     parser.add_argument(
@@ -692,7 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--backend",
         choices=["spool", "tmux"],
-        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BACKEND", "spool"),
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BACKEND") or "spool",
         help="Wake mechanism: spool file only, or tmux send-keys + spool",
     )
     parser.add_argument(
@@ -879,10 +893,16 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Hook URL path {hook_path!r} isn't /hook (the only route this "
             "listener serves) - correct only if something rewrites between them"
         )
-    # Fourth quadrant: a non-loopback bind under a loopback hook URL means
-    # the bridge advertises 127.0.0.1 while nothing listens there - every
-    # dispatch is refused at TCP. Same warn-don't-refuse policy as above.
-    if not _is_host_loopback(bind_host(config)) and _is_loopback(bridge_hook_url(config)):
+    # Fourth quadrant: a PINNED non-loopback bind under a loopback hook URL
+    # means the bridge advertises 127.0.0.1 while nothing listens there -
+    # every dispatch is refused at TCP. Wildcard binds are exempt: 0.0.0.0
+    # and :: listen on loopback too, so that combination works exactly as
+    # advertised. Same warn-don't-refuse policy as above.
+    if (
+        not _is_host_loopback(bind_host(config))
+        and not _is_host_wildcard(bind_host(config))
+        and _is_loopback(bridge_hook_url(config))
+    ):
         logger.warning(
             f"Listener binds {bind_host(config)} but the hook URL "
             f"{bridge_hook_url(config)} advertises loopback - the bus can't reach it; "

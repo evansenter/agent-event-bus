@@ -410,6 +410,14 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   `registered: true` on a bridge the bus no longer dispatches to - restart
   the bridge after manual webhook surgery. Periodic re-assertion is a
   follow-up.
+- Each delivered `200` carries an `action` field naming what happened:
+  `spool` (spool backend, working as designed), `tmux` (wake injected),
+  `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
+  backend, no `panes.json` entry - the *normal* outcome for a session on
+  another machine), or `spool-tmux-failed` (the `send-keys` attempt itself
+  failed). Only the last one means tmux is broken on this host; the
+  unmapped arm logs only at debug, so the response body is where that
+  distinction surfaces at the default log level.
 
 Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,
