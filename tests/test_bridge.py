@@ -593,6 +593,23 @@ class TestBusRegistration:
         assert register["arguments"]["channel"] == "session:"
         assert register["url"] == "http://bus/mcp"
 
+    def test_unregister_unexpected_result_warns_not_asserts(self, tmp_path, caplog):
+        """Shutdown-side twin of the sweep's result check: best-effort, so a
+        bus that answers but doesn't delete is a warning (the next startup
+        sweep reclaims the row) - but the log must not claim 'Unregistered'
+        for a removal that never happened."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            return {}  # a JSON-RPC error response falls through to this
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "call_tool", fake_call_tool):
+                bridge.unregister_from_bus(config, 42)
+        assert any("unexpected result" in r.message for r in caplog.records)
+
     def test_failed_stale_removal_is_retryable(self, tmp_path):
         """unregister_webhook reports logical failure in-band (success-False
         dict; call_tool raises only on transport errors) - a sweep that
@@ -815,6 +832,40 @@ class TestDaemonLifecycle:
         # Shutdown stopped and joined the thread, so the result is visible
         assert state["webhook_id"] == 42
         assert stop.is_set()
+
+    def test_cancelled_shutdown_still_stops_and_joins(self, tmp_path):
+        """TestClient's context exit is always a CLEAN shutdown, so the two
+        subtlest lifespan lines - the try/finally around the yield and the
+        shielded join - are invisible to the tests above. Drive the lifespan
+        directly and tear it down under an active cancellation: without the
+        try/finally the cleanup never runs at all; without the shield,
+        anyio.to_thread.run_sync raises at its own cancellation checkpoint
+        and the join is skipped, so the post-stop commit below is never
+        observed and the webhook row leaks."""
+        import anyio
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+
+        def slow_register(cfg):
+            time.sleep(0.2)  # the commit lands only if shutdown really joins
+            return 44
+
+        state: dict = {}
+        stop = threading.Event()
+        with patch.object(bridge, "register_with_bus", slow_register):
+            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+
+            async def scenario():
+                with anyio.CancelScope() as scope:
+                    async with app.router.lifespan_context(app):
+                        scope.cancel()
+                    # exiting the lifespan now tears down under an active
+                    # cancellation - the path uvicorn's forced shutdown takes
+
+            anyio.run(scenario)
+
+        assert stop.is_set()
+        assert state["webhook_id"] == 44
 
     def test_shutdown_waits_for_inflight_registration(self, tmp_path):
         """stop can't interrupt a register call already inside its HTTP POST;

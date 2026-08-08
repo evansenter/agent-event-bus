@@ -46,8 +46,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import anyio
+# Explicit submodule import: `import anyio` alone doesn't bind to_thread -
+# it currently resolves only through starlette's own imports. Matches
+# server.py and middleware.py.
+import anyio.to_thread
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -414,8 +418,6 @@ def create_bridge_app(
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
     async def hook_endpoint(request: Request) -> JSONResponse:
-        from starlette.concurrency import run_in_threadpool
-
         # Precheck the honest case cheaply; the post-read check below covers
         # a missing or lying content-length (e.g. chunked encoding)
         content_length = request.headers.get("content-length")
@@ -555,11 +557,23 @@ def register_with_bus(config: BridgeConfig) -> int:
 def unregister_from_bus(config: BridgeConfig, webhook_id: int) -> None:
     """Best-effort webhook cleanup on shutdown."""
     try:
-        call_tool("unregister_webhook", {"webhook_id": webhook_id}, url=config.bus_url)
-        logger.info(f"Unregistered bridge webhook #{webhook_id}")
+        result = call_tool("unregister_webhook", {"webhook_id": webhook_id}, url=config.bus_url)
     except SystemExit:
         # call_tool exits on connection errors; shutdown must not care
         logger.warning(f"Could not unregister webhook #{webhook_id} (bus unreachable)")
+        return
+    # Same accept-shape as the startup sweep: the bus reports logical
+    # failure in-band (success-False dict), and already-gone is the goal
+    # state. Shutdown stays best-effort, so a surprise is a warning here
+    # rather than the sweep's retryable SystemExit - but the log must not
+    # assert a removal it never checked; the next startup sweep reclaims.
+    ok = isinstance(result, dict) and (
+        result.get("success") or result.get("error") == "Webhook not found"
+    )
+    if ok:
+        logger.info(f"Unregistered bridge webhook #{webhook_id}")
+    else:
+        logger.warning(f"unregister_webhook #{webhook_id} returned unexpected result: {result!r}")
 
 
 def register_with_retry(
