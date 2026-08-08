@@ -143,6 +143,31 @@ class TestPathSafety:
         ):
             assert resolve_target_session(make_event(channel=channel)) is None
 
+    def test_unsafe_id_warning_is_bounded_per_channel(self, caplog, monkeypatch):
+        """The rejection arm is publisher-drivable, so a repeated garbage
+        channel must not write one WARNING per event: first sighting warns,
+        repeats are debug, and the dedup set clears at its cap so warnings
+        resume instead of the set growing without bound."""
+        import logging
+
+        monkeypatch.setattr(bridge, "_warned_unsafe_channels", set())
+        monkeypatch.setattr(bridge, "_WARNED_UNSAFE_CHANNELS_CAP", 2)
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            assert resolve_target_session(make_event(channel="session:a/b")) is None
+            assert resolve_target_session(make_event(channel="session:a/b")) is None
+            assert len(warnings()) == 1  # the repeat was debug, not warning
+            assert "session:a/b" in warnings()[0].message
+            # Two more distinct channels reach the cap and clear the set...
+            assert resolve_target_session(make_event(channel="session:c/d")) is None
+            assert resolve_target_session(make_event(channel="session:e/f")) is None
+            # ...so the first channel warns again instead of staying dark
+            assert resolve_target_session(make_event(channel="session:a/b")) is None
+        assert len(warnings()) == 4
+
     def test_traversal_channel_is_ignored_and_writes_nothing(self, client, config, tmp_path):
         evil = make_event(channel="session:../../escape")
         resp = client.post("/hook", content=json.dumps(evil).encode())
@@ -245,9 +270,10 @@ class TestHookFiltering:
         assert client.post("/hook", content=big).status_code == 413
 
     def test_oversized_chunked_body_rejected(self, client):
-        """The post-read check is the half an attacker actually hits: a
-        chunked body carries no content-length to precheck. (The body is
-        still buffered once before the 413 - acknowledged residual.)"""
+        """The streamed count is the half an attacker actually hits: a
+        chunked body carries no content-length to precheck, and the bound
+        must hold WHILE reading - the 413 fires mid-stream, not after an
+        unbounded buffer."""
 
         def chunks():
             yield b'{"payload": "'
@@ -374,7 +400,7 @@ class TestInjectorCooldown:
             raise bridge.subprocess.CalledProcessError(1, cmd)
 
         with patch.object(bridge.subprocess, "run", tmux_fail):
-            assert injector.deliver("target-1", make_event()) == "spool"
+            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
 
         with patch.object(bridge.subprocess, "run", tmux_ok):
             assert injector.deliver("target-1", make_event()) == "tmux"
@@ -506,7 +532,11 @@ class TestTmuxBackend:
             action = injector.deliver("target-1", make_event())
 
         assert action == "tmux"
-        assert commands[0][:4] == ["tmux", "send-keys", "-t", "%7"]
+        # Full argv, not a prefix: WAKE_PROMPT as ONE argument without -l,
+        # then Enter - dropping the Enter (or switching to -l without a
+        # separate Enter send) would type the prompt and never submit it,
+        # a wake that wakes nobody while everything else stays green
+        assert commands[0] == ["tmux", "send-keys", "-t", "%7", bridge.WAKE_PROMPT, "Enter"]
         # The event is also spooled (durable path is unconditional)
         assert (config.wake_dir / "target-1.jsonl").exists()
 
@@ -517,7 +547,10 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run") as mock_run:
             action = injector.deliver("target-1", make_event())
 
-        assert action == "spool"
+        # Distinct from plain "spool": the unmapped-pane arm logs only at
+        # debug, so the action field is the one in-band signal separating a
+        # broken tmux setup from the spool backend's normal path
+        assert action == "spool-tmux-failed"
         mock_run.assert_not_called()
 
     def test_tmux_failure_falls_back_to_spool(self, tmp_path):
@@ -532,7 +565,7 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run", fake_run):
             action = injector.deliver("target-1", make_event())
 
-        assert action == "spool"
+        assert action == "spool-tmux-failed"
 
     def test_tmux_oserror_falls_back_to_spool(self, tmp_path):
         """A non-executable tmux binary (PermissionError) must degrade to
@@ -544,7 +577,7 @@ class TestTmuxBackend:
             raise PermissionError("tmux not executable")
 
         with patch.object(bridge.subprocess, "run", tmux_perm):
-            assert injector.deliver("target-1", make_event()) == "spool"
+            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
 
     def test_malformed_panes_json_degrades_to_spool(self, tmp_path):
         """panes.json is maintained by an external component - every failure
@@ -556,7 +589,7 @@ class TestTmuxBackend:
         for content in (b'["not", "an", "object"]', b'"bare string"', b"null", b"\xff\xfe{}"):
             panes.write_bytes(content)
             with patch.object(bridge.subprocess, "run") as mock_run:
-                assert injector.deliver("target-1", make_event()) == "spool"
+                assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
             mock_run.assert_not_called()
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
@@ -565,7 +598,7 @@ class TestTmuxBackend:
         (config.wake_dir / "panes.json").mkdir()  # IsADirectoryError on read
 
         with patch.object(bridge.subprocess, "run") as mock_run:
-            assert injector.deliver("target-1", make_event()) == "spool"
+            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
         mock_run.assert_not_called()
 
 
@@ -804,13 +837,16 @@ class TestBusRegistration:
 
 
 class TestDaemonLifecycle:
-    """The lifespan owns registration: startup must actually fire the thread
-    (a wiring failure is silent - the daemon binds, serves /health, and never
-    registers), and shutdown must join it before the caller reads the id."""
+    """The lifespan owns registration end to end: startup must actually fire
+    the thread (a wiring failure is silent - the daemon binds, serves /health,
+    and never registers), and shutdown must join it, then unregister the
+    committed id itself and pop it - main()'s finally is belt-and-braces
+    only, for exits that skip the lifespan."""
 
     def test_lifespan_starts_registration_and_joins_on_shutdown(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         registered = threading.Event()
+        unregistered: list = []
 
         def fake_register(cfg):
             registered.set()
@@ -819,18 +855,24 @@ class TestDaemonLifecycle:
         state: dict = {}
         stop = threading.Event()
         with patch.object(bridge, "register_with_bus", fake_register):
-            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-            with TestClient(app) as client:
-                assert registered.wait(timeout=5), "startup never fired registration"
-                # /health surfaces the registration outcome - the one signal
-                # that separates "working" from "listening but never registered"
-                for _ in range(500):
-                    if client.get("/health").json().get("registered"):
-                        break
-                    time.sleep(0.01)
-                assert client.get("/health").json()["registered"] is True
-        # Shutdown stopped and joined the thread, so the result is visible
-        assert state["webhook_id"] == 42
+            with patch.object(
+                bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+            ):
+                app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+                with TestClient(app) as client:
+                    assert registered.wait(timeout=5), "startup never fired registration"
+                    # /health surfaces the registration outcome - the one signal
+                    # that separates "working" from "listening but never registered"
+                    for _ in range(500):
+                        if client.get("/health").json().get("registered"):
+                            break
+                        time.sleep(0.01)
+                    assert client.get("/health").json()["registered"] is True
+        # Shutdown stopped and joined the thread, then unregistered the
+        # committed id and popped it - the app owns the row end to end, and
+        # a main()-style belt-and-braces finally finds nothing to repeat
+        assert unregistered == [42]
+        assert state.get("webhook_id") is None
         assert stop.is_set()
 
     def test_cancelled_shutdown_still_stops_and_joins(self, tmp_path):
@@ -852,20 +894,28 @@ class TestDaemonLifecycle:
 
         state: dict = {}
         stop = threading.Event()
+        unregistered: list = []
         with patch.object(bridge, "register_with_bus", slow_register):
-            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+            with patch.object(
+                bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+            ):
+                app = create_bridge_app(config, registration_state=state, registration_stop=stop)
 
-            async def scenario():
-                with anyio.CancelScope() as scope:
-                    async with app.router.lifespan_context(app):
-                        scope.cancel()
-                    # exiting the lifespan now tears down under an active
-                    # cancellation - the path uvicorn's forced shutdown takes
+                async def scenario():
+                    with anyio.CancelScope() as scope:
+                        async with app.router.lifespan_context(app):
+                            scope.cancel()
+                        # exiting the lifespan now tears down under an active
+                        # cancellation - the path uvicorn's forced shutdown takes
 
-            anyio.run(scenario)
+                anyio.run(scenario)
 
         assert stop.is_set()
-        assert state["webhook_id"] == 44
+        # The unregister call observing 44 is the proof the join really ran
+        # under cancellation - the id is committed only after slow_register's
+        # sleep, and the lifespan pops it after handing it off
+        assert unregistered == [44]
+        assert state.get("webhook_id") is None
 
     def test_shutdown_waits_for_inflight_registration(self, tmp_path):
         """stop can't interrupt a register call already inside its HTTP POST;
@@ -881,12 +931,17 @@ class TestDaemonLifecycle:
 
         state: dict = {}
         stop = threading.Event()
+        unregistered: list = []
         with patch.object(bridge, "register_with_bus", slow_register):
-            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-            with TestClient(app):
-                assert entered.wait(timeout=5)  # registration is in flight
-            # Context exit runs lifespan shutdown while slow_register sleeps
-        assert state["webhook_id"] == 43
+            with patch.object(
+                bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+            ):
+                app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+                with TestClient(app):
+                    assert entered.wait(timeout=5)  # registration is in flight
+                # Context exit runs lifespan shutdown while slow_register sleeps
+        # The join observed the in-flight commit, so the unregister got it
+        assert unregistered == [43]
 
     def test_app_without_registration_has_inert_lifespan(self, config):
         with TestClient(create_bridge_app(config)) as client:
@@ -1176,6 +1231,33 @@ class TestBindHost:
             "laptop.tailnet.example" in r.message and "127.0.0.1" in r.message
             for r in caplog.records
         )
+
+    def test_ipv6_hook_with_ipv4_bind_warns(self, monkeypatch, caplog):
+        """0.0.0.0 binds IPv4 only: an IPv6 hook literal with the derived
+        wide bind is refused at TCP while every quadrant warning stays
+        quiet (both sides non-loopback, port and path agreeing), so the
+        address-family mismatch needs its own name."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        args = bridge.build_parser().parse_args(
+            ["--hook-url", "http://[fd7a:115c:a1e0::1]:8082/hook"]
+        )
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            config = bridge.config_from_args(args)
+        assert bridge.bind_host(config) == "0.0.0.0"
+        assert any("IPv6" in r.message and "0.0.0.0" in r.message for r in caplog.records)
+
+    def test_ipv6_hook_with_ipv6_bind_is_quiet(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        args = bridge.build_parser().parse_args(
+            ["--hook-url", "http://[fd7a:115c:a1e0::1]:8082/hook", "--bind", "::"]
+        )
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(args)
+        assert not any("IPv6" in r.message for r in caplog.records)
 
     def test_main_passes_bind_through_and_unregisters(self, monkeypatch, tmp_path):
         """End-to-end main(): the default local config binds loopback, the

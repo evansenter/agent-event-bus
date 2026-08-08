@@ -142,6 +142,16 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
 # open (and caps spool-file blast radius).
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
+# The unsafe-id rejection below is publisher-drivable (the bus warns on
+# malformed channels but never rejects them), so a per-event WARNING would
+# let any publisher choose how much the bridge writes to its log. Warn on
+# the first sighting of each distinct channel string, debug the rest.
+# Cleared at a cap rather than LRU-evicted: past that many distinct garbage
+# channels, one repeat warning per channel is the lesser noise. Unlocked -
+# a rare race just duplicates a warning.
+_warned_unsafe_channels: set[str] = set()
+_WARNED_UNSAFE_CHANNELS_CAP = 64
+
 
 def resolve_target_session(event: dict) -> str | None:
     """Which session should this event wake?
@@ -159,7 +169,13 @@ def resolve_target_session(event: dict) -> str | None:
         return None
     target = channel.split(":", 1)[1]
     if not SESSION_ID_PATTERN.fullmatch(target):
-        logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
+        if channel in _warned_unsafe_channels:
+            logger.debug(f"Ignoring event with unsafe session id in channel {channel!r}")
+        else:
+            if len(_warned_unsafe_channels) >= _WARNED_UNSAFE_CHANNELS_CAP:
+                _warned_unsafe_channels.clear()
+            _warned_unsafe_channels.add(channel)
+            logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
         return None
     return target
 
@@ -187,8 +203,13 @@ class Injector:
             ) from None
 
     def deliver(self, session_id: str, event: dict) -> str:
-        """Wake session_id for event. Returns the action taken:
-        "tmux", "spool", or "spool-cooldown".
+        """Wake session_id for event. Returns the action taken: "tmux",
+        "spool" (spool backend working as designed), "spool-cooldown", or
+        "spool-tmux-failed" (tmux backend, wake missed or failed). The
+        distinct failure value is the one in-band signal - it rides the 200
+        response's `action` field - that separates "tmux is broken on this
+        box" from the spool backend's normal path, since the unmapped-pane
+        arm logs only at debug.
 
         The cooldown bounds successful injections only: spool writes are
         durable bookkeeping, not wakes, and a failed tmux attempt must not
@@ -233,7 +254,7 @@ class Injector:
             # prune returned spool-cooldown above.
             if self._last_wake.get(session_id) == now:
                 del self._last_wake[session_id]
-        return "spool"
+        return "spool-tmux-failed"
 
     def _spool(self, session_id: str, event: dict) -> None:
         """Always-on durable path: one JSON line per event, per session.
@@ -331,11 +352,14 @@ def create_bridge_app(
     """Build the ASGI app: POST /hook (webhook receiver) + GET /health.
 
     When registration_state/registration_stop are given, the app's lifespan
-    owns bus registration: startup launches register_with_retry in a
-    background thread (so the listener binds first and a down bus can't kill
-    the daemon), and shutdown stops it and joins - stop can't interrupt a
+    owns bus registration end to end: startup launches register_with_retry
+    in a background thread (so the listener binds first and a down bus can't
+    kill the daemon), and shutdown stops it, joins - stop can't interrupt a
     register call already inside its HTTP POST, so without the join a clean
-    exit could read webhook_id before the thread writes it and leak the row.
+    exit could read webhook_id before the thread writes it and leak the row -
+    and unregisters the committed id. The app created the row, so the app
+    removes it; any embedding (uvicorn --factory, an ASGI mount) gets clean
+    shutdown without needing a main()-style finally of its own.
     """
     injector = Injector(config)
     registration_thread: threading.Thread | None = None
@@ -370,6 +394,16 @@ def create_bridge_app(
                     await anyio.to_thread.run_sync(
                         functools.partial(registration_thread.join, REGISTRATION_JOIN_TIMEOUT)
                     )
+                    # pop, not get: hand the id off exactly once, so main()'s
+                    # belt-and-braces finally (for exits that skip the
+                    # lifespan) can't double-unregister. Same off-loop
+                    # treatment as the join - unregister_from_bus is a
+                    # blocking call_tool POST - inside the same shield.
+                    webhook_id = registration_state.pop("webhook_id", None)
+                    if webhook_id is not None:
+                        await anyio.to_thread.run_sync(
+                            functools.partial(unregister_from_bus, config, webhook_id)
+                        )
 
     def process(body: bytes, signature: str | None) -> tuple[dict, int]:
         """Sync webhook handling (runs in a worker thread - the file appends
@@ -422,14 +456,23 @@ def create_bridge_app(
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
     async def hook_endpoint(request: Request) -> JSONResponse:
-        # Precheck the honest case cheaply; the post-read check below covers
+        # Precheck the honest case cheaply; the streamed count below covers
         # a missing or lying content-length (e.g. chunked encoding)
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
             return JSONResponse({"error": "body too large"}, status_code=413)
-        body = await request.body()
-        if len(body) > MAX_BODY_BYTES:
-            return JSONResponse({"error": "body too large"}, status_code=413)
+        # Stream with a running count, not request.body(): body() concatenates
+        # every chunk unconditionally, so a chunked POST (no content-length to
+        # precheck) could make the daemon buffer arbitrarily many bytes before
+        # a post-read check ever ran - the bound must hold WHILE reading
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > MAX_BODY_BYTES:
+                return JSONResponse({"error": "body too large"}, status_code=413)
+            chunks.append(chunk)
+        body = b"".join(chunks)
         signature = request.headers.get("x-event-bus-signature")
         payload, status = await run_in_threadpool(process, body, signature)
         return JSONResponse(payload, status_code=status)
@@ -828,6 +871,30 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"{bridge_hook_url(config)} advertises loopback - the bus can't reach it; "
             "set --hook-url to an address on the bound interface"
         )
+    # Address-family mismatch: 0.0.0.0 binds IPv4 only, so an IPv6 hook
+    # literal (a Tailscale IPv6 address, say) is refused at TCP while every
+    # quadrant warning above stays quiet - both sides can be non-loopback
+    # with port and path agreeing. Hostname hooks are exempt: DNS/MagicDNS
+    # publishes A records too and happy-eyeballs falls back to v4. Hostname
+    # binds ("localhost") are exempt the other way - the resolver decides
+    # their family.
+    try:
+        hook_is_v6 = (
+            ipaddress.ip_address(urllib.parse.urlsplit(bridge_hook_url(config)).hostname).version
+            == 6
+        )
+    except ValueError:
+        hook_is_v6 = False
+    try:
+        bind_is_v4 = ipaddress.ip_address(bind_host(config)).version == 4
+    except ValueError:
+        bind_is_v4 = False
+    if hook_is_v6 and bind_is_v4:
+        logger.warning(
+            f"Hook URL host is an IPv6 address but the listener binds "
+            f"{bind_host(config)} (IPv4 only) - the bus can't reach it; "
+            "set --bind to '::' (dual-stack) or an IPv6 address"
+        )
     return config
 
 
@@ -846,7 +913,8 @@ def main():
         uvicorn.run(app, host=bind_host(config), port=config.port)
     finally:
         # Lifespan shutdown already stopped and joined the registration
-        # thread; the stop here only covers exits that skipped the lifespan
+        # thread AND unregistered (popping the id) - this is pure
+        # belt-and-braces for exits that skipped the lifespan
         stop.set()
         if state.get("webhook_id") is not None:
             unregister_from_bus(config, state["webhook_id"])
