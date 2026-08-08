@@ -469,6 +469,11 @@ def _publish_event_impl(
         "event_type": event_type,
         "payload": payload,
         "channel": channel,
+        # Effective level, so publishers see what the server assigned - soft
+        # validation means an unknown signal_level is otherwise silently
+        # replaced by the derived value (the warning only reaches the server
+        # log, not the caller)
+        "signal_level": _get_signal_level(event),
     }
     if correlation_id:
         result["correlation_id"] = correlation_id

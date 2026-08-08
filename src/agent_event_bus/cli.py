@@ -7,9 +7,12 @@ Usage:
     agent-event-bus-cli sessions
     agent-event-bus-cli channels
     agent-event-bus-cli publish --type TYPE --payload PAYLOAD [--channel CHANNEL] [--session-id ID]
+                         [--title TITLE] [--tags T1,T2] [--correlation-id ID]
+                         [--signal-level lifecycle|info|actionable]
     agent-event-bus-cli events [--cursor CURSOR] [--session-id ID] [--limit N] [--include T1,T2]
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
-                         [--channel CHANNEL] [--resume] [--peek]
+                         [--channel CHANNEL] [--resume] [--peek] [--correlation-id ID]
+                         [--min-level lifecycle|info|actionable]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
     agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
     agent-event-bus-cli webhook list [--all]
@@ -507,7 +510,8 @@ def main():
     )
     p_events.add_argument(
         "--channel",
-        help="Filter to a specific channel (e.g., 'repo:my-project', 'all')",
+        help="Filter to a specific channel (e.g., 'repo:my-project', 'all') "
+        "(non-consuming: does not advance the session cursor)",
     )
     p_events.add_argument(
         "--resume",
@@ -521,9 +525,14 @@ def main():
     )
     p_events.add_argument(
         "--include",
-        help="Comma-separated event types to include (e.g., task_completed,ci_completed)",
+        help="Comma-separated event types to include (e.g., task_completed,ci_completed) "
+        "(non-consuming: does not advance the session cursor)",
     )
-    p_events.add_argument("--correlation-id", help="Filter to one correlation thread")
+    p_events.add_argument(
+        "--correlation-id",
+        help="Filter to one correlation thread "
+        "(non-consuming: does not advance the session cursor)",
+    )
     p_events.add_argument(
         "--min-level",
         choices=["lifecycle", "info", "actionable"],

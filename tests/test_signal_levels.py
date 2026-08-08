@@ -136,3 +136,23 @@ class TestCLIMinLevel:
 
                 args = mock_cmd.call_args[0][0]
                 assert args.min_level == "info"
+
+
+class TestPublishEchoesEffectiveLevel:
+    """The publish result reports the server-assigned level - soft validation
+    is otherwise silent toward the caller."""
+
+    def test_derived_level_echoed(self):
+        result = publish_event(event_type="help_needed", payload="p")
+        assert result["signal_level"] == "actionable"
+
+    def test_explicit_level_echoed(self):
+        result = publish_event(
+            event_type="session_registered", payload="p", signal_level="actionable"
+        )
+        assert result["signal_level"] == "actionable"
+
+    def test_unknown_level_echoes_derived_fallback(self):
+        """An MCP caller sending an unknown level sees what actually shipped."""
+        result = publish_event(event_type="note", payload="p", signal_level="urgent")
+        assert result["signal_level"] == "info"
