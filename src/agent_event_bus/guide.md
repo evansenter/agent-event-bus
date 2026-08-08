@@ -324,9 +324,13 @@ small localhost daemon that registers a webhook on the bus, filters to
 session. Broadcast events stay pull-only.
 
 ```
-agent-event-bus-bridge                    # spool backend (default)
-agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
+uv run agent-event-bus-bridge                    # spool backend (default)
+uv run agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
 ```
+
+(`uv run` from the repo checkout: the console script lives in the project
+venv - unlike `agent-event-bus-cli`, nothing symlinks it onto PATH yet.
+That lands with the supervision story.)
 
 - **spool**: every wake event is appended to
   `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to

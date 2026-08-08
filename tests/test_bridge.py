@@ -593,6 +593,30 @@ class TestTmuxBackend:
                 assert injector.deliver("target-1", make_event()) == "spool-unmapped"
             mock_run.assert_not_called()
 
+    def test_persistent_panes_failure_warns_once(self, tmp_path, caplog):
+        """A stuck-broken panes.json must not emit one WARNING per DM (same
+        unbounded-volume shape as the unsafe-channel warning): first
+        sighting warns, repeats are debug, and a healthy read re-arms."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            panes.write_text("[]")  # not an object
+            injector.deliver("target-1", make_event())
+            injector.deliver("target-1", make_event())
+            assert len(warnings()) == 1  # the repeat was debug
+            panes.write_text("{}")  # healthy read re-arms the guard
+            injector.deliver("target-1", make_event())
+            panes.write_text("[]")  # breaks again - warns again
+            injector.deliver("target-1", make_event())
+        assert len(warnings()) == 2
+
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
         injector = Injector(config)

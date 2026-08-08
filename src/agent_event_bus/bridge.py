@@ -25,7 +25,9 @@ so nothing is lost. In the default spool backend the cooldown never engages -
 a spool line only becomes a wake when the drain hook acts on it, so bounding
 that belongs to the drain hook.
 
-Run:  agent-event-bus-bridge [--backend tmux] [--port 8082] ...
+Run:  uv run agent-event-bus-bridge [--backend tmux] [--port 8082] ...
+(from the repo checkout - the console script lives in the project venv;
+nothing puts it on PATH yet, that lands with the supervision story)
 The bridge registers its own webhook on the bus at startup (HMAC-signed when
 AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
 """
@@ -190,6 +192,8 @@ class Injector:
         self.config = config
         self._lock = threading.Lock()
         self._last_wake: dict[str, float] = {}
+        # Last panes.json warning emitted, for the warn-once guard below
+        self._last_panes_warning: str | None = None
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event. The dir is
@@ -226,6 +230,12 @@ class Injector:
         # so it must NOT run under the global lock, or one stalled drain
         # would stall every session's delivery
         self._spool(session_id, event)
+        # The one default-level breadcrumb on the happy path: without it the
+        # spool backend's terminal shows the registration line and then
+        # permanent silence, indistinguishable from a bus that stopped
+        # dispatching. Volume is bounded by the actionable-DM rate - exactly
+        # the traffic this daemon exists to surface.
+        logger.info(f"Spooled event {event.get('event_id')} for {session_id[:8]}...")
 
         if self.config.backend != "tmux":
             return "spool"
@@ -323,15 +333,31 @@ class Injector:
         try:
             panes = json.loads(panes_file.read_text())
         except FileNotFoundError:
+            self._last_panes_warning = None  # normal unmapped state re-arms
             return None
         except (OSError, ValueError) as e:
-            logger.warning(f"Unreadable panes.json ({e}); treating as unmapped")
+            self._warn_panes_once(f"Unreadable panes.json ({e}); treating as unmapped")
             return None
         if not isinstance(panes, dict):
-            logger.warning("panes.json is not an object; treating as unmapped")
+            self._warn_panes_once("panes.json is not an object; treating as unmapped")
             return None
+        self._last_panes_warning = None  # healthy read re-arms the warning
         pane = panes.get(session_id)
         return pane if isinstance(pane, str) and pane else None
+
+    def _warn_panes_once(self, message: str) -> None:
+        """A persistently broken panes.json must not emit one WARNING per
+        delivered DM - the same unbounded-volume shape as the unsafe-channel
+        warning, driven by DM rate against a stuck local condition instead
+        of a hostile publisher. Warn on the first sighting of each distinct
+        condition, debug repeats; a healthy read (or the file going away)
+        re-arms it, so a NEW breakage always warns. Unlocked - a rare race
+        just duplicates a warning."""
+        if message == self._last_panes_warning:
+            logger.debug(message)
+        else:
+            self._last_panes_warning = message
+            logger.warning(message)
 
     def _tmux_wake(self, session_id: str, pane: str) -> bool:
         """Type the wake prompt into the given pane. False on failure."""
