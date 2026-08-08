@@ -299,7 +299,11 @@ class Injector:
         """Type the wake prompt into the session's pane. False on any miss."""
         pane = self._tmux_pane(session_id)
         if pane is None:
-            logger.info(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
+            # Debug, not info: webhooks have no machine scoping, so every DM
+            # aimed at a session on another machine lands here - per-event
+            # INFO would be permanent noise. Matches the below-actionable
+            # filter arm and _tmux_pane's silent missing-file case.
+            logger.debug(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
             return False
         try:
             subprocess.run(

@@ -416,7 +416,9 @@ Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
 `--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`,
 `--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`,
-`--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`.
+`--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`. `AGENT_EVENT_BUS_BRIDGE_SECRET` is
+deliberately env-only - a `--secret` flag would expose the value in `ps`
+output and shell history.
 
 **Remote-bus topology**: the defaults assume the bus runs on the same
 machine. With a remote bus (`AGENT_EVENT_BUS_URL` pointing off-host), a
@@ -429,7 +431,10 @@ authentication on that hop - and it authenticates but neither encrypts nor
 expires, so run the hop over an encrypted transport (your tailnet, or a TLS
 terminator); replay freshness is an RFC-level follow-up. `--bind` can pin
 the listener to a single interface (e.g. the tailnet address) instead of
-all interfaces - any non-loopback bind requires the secret too. Keep `--port` and the port in `--hook-url` in agreement
+all interfaces - any non-loopback bind requires the secret too. `/health`
+is intentionally unauthenticated (readiness probes shouldn't need the
+secret); it exposes only `status`/`service`/`registered`, but on a
+non-loopback bind anyone who can reach the port can read it. Keep `--port` and the port in `--hook-url` in agreement
 unless a proxy genuinely forwards between them (a mismatch is logged). Note webhooks have no machine scoping - every bridge receives
 every `session:` DM; tmux wakes only work for sessions on the bridge's own
 machine, and spool files for foreign sessions accumulate until the pruning
