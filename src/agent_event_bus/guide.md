@@ -337,7 +337,11 @@ That lands with the supervision story.)
 
 - **spool**: every wake event is appended to
   `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to
-  drain. This durable path is always on, in every backend. Drain contract:
+  drain. This path is always on, in every backend, and durable against
+  bridge and session crashes - but the append is not fsync'ed, so a
+  host-level crash (kernel panic, power loss) inside the writeback window
+  can lose a wake the bus already counted delivered; fsync-on-append is an
+  accepted follow-up. Drain contract:
   1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
@@ -433,7 +437,9 @@ Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`,
 `--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`. `AGENT_EVENT_BUS_BRIDGE_SECRET` is
 deliberately env-only - a `--secret` flag would expose the value in `ps`
-output and shell history.
+output and shell history. `DEV_MODE=1` turns on debug logging (the
+per-event reasons a delivery did nothing) - the same switch the bus server
+honors.
 
 **Remote-bus topology**: the defaults assume the bus runs on the same
 machine. With a remote bus (`AGENT_EVENT_BUS_URL` pointing off-host), a

@@ -233,14 +233,16 @@ class Injector:
         # so it must NOT run under the global lock, or one stalled drain
         # would stall every session's delivery
         self._spool(session_id, event)
-        # The one default-level breadcrumb on the happy path: without it the
-        # spool backend's terminal shows the registration line and then
-        # permanent silence, indistinguishable from a bus that stopped
-        # dispatching. Volume is bounded by the actionable-DM rate - exactly
-        # the traffic this daemon exists to surface.
-        logger.info(f"Spooled event {event.get('event_id')} for {session_id[:8]}...")
 
         if self.config.backend != "tmux":
+            # The one default-level breadcrumb on the happy path: without it
+            # the spool backend's terminal shows the registration line and
+            # then permanent silence, indistinguishable from a bus that
+            # stopped dispatching. Spool backend ONLY: in the tmux backend
+            # this would emit one INFO per foreign-machine DM - the exact
+            # volume the unmapped arm's debug demotion exists to avoid - and
+            # a mapped wake already logs "Woke ..." at INFO.
+            logger.info(f"Spooled event {event.get('event_id')} for {session_id[:8]}...")
             return "spool"
 
         # Pane lookup BEFORE the cooldown machinery: on a multi-machine bus
@@ -288,6 +290,13 @@ class Injector:
 
     def _spool(self, session_id: str, event: dict) -> None:
         """Always-on durable path: one JSON line per event, per session.
+
+        Durable against bridge and session crashes, not host crashes: the
+        file is flushed and closed before the 200, but never fsync'ed, so a
+        kernel panic or power loss inside the writeback window can lose a
+        wake the bus already counted delivered. fsync-on-append is an
+        accepted follow-up - it would eat into the SPOOL_LOCK deadline
+        budget that must stay under the bus's WEBHOOK_TIMEOUT.
 
         Serialized by the per-session flock below - against other threads in
         this process and against the drain hook alike.
@@ -913,6 +922,18 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Hook URL advertises port {hook_port} but the listener binds {config.port} - "
             "correct only if something forwards between them"
         )
+    # The listener only ever speaks plain HTTP (uvicorn.run gets no TLS
+    # config), so an https hook URL needs a terminator in front - and a
+    # terminator fronts one port while forwarding to another, so https with
+    # the ports AGREEING is precisely the no-terminator shape: every
+    # dispatch dies in the TLS handshake with every other guard quiet. The
+    # mismatched-port terminator shape is already named by the check above.
+    if hook_split.scheme == "https" and hook_port == config.port:
+        logger.warning(
+            f"Hook URL {bridge_hook_url(config)} is https but this listener serves "
+            "plain HTTP on that same port - correct only if a TLS terminator "
+            "forwards between them"
+        )
     # POST /hook is the only route this listener serves; any other
     # advertised path 404s every dispatch. Legitimate behind a rewriting
     # proxy, so warn-don't-refuse like the port mismatch above.
@@ -969,7 +990,15 @@ def main():
     import uvicorn
 
     args = build_parser().parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    # DEV_MODE=1 turns on the debug diagnostics - the per-event reasons a
+    # delivery did nothing - matching server.py and the switch CLAUDE.md
+    # documents for this package. Without a level path every logger.debug
+    # in this module is dead code in the shipped daemon.
+    level = logging.DEBUG if os.environ.get("DEV_MODE") else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
+    # basicConfig is a no-op when the root logger already has handlers
+    # (e.g. under a test harness), so pin the module logger too
+    logger.setLevel(level)
     config = config_from_args(args)
 
     state: dict = {}

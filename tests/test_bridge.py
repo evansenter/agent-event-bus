@@ -658,6 +658,35 @@ class TestBusRegistration:
         assert register["arguments"]["channel"] == "session:"
         assert register["url"] == "http://bus/mcp"
 
+    def test_session_filter_prefix_match_contract(self, tmp_path):
+        """The registered channel="session:" filter only cuts traffic if
+        the bus prefix-matches it - pin that through the REAL matcher, the
+        same idiom as sign() and the signal-level contract test. If
+        get_matching_webhooks were ever tightened to exact match (a bare
+        "session:" is not a channel anyone publishes to), the bridge would
+        receive nothing while every mocked test here stayed green."""
+        from datetime import datetime
+
+        from agent_event_bus.storage import Event as BusEvent
+        from agent_event_bus.storage import SQLiteStorage
+
+        storage = SQLiteStorage(str(tmp_path / "contract.db"))
+        storage.add_webhook(url="http://127.0.0.1:8082/hook", channel_filter="session:")
+
+        def bus_event(channel):
+            return BusEvent(
+                id=1,
+                event_type="note",
+                payload="hi",
+                session_id="sender-1",
+                timestamp=datetime(2026, 8, 8),
+                channel=channel,
+            )
+
+        assert storage.get_matching_webhooks(bus_event("session:abc"))
+        assert not storage.get_matching_webhooks(bus_event("repo:foo"))
+        assert not storage.get_matching_webhooks(bus_event("all"))
+
     def test_unregister_unexpected_result_warns_not_asserts(self, tmp_path, caplog):
         """Shutdown-side twin of the sweep's result check: best-effort, so a
         bus that answers but doesn't delete is a warning (the next startup
@@ -1191,15 +1220,44 @@ class TestHookUrlTopology:
             )
 
     def test_hook_url_scheme_default_matching_port_is_quiet(self, monkeypatch, caplog):
-        """https behind a TLS terminator with --port 443 is the legitimate
-        shape - the substituted default must not warn when it matches."""
+        """The substituted default must not warn when it matches - kept on
+        http so the separate https-no-terminator warning doesn't muddy the
+        pure port-substitution case."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local/hook")
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args(["--port", "80"]))
+        assert not any("advertises port" in r.message for r in caplog.records)
+
+    def test_https_hook_with_agreeing_port_warns_no_terminator(self, monkeypatch, caplog):
+        """The listener never speaks TLS, and a terminator fronts one port
+        while forwarding to another - so https with the ports AGREEING
+        means no terminator exists and every dispatch dies in the
+        handshake, with every other topology guard quiet."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        monkeypatch.setenv(
+            "AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "https://bridge.tailnet.example:8082/hook"
+        )
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert any("TLS terminator" in r.message for r in caplog.records)
+
+    def test_https_hook_with_mismatched_port_no_tls_warning(self, monkeypatch, caplog):
+        """https fronting 443 while forwarding to --port is the legitimate
+        terminator shape: the port-mismatch warning names it, and the TLS
+        warning must stay quiet rather than double-warn."""
         import logging
 
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "https://box.local/hook")
         with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
-            bridge.config_from_args(bridge.build_parser().parse_args(["--port", "443"]))
-        assert not any("advertises port" in r.message for r in caplog.records)
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert not any("TLS terminator" in r.message for r in caplog.records)
+        assert any("advertises port 443 " in r.message for r in caplog.records)
 
     def test_hook_path_mismatch_warns(self, monkeypatch, caplog):
         """POST /hook is the only route served - any other advertised path
@@ -1345,6 +1403,37 @@ class TestBindHost:
         with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
             bridge.config_from_args(args)
         assert not any("IPv6" in r.message for r in caplog.records)
+
+    def test_dev_mode_enables_debug_logging(self, monkeypatch, tmp_path):
+        """CLAUDE.md advertises DEV_MODE=1 as THE debug switch for this
+        package (server.py honors it); without a level path every
+        logger.debug in the module - the only per-event visibility into
+        why a delivery did nothing - is dead code in the shipped daemon."""
+        import logging
+        import sys
+
+        import uvicorn
+
+        monkeypatch.setattr(
+            sys, "argv", ["agent-event-bus-bridge", "--wake-dir", str(tmp_path / "wake")]
+        )
+
+        def run_quiet(app, host=None, port=None):
+            return None
+
+        try:
+            monkeypatch.delenv("DEV_MODE", raising=False)
+            with patch.object(uvicorn, "run", run_quiet):
+                bridge.main()
+            assert not bridge.logger.isEnabledFor(logging.DEBUG)
+            monkeypatch.setenv("DEV_MODE", "1")
+            with patch.object(uvicorn, "run", run_quiet):
+                bridge.main()
+            assert bridge.logger.isEnabledFor(logging.DEBUG)
+        finally:
+            # main() sets a level on the module logger; don't leak it into
+            # tests that rely on the default NOTSET-inherits-root behavior
+            bridge.logger.setLevel(logging.NOTSET)
 
     def test_main_passes_bind_through_and_unregisters(self, monkeypatch, tmp_path):
         """End-to-end main(): the default local config binds loopback, the
