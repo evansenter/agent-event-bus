@@ -353,10 +353,15 @@ def create_bridge_app(
                 registration_stop.set()
                 # Off the event loop: a join that waits on an in-flight
                 # call_tool POST would otherwise freeze signal handling for
-                # up to the timeout (#112 invariant, shutdown edition)
-                await anyio.to_thread.run_sync(
-                    functools.partial(registration_thread.join, REGISTRATION_JOIN_TIMEOUT)
-                )
+                # up to the timeout (#112 invariant, shutdown edition).
+                # Shielded because run_sync is itself a cancellation
+                # checkpoint - and this finally exists precisely for the
+                # cancelled-shutdown path; unshielded, the join would be
+                # skipped exactly when it matters
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(
+                        functools.partial(registration_thread.join, REGISTRATION_JOIN_TIMEOUT)
+                    )
 
     def process(body: bytes, signature: str | None) -> tuple[dict, int]:
         """Sync webhook handling (runs in a worker thread - the file appends
@@ -432,13 +437,20 @@ def create_bridge_app(
             payload["registered"] = registration_state.get("webhook_id") is not None
         return JSONResponse(payload)
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/hook", hook_endpoint, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
         ],
         lifespan=lifespan,
     )
+    # POST /hook/ must be a loud 404 (bus retries and logs it), not a 307:
+    # the bus's httpx client doesn't follow redirects and counts any status
+    # under 400 as delivered, so the default slash-redirect would make a
+    # trailing-slash hook URL read as a perfectly healthy webhook while the
+    # bridge processes nothing.
+    app.router.redirect_slashes = False
+    return app
 
 
 def bridge_hook_url(config: BridgeConfig) -> str:
@@ -500,7 +512,22 @@ def register_with_bus(config: BridgeConfig) -> int:
         if not isinstance(wh, dict):
             continue
         if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
-            call_tool("unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url)
+            removal = call_tool(
+                "unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url
+            )
+            # unregister_webhook reports logical failure in-band (a
+            # success-False dict) rather than raising, and call_tool only
+            # raises on transport errors - proceeding after a failed removal
+            # would re-create the duplicate deliveries the sweep exists to
+            # prevent. Already-gone ("Webhook not found") is the goal state.
+            ok = isinstance(removal, dict) and (
+                removal.get("success") or removal.get("error") == "Webhook not found"
+            )
+            if not ok:
+                raise SystemExit(
+                    f"unregister_webhook #{wh['webhook_id']} returned "
+                    f"unexpected result: {removal!r}"
+                )
             logger.info(f"Removed stale bridge webhook #{wh['webhook_id']}")
 
     result = call_tool(

@@ -197,6 +197,19 @@ class TestHookFiltering:
         )
         assert _get_signal_level(dm) == "actionable"
 
+    def test_trailing_slash_hook_is_404_not_redirect(self, client):
+        """redirect_slashes must stay off: the bus's httpx client doesn't
+        follow redirects and counts any status under 400 as delivered, so a
+        307 for /hook/ would make a trailing-slash hook URL read as a
+        healthy webhook while the bridge processes nothing. A 404 is
+        retried and logged bus-side - loud instead of silently 'delivered'."""
+        resp = client.post(
+            "/hook/",
+            content=json.dumps(make_event()).encode(),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 404
+
     def test_below_actionable_ignored(self, client, config):
         for level in ("lifecycle", "info"):
             resp = client.post("/hook", content=json.dumps(make_event(signal_level=level)).encode())
@@ -580,6 +593,37 @@ class TestBusRegistration:
         assert register["arguments"]["channel"] == "session:"
         assert register["url"] == "http://bus/mcp"
 
+    def test_failed_stale_removal_is_retryable(self, tmp_path):
+        """unregister_webhook reports logical failure in-band (success-False
+        dict; call_tool raises only on transport errors) - a sweep that
+        didn't actually delete the row must not proceed to register and
+        stack the duplicate deliveries it exists to prevent. Already-gone
+        ("Webhook not found") stays benign: the row being absent is the goal."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port=9999)
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            if tool_name == "list_webhooks":
+                return [{"webhook_id": 7, "url": "http://127.0.0.1:9999/hook"}]
+            if tool_name == "unregister_webhook":
+                return {}  # a JSON-RPC error response falls through to this
+            return {"webhook_id": 43}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            with pytest.raises(SystemExit, match="unexpected result"):
+                bridge.register_with_bus(config)
+
+    def test_already_gone_stale_row_is_benign(self, tmp_path):
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            if tool_name == "list_webhooks":
+                return [{"webhook_id": 7, "url": "http://127.0.0.1:9999/hook"}]
+            if tool_name == "unregister_webhook":
+                return {"success": False, "error": "Webhook not found", "webhook_id": 7}
+            return {"webhook_id": 43}
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port=9999)
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            assert bridge.register_with_bus(config) == 43
+
     def test_unregister_calls_unregister_webhook_with_id_and_url(self, tmp_path):
         """Pin the wire call unregister_from_bus makes (tool name, id, bus
         URL) - a wrong argument here only ever surfaces as a stale row that
@@ -612,6 +656,8 @@ class TestBusRegistration:
                     {"webhook_id": 7, "url": "http://127.0.0.1:9999/hook"},
                     {"webhook_id": 8, "url": "http://elsewhere/hook"},
                 ]
+            if tool_name == "unregister_webhook":
+                return {"success": True, "webhook_id": arguments["webhook_id"]}
             return {"webhook_id": 43}
 
         with patch.object(bridge, "call_tool", fake_call_tool):

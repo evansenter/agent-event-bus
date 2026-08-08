@@ -399,6 +399,11 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   the bus keeps dispatching to the dead address forever.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
+- The hook body is capped at 1 MiB (the HMAC can only be checked after
+  buffering the whole body, so the cap bounds what an unauthenticated peer
+  can make the bridge hold). The bus does not cap event payloads, so a DM
+  larger than that is refused (413, retried twice, then dropped) and stays
+  pull-only: it reaches the session by polling, never as a wake.
 - `GET /health` reports `registered`: whether the *startup* registration
   succeeded. The row is not re-verified afterwards, so unregistering the
   webhook by hand (or restoring the bus DB from a backup) leaves
