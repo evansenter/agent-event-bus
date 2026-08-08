@@ -37,6 +37,7 @@ import re
 import subprocess
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +57,10 @@ DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wa
 # tmux send-keys is bounded like the notifier subprocesses in helpers.py -
 # a hung tmux must not wedge the bridge
 TMUX_TIMEOUT = 5.0
+
+# Bound on joining the registration thread at shutdown: long enough for an
+# in-flight register call to commit, short enough not to hang exit
+REGISTRATION_JOIN_TIMEOUT = 10.0
 
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
@@ -206,9 +211,38 @@ class Injector:
             return False
 
 
-def create_bridge_app(config: BridgeConfig, injector: Injector | None = None) -> Starlette:
-    """Build the ASGI app: POST /hook (webhook receiver) + GET /health."""
+def create_bridge_app(
+    config: BridgeConfig,
+    injector: Injector | None = None,
+    registration_state: dict | None = None,
+    registration_stop: threading.Event | None = None,
+) -> Starlette:
+    """Build the ASGI app: POST /hook (webhook receiver) + GET /health.
+
+    When registration_state/registration_stop are given, the app's lifespan
+    owns bus registration: startup launches register_with_retry in a
+    background thread (so the listener binds first and a down bus can't kill
+    the daemon), and shutdown stops it and joins - stop can't interrupt a
+    register call already inside its HTTP POST, so without the join a clean
+    exit could read webhook_id before the thread writes it and leak the row.
+    """
     injector = injector or Injector(config)
+    registration_thread: threading.Thread | None = None
+
+    @asynccontextmanager
+    async def lifespan(app):
+        nonlocal registration_thread
+        if registration_state is not None and registration_stop is not None:
+            registration_thread = threading.Thread(
+                target=register_with_retry,
+                args=(config, registration_state, registration_stop),
+                daemon=True,
+            )
+            registration_thread.start()
+        yield
+        if registration_thread is not None:
+            registration_stop.set()
+            registration_thread.join(timeout=REGISTRATION_JOIN_TIMEOUT)
 
     def process(body: bytes, signature: str | None) -> tuple[dict, int]:
         """Sync webhook handling (runs in a worker thread - the file appends
@@ -249,7 +283,8 @@ def create_bridge_app(config: BridgeConfig, injector: Injector | None = None) ->
         routes=[
             Route("/hook", hook_endpoint, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
-        ]
+        ],
+        lifespan=lifespan,
     )
 
 
@@ -332,6 +367,18 @@ def register_with_retry(
         delay = min(delay * 2, max_delay)
 
 
+def _env_number(name: str, default, cast):
+    """Read a numeric env var, turning a typo into a config error instead of
+    a bare ValueError traceback out of build_parser()."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        raise SystemExit(f"Invalid {name}={raw!r}: expected a number") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="agent-event-bus re-awakening bridge (RFC #122)")
     parser.add_argument(
@@ -342,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("AGENT_EVENT_BUS_BRIDGE_PORT", DEFAULT_BRIDGE_PORT)),
+        default=_env_number("AGENT_EVENT_BUS_BRIDGE_PORT", DEFAULT_BRIDGE_PORT, int),
         help=f"Localhost port to listen on (default: {DEFAULT_BRIDGE_PORT})",
     )
     parser.add_argument(
@@ -354,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cooldown",
         type=float,
-        default=float(os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", DEFAULT_COOLDOWN_SECONDS)),
+        default=_env_number("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", DEFAULT_COOLDOWN_SECONDS, float),
         help="Minimum seconds between wakes per session (loop prevention)",
     )
     parser.add_argument(
@@ -368,6 +415,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     """Build the runtime config from parsed args plus environment."""
+    # argparse enforces `choices` only for values given on the command line -
+    # an env-supplied default bypasses the check, and an unknown backend would
+    # otherwise silently mean "spool" (deliver only tests != "tmux")
+    if args.backend not in ("spool", "tmux"):
+        raise SystemExit(
+            f"Invalid backend {args.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
+            "expected 'spool' or 'tmux'"
+        )
     return BridgeConfig(
         bus_url=args.bus_url,
         port=args.port,
@@ -392,21 +447,14 @@ def main():
 
     state: dict = {}
     stop = threading.Event()
-    app = create_bridge_app(config)
-    # Register from a startup hook: uvicorn binds right after startup
-    # completes, so the thread's first attempt races the bind by microseconds
-    # at most (and the bus retries deliveries anyway)
-    app.add_event_handler(
-        "startup",
-        lambda: threading.Thread(
-            target=register_with_retry, args=(config, state, stop), daemon=True
-        ).start(),
-    )
+    app = create_bridge_app(config, registration_state=state, registration_stop=stop)
     try:
         # Localhost only: the bus is the sole intended caller, and HMAC (when
         # a secret is set) authenticates it
         uvicorn.run(app, host="127.0.0.1", port=config.port)
     finally:
+        # Lifespan shutdown already stopped and joined the registration
+        # thread; the stop here only covers exits that skipped the lifespan
         stop.set()
         if state.get("webhook_id") is not None:
             unregister_from_bus(config, state["webhook_id"])

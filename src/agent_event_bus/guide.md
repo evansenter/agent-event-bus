@@ -354,6 +354,12 @@ Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
 `--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`.
 
+Supervision is deliberately out of scope for the v1 prototype: there is no
+`make install-bridge`, launchd plist, or systemd unit yet - run the bridge in
+a terminal (or your own supervisor) while experimenting. Startup ordering is
+already safe for a future supervisor (registration retries until the bus is
+up); unit files land once the prototype proves out (RFC #122).
+
 ## Best Practices
 
 1. **Register with client_id** - Enables session resumption

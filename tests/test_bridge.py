@@ -224,16 +224,22 @@ class TestInjectorCooldown:
         with patch.object(bridge.subprocess, "run", slow_tmux):
             for t in threads:
                 t.start()
-            # Wait until one thread is parked inside tmux and the other has
-            # already returned (proving they overlapped), then release
+            # Wait until one thread is parked inside tmux AND the other has
+            # already returned - release is still unset, so this is asserted
+            # overlap, not a lucky serialization (under the pre-fix code both
+            # threads would be parked in tmux here and results stays empty)
             for _ in range(500):
                 if wakes and results:
                     break
                 time.sleep(0.01)
+            overlapped = bool(wakes) and bool(results) and not release.is_set()
+            snapshot = list(results)
             release.set()
             for t in threads:
                 t.join()
 
+        assert overlapped, f"deliveries never overlapped (wakes={len(wakes)}, results={results})"
+        assert snapshot == ["spool-cooldown"]
         assert sorted(results) == ["spool-cooldown", "tmux"]
         assert len(wakes) == 1
 
@@ -441,3 +447,78 @@ class TestBusRegistration:
 
         with patch.object(bridge, "call_tool", fake_call_tool):
             bridge.unregister_from_bus(config, 42)  # must not raise
+
+
+class TestDaemonLifecycle:
+    """The lifespan owns registration: startup must actually fire the thread
+    (a wiring failure is silent - the daemon binds, serves /health, and never
+    registers), and shutdown must join it before the caller reads the id."""
+
+    def test_lifespan_starts_registration_and_joins_on_shutdown(self, tmp_path):
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        registered = threading.Event()
+
+        def fake_register(cfg):
+            registered.set()
+            return 42
+
+        state: dict = {}
+        stop = threading.Event()
+        with patch.object(bridge, "register_with_bus", fake_register):
+            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+            with TestClient(app):
+                assert registered.wait(timeout=5), "startup never fired registration"
+        # Shutdown stopped and joined the thread, so the result is visible
+        assert state["webhook_id"] == 42
+        assert stop.is_set()
+
+    def test_shutdown_waits_for_inflight_registration(self, tmp_path):
+        """stop can't interrupt a register call already inside its HTTP POST;
+        shutdown must join so the committed webhook_id isn't lost (and can be
+        unregistered) on a clean exit."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        entered = threading.Event()
+
+        def slow_register(cfg):
+            entered.set()
+            time.sleep(0.2)
+            return 43
+
+        state: dict = {}
+        stop = threading.Event()
+        with patch.object(bridge, "register_with_bus", slow_register):
+            app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+            with TestClient(app):
+                assert entered.wait(timeout=5)  # registration is in flight
+            # Context exit runs lifespan shutdown while slow_register sleeps
+        assert state["webhook_id"] == 43
+
+    def test_app_without_registration_has_inert_lifespan(self, config):
+        with TestClient(create_bridge_app(config)) as client:
+            assert client.get("/health").status_code == 200
+
+
+class TestEnvValidation:
+    """argparse `choices` and `type` only run for command-line values, so
+    env-supplied defaults need their own validation - a typo must be a named
+    config error, not a silent spool-only bridge or a bare traceback."""
+
+    def test_env_backend_typo_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmuxx")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_BACKEND"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_env_backend_tmux_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmux")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.backend == "tmux"
+
+    def test_env_port_typo_is_a_config_error(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "eight")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
+            bridge.build_parser()
+
+    def test_env_cooldown_typo_is_a_config_error(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "30s")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_COOLDOWN"):
+            bridge.build_parser()
