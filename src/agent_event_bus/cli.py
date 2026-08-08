@@ -241,13 +241,13 @@ def cmd_publish(args):
     if session_id:
         arguments["session_id"] = session_id
     # Optional structured payload fields (RFC #121)
-    if getattr(args, "title", None):
+    if args.title:
         arguments["title"] = args.title
-    if getattr(args, "tags", None):
+    if args.tags:
         arguments["tags"] = [t.strip() for t in args.tags.split(",")]
-    if getattr(args, "correlation_id", None):
+    if args.correlation_id:
         arguments["correlation_id"] = args.correlation_id
-    if getattr(args, "signal_level", None):
+    if args.signal_level:
         arguments["signal_level"] = args.signal_level
 
     result = call_tool("publish_event", arguments, url=args.url, debug=args.debug)
@@ -276,13 +276,13 @@ def cmd_events(args):
         arguments["channel"] = args.channel
     if args.resume:
         arguments["resume"] = True
-    if getattr(args, "peek", False):
+    if args.peek:
         arguments["peek"] = True
     if args.include:
         arguments["event_types"] = [t.strip() for t in args.include.split(",")]
-    if getattr(args, "correlation_id", None):
+    if args.correlation_id:
         arguments["correlation_id"] = args.correlation_id
-    if getattr(args, "min_level", None):
+    if args.min_level:
         arguments["min_level"] = args.min_level
 
     result = call_tool(
@@ -314,7 +314,6 @@ def cmd_events(args):
     else:
         if not events:
             print("No events")
-            return
         for e in events:
             print(f"[{e['id']}] {e['event_type']} ({e['channel']})")
             if e.get("title"):
@@ -325,6 +324,13 @@ def cmd_events(args):
                 from_line += f" corr:{e['correlation_id']}"
             print(from_line)
             print()
+        if has_more:
+            # The default desc order serves the newest slice; without this
+            # hint a large backlog gets silently truncated on screen
+            print(
+                "More events available; use --order asc with --cursor to drain the backlog.",
+                file=sys.stderr,
+            )
 
 
 def cmd_notify(args):

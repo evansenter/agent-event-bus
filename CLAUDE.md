@@ -43,9 +43,15 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 - `make install-server` - Idempotent, restarts service automatically
 - Schema migrations via `@migration` decorator (increment `SCHEMA_VERSION` when adding)
 
+### WAL mode:
+The database runs in WAL mode: `data.db-wal` and `data.db-shm` are **part of
+the database**. Never copy or move `data.db` alone (a plain `cp` can silently
+miss recently committed events sitting in the WAL) - use `sqlite3 .backup`,
+which is WAL-aware and safe against a running server.
+
 ### Before schema changes:
 ```bash
-cp ~/.claude/contrib/agent-event-bus/data.db ~/.claude/contrib/agent-event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)
+sqlite3 ~/.claude/contrib/agent-event-bus/data.db ".backup $HOME/.claude/contrib/agent-event-bus/data.db.backup-$(date +%Y%m%d-%H%M%S)"
 ```
 
 ## Commands
@@ -145,6 +151,7 @@ CLI and MCP expose the same functionality:
 - **Session cleanup**: 24-hour timeout + PID liveness checks for local sessions
 - **Auto-heartbeat**: `publish_event` and `get_events` refresh heartbeat
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
+- **Non-consuming narrowed reads**: `channel`/`event_types`/`correlation_id` filters never advance the session cursor (their SQL-filtered max would mark non-matching events as seen); `min_level` filters post-bookkeeping and does
 - **High-water cursors**: `next_cursor` is the batch MAX id in both orders; feeding it back never re-serves events
 - **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-trex")
 - **Client deduplication**: `(machine, client_id)` enables session resumption

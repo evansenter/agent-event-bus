@@ -233,6 +233,24 @@ class TestCmdSessions:
         assert "my-repo" in captured.out
 
 
+def make_publish_args(**overrides):
+    """Namespace matching the publish subparser's output - keep in sync."""
+    defaults = dict(
+        type="test_event",
+        payload="hello",
+        channel=None,
+        session_id=None,
+        title=None,
+        tags=None,
+        correlation_id=None,
+        signal_level=None,
+        url=None,
+        debug=False,
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
 class TestCmdPublish:
     """Tests for publish command."""
 
@@ -241,9 +259,7 @@ class TestCmdPublish:
         """Test basic publish."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event", payload="hello", channel=None, session_id=None, url=None, debug=False
-        )
+        args = make_publish_args()
         cli.cmd_publish(args)
 
         mock_call.assert_called_once_with(
@@ -258,14 +274,7 @@ class TestCmdPublish:
         """Test publish with channel."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event",
-            payload="hello",
-            channel="repo:my-repo",
-            session_id="abc123",
-            url=None,
-            debug=False,
-        )
+        args = make_publish_args(channel="repo:my-repo", session_id="abc123")
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -278,9 +287,7 @@ class TestCmdPublish:
         """Test publish uses session_id from env var when not provided."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event", payload="hello", channel=None, session_id=None, url=None, debug=False
-        )
+        args = make_publish_args()
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -292,14 +299,7 @@ class TestCmdPublish:
         """Test explicit --session-id overrides env var."""
         mock_call.return_value = {"event_id": 1}
 
-        args = Namespace(
-            type="test_event",
-            payload="hello",
-            channel=None,
-            session_id="explicit-123",
-            url=None,
-            debug=False,
-        )
+        args = make_publish_args(session_id="explicit-123")
         cli.cmd_publish(args)
 
         call_args = mock_call.call_args[0][1]
@@ -953,18 +953,6 @@ class TestCmdEventsPeek:
         call_args = mock_call.call_args[0][1]
         assert "peek" not in call_args
 
-    @patch("agent_event_bus.cli.call_tool")
-    def test_peek_attr_absent_defaults_off(self, mock_call):
-        """Namespaces built without a peek attribute (older callers) must not
-        crash and must not send peek - the getattr default path."""
-        mock_call.return_value = {"events": [], "next_cursor": None}
-        args = make_events_args()  # make_events_args does not define peek
-
-        cli.cmd_events(args)
-
-        call_args = mock_call.call_args[0][1]
-        assert "peek" not in call_args
-
     def test_peek_flag_parses(self):
         """--peek wires through argument parsing to cmd_events."""
         import sys as _sys
@@ -1028,3 +1016,50 @@ class TestCmdEventsEnvAttribution:
             cli.cmd_events(make_events_args(resume=True))
 
         assert "requires --session-id" in capsys.readouterr().err
+
+
+class TestCmdEventsHasMoreHint:
+    """Human-readable output must surface has_more (the default desc order
+    silently truncates a large backlog otherwise)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_hint_printed_when_more_available(self, mock_call, capsys):
+        mock_call.return_value = {
+            "events": [
+                {
+                    "id": 1,
+                    "event_type": "note",
+                    "channel": "all",
+                    "payload": "p",
+                    "session_id": "s",
+                    "timestamp": "t",
+                }
+            ],
+            "next_cursor": "50",
+            "has_more": True,
+        }
+
+        cli.cmd_events(make_events_args())
+
+        captured = capsys.readouterr()
+        assert "More events available" in captured.err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_hint_with_empty_filtered_page(self, mock_call, capsys):
+        # Reachable with --min-level: a full page of lifecycle churn filters
+        # to zero events but has_more is true
+        mock_call.return_value = {"events": [], "next_cursor": "50", "has_more": True}
+
+        cli.cmd_events(make_events_args(min_level="actionable"))
+
+        captured = capsys.readouterr()
+        assert "No events" in captured.out
+        assert "More events available" in captured.err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_no_hint_without_more(self, mock_call, capsys):
+        mock_call.return_value = {"events": [], "next_cursor": None, "has_more": False}
+
+        cli.cmd_events(make_events_args())
+
+        assert capsys.readouterr().err == ""

@@ -265,6 +265,11 @@ class SQLiteStorage:
 
         Old: ~/.claude/event-bus.db or ~/.claude/contrib/event-bus/data.db
         New: ~/.claude/contrib/agent-event-bus/data.db
+
+        Moving only data.db is safe here ONLY because the old paths predate
+        WAL mode (single-file databases). Do not reuse this pattern for a
+        WAL-era path: data.db-wal / data.db-shm are part of the database and
+        would be left behind.
         """
         if self.db_path.exists():
             return  # Already at new location, nothing to do
@@ -295,10 +300,13 @@ class SQLiteStorage:
             # lock, which is the norm when several agents poll and publish at
             # once (issue #112). journal_mode is persistent per-database but
             # cheap to re-assert; busy_timeout is per-connection and must be
-            # set each time. Inside the try so a PRAGMA failure (e.g. WAL on
-            # a network filesystem) still closes the connection.
-            conn.execute("PRAGMA journal_mode=WAL")
+            # set each time - and set FIRST, so the one-time WAL conversion
+            # of a legacy DB queues briefly under contention instead of
+            # failing fast with SQLITE_BUSY. Inside the try so a PRAGMA
+            # failure (e.g. WAL on a network filesystem) still closes the
+            # connection.
             conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA journal_mode=WAL")
             yield conn
             conn.commit()
         finally:

@@ -190,3 +190,18 @@ class TestDispatchStorageOffLoop:
         # asyncio.run drove the loop on this thread; the lookup must not have
         # run there
         assert seen["thread"] is not threading.current_thread()
+
+
+class TestHealthEndpointAuth:
+    def test_health_sits_behind_tailscale_auth(self, monkeypatch):
+        """With auth enabled, /health requires localhost or Tailscale identity
+        headers - it is not an openly probeable endpoint."""
+        from starlette.testclient import TestClient
+
+        monkeypatch.delenv("AGENT_EVENT_BUS_AUTH_DISABLED", raising=False)
+
+        with TestClient(server.create_app()) as client:
+            # TestClient's IP is "testclient", not a trusted localhost address
+            assert client.get("/health").status_code == 401
+            resp = client.get("/health", headers={"tailscale-user-login": "user@example.com"})
+            assert resp.status_code == 200

@@ -1422,3 +1422,64 @@ class TestGetEventsHasMore:
         result2 = get_events(cursor=result["next_cursor"], order="asc", limit=3)
         assert [e["payload"] for e in result2["events"]] == ["3", "4"]
         assert result2["has_more"] is False
+
+
+class TestNarrowedReadsDoNotConsumeCursor:
+    """Narrowing filters (channel/event_types/correlation_id) must not advance
+    the session cursor - the filtered batch's max id would mark non-matching
+    events as seen and drop them from a later resume."""
+
+    def _seed_session(self, name):
+        """Register a session and establish a consuming cursor position."""
+        reg = register_session(name=name, client_id=f"{name}-client")
+        sid = reg["session_id"]
+        seed = publish_event(event_type="note", payload="seed", session_id=sid)
+        get_events(session_id=sid, cursor=reg["cursor"], order="asc")
+        return sid, seed["event_id"]
+
+    def test_correlation_read_leaves_backlog_unread(self):
+        sid, seed_id = self._seed_session("narrow-corr")
+
+        publish_event(event_type="help_needed", payload="unrelated backlog")
+        publish_event(event_type="task_completed", payload="tagged", correlation_id="rev-42")
+
+        result = get_events(session_id=sid, correlation_id="rev-42", order="desc")
+        assert [e["payload"] for e in result["events"]] == ["tagged"]
+
+        # Cursor untouched by the narrowed read...
+        assert server.storage.get_session(sid).last_cursor == str(seed_id)
+
+        # ...so resume still surfaces the event that didn't match the filter
+        resumed = get_events(session_id=sid, resume=True, order="asc")
+        assert [e["payload"] for e in resumed["events"]] == ["unrelated backlog", "tagged"]
+
+    def test_event_type_read_leaves_backlog_unread(self):
+        sid, seed_id = self._seed_session("narrow-types")
+
+        publish_event(event_type="help_needed", payload="unrelated backlog")
+        publish_event(event_type="narrow_wanted_type", payload="wanted")
+
+        # Unique type: the suite shares one events table
+        result = get_events(session_id=sid, event_types=["narrow_wanted_type"], order="desc")
+        assert [e["payload"] for e in result["events"]] == ["wanted"]
+
+        assert server.storage.get_session(sid).last_cursor == str(seed_id)
+
+    def test_channel_read_leaves_backlog_unread(self):
+        sid, seed_id = self._seed_session("narrow-channel")
+
+        publish_event(event_type="note", payload="broadcast backlog")
+        publish_event(event_type="note", payload="repo scoped", channel="repo:narrow-test")
+
+        result = get_events(session_id=sid, channel="repo:narrow-test", order="desc")
+        assert [e["payload"] for e in result["events"]] == ["repo scoped"]
+
+        assert server.storage.get_session(sid).last_cursor == str(seed_id)
+
+    def test_unfiltered_read_still_consumes(self):
+        sid, seed_id = self._seed_session("narrow-none")
+
+        published = publish_event(event_type="note", payload="new")
+        get_events(session_id=sid, resume=True, order="asc")
+
+        assert server.storage.get_session(sid).last_cursor == str(published["event_id"])

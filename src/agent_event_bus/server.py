@@ -619,7 +619,13 @@ def _get_events_impl(
     # consuming poll (e.g. the UserPromptSubmit hook) still returns them. This
     # lets a Stop-hook drain inspect pending events and decide whether to act
     # without stealing them from the normal pull path.
-    if session_id and raw_events and not peek:
+    # Narrowing filters (channel, event_types, correlation_id) make the read
+    # non-consuming: the max id below is taken over the SQL-filtered batch,
+    # so advancing the cursor would mark every non-matching lower-id event
+    # as seen and silently drop it from a later resume. min_level filters
+    # after this bookkeeping, so level-filtered noise still counts as seen.
+    narrowed = bool(channel or event_types or correlation_id)
+    if session_id and raw_events and not peek and not narrowed:
         high_water_mark = str(max(e.id for e in raw_events))
         storage.update_session_cursor(session_id, high_water_mark)
 
@@ -658,6 +664,9 @@ async def get_events(
     min_level: Literal["lifecycle", "info", "actionable"] | None = None,
 ) -> dict:
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
+
+    Narrowed reads (channel/event_types/correlation_id) never advance the
+    session cursor; min_level does.
 
     Args:
         cursor: Position from register_session or previous call

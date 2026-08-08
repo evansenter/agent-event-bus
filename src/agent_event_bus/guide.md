@@ -100,6 +100,11 @@ Useful for focused polling (e.g., only discoveries):
 get_events(event_types=["gotcha_discovered", "pattern_found", "improvement_suggested"])
 ```
 
+Narrowing filters (`channel`, `event_types`, `correlation_id`) are
+**non-consuming**: they never advance your session cursor, so events that
+didn't match your filter stay unread for the next normal poll. (`min_level`
+is the exception - noise it hides still counts as seen.)
+
 ### Filter by Signal Level
 
 Every event carries a server-derived `signal_level`, so consumers don't need
@@ -224,7 +229,9 @@ See `docs/TAILSCALE_SETUP.md` for full setup instructions.
 ## Health Check
 
 `GET /health` answers `{"status": "ok"}` without touching the MCP handler or
-storage - use it for monitoring. If `/health` responds but tool calls hang,
+storage - use it for monitoring. It sits behind the same auth as everything
+else: reachable from localhost, or remotely via `tailscale serve` (which
+injects the identity headers). If `/health` responds but tool calls hang,
 the worker pool is saturated; if `/health` itself hangs, the event loop is
 blocked.
 
@@ -253,10 +260,13 @@ When events match, your endpoint receives a POST with:
     "session_id": "abc123",
     "timestamp": "2026-01-31T12:00:00",
     "channel": "repo:my-project",
-    "correlation_id": null
+    "correlation_id": null,
+    "signal_level": "info"
 }
 ```
-Structured fields (`title`, `tags`, `signal_level`) are included when the
+`correlation_id` and `signal_level` are always present - `signal_level` is
+server-derived, matching what `get_events` reports for the same event, so
+webhook consumers can filter on it. `title` and `tags` appear only when the
 event carries them.
 
 ### HMAC Signature Verification
