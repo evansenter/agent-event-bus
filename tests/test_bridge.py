@@ -3,6 +3,8 @@
 import hashlib
 import hmac
 import json
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -80,6 +82,42 @@ class TestTargetResolution:
         assert resolve_target_session(make_event(channel="all")) is None
         assert resolve_target_session(make_event(channel="repo:myrepo")) is None
         assert resolve_target_session(make_event(channel="session:")) is None
+
+    def test_uuid_and_display_ids_accepted(self):
+        uuid = "067fd316-8cc7-5cb1-861f-4d9d67ba7ee8"
+        assert resolve_target_session(make_event(channel=f"session:{uuid}")) == uuid
+        assert resolve_target_session(make_event(channel="session:brave_trex-2")) == "brave_trex-2"
+
+
+class TestPathSafety:
+    """The session id comes verbatim off the wire (the event's channel string,
+    which the bus warns on but never rejects) and becomes a spool filename -
+    traversal and absolute components must never reach the filesystem."""
+
+    def test_unsafe_session_ids_resolve_to_none(self):
+        for channel in (
+            "session:../../victim/x",
+            "session:/etc/cron.d/x",
+            "session:a/b",
+            "session:a\x00b",
+            "session:..",
+        ):
+            assert resolve_target_session(make_event(channel=channel)) is None
+
+    def test_traversal_channel_is_ignored_and_writes_nothing(self, client, config, tmp_path):
+        evil = make_event(channel="session:../../escape")
+        resp = client.post("/hook", content=json.dumps(evil).encode())
+
+        assert resp.json() == {"status": "ignored", "reason": "no target session"}
+        assert list(tmp_path.rglob("*.jsonl")) == []
+
+    def test_spool_refuses_escaping_path(self, config):
+        """Belt-and-braces: even if a bad id reached _spool directly, the
+        resolved-parent check must refuse to write outside the wake dir."""
+        injector = Injector(config)
+        with pytest.raises(ValueError, match="escapes wake dir"):
+            injector._spool("../escape", make_event())
+        assert not (config.wake_dir.parent / "escape.jsonl").exists()
 
 
 class TestHookFiltering:
@@ -159,6 +197,46 @@ class TestInjectorCooldown:
                 clock["now"] += 25.0  # 35s after the successful wake
                 assert injector.deliver("target-1", make_event()) == "tmux"
 
+    def test_concurrent_deliveries_wake_only_once(self, tmp_path):
+        """Two concurrent deliveries for the same session must produce one
+        tmux wake - the reservation closes the check-then-act window between
+        reading the cooldown and recording the wake."""
+        injector, _ = make_tmux_injector(tmp_path)
+        release = threading.Event()
+        wakes = []
+
+        def slow_tmux(cmd, **kwargs):
+            wakes.append(cmd)
+            release.wait(timeout=5)
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        results = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(injector.deliver("target-1", make_event()))
+            )
+            for _ in range(2)
+        ]
+        with patch.object(bridge.subprocess, "run", slow_tmux):
+            for t in threads:
+                t.start()
+            # Wait until one thread is parked inside tmux and the other has
+            # already returned (proving they overlapped), then release
+            for _ in range(500):
+                if wakes and results:
+                    break
+                time.sleep(0.01)
+            release.set()
+            for t in threads:
+                t.join()
+
+        assert sorted(results) == ["spool-cooldown", "tmux"]
+        assert len(wakes) == 1
+
     def test_failed_wake_does_not_burn_cooldown(self, tmp_path):
         """A transient tmux failure must not silence the session for a full
         cooldown - the next event retries immediately."""
@@ -182,8 +260,6 @@ class TestInjectorCooldown:
     def test_concurrent_spool_appends_do_not_tear(self, config):
         """Concurrent webhook deliveries append under the lock; every line
         must stay valid JSON even when payloads exceed the IO buffer."""
-        import threading
-
         injector = Injector(config)
         event = make_event(payload="x" * 100_000)  # > default 8 KiB buffer
 
@@ -252,6 +328,18 @@ class TestTmuxBackend:
 
         assert action == "spool"
 
+    def test_tmux_oserror_falls_back_to_spool(self, tmp_path):
+        """A non-executable tmux binary (PermissionError) must degrade to
+        spool, not escape as a 500 that makes the bus re-POST an event which
+        is already durably spooled (duplicate lines)."""
+        injector, _ = make_tmux_injector(tmp_path)
+
+        def tmux_perm(cmd, **kwargs):
+            raise PermissionError("tmux not executable")
+
+        with patch.object(bridge.subprocess, "run", tmux_perm):
+            assert injector.deliver("target-1", make_event()) == "spool"
+
 
 class TestBusRegistration:
     def test_registers_webhook_with_bridge_url_and_secret(self, tmp_path):
@@ -273,6 +361,8 @@ class TestBusRegistration:
         register = next(c for c in calls if c["tool"] == "register_webhook")
         assert register["arguments"]["url"] == "http://127.0.0.1:9999/hook"
         assert register["arguments"]["secret"] == "s3cret"
+        # v1 only acts on DMs, so the bus drops broadcast traffic server-side
+        assert register["arguments"]["channel"] == "session:"
         assert register["url"] == "http://bus/mcp"
 
     def test_startup_removes_stale_webhooks_at_same_url(self, tmp_path):
@@ -298,18 +388,50 @@ class TestBusRegistration:
         # Only the stale hook at OUR url is removed, not other consumers'
         assert unregisters == [{"webhook_id": 7}]
 
-    def test_empty_secret_env_is_normalized_to_none(self, tmp_path, monkeypatch):
+    def test_empty_secret_env_is_normalized_to_none(self, monkeypatch):
         """An accidentally empty secret must not split registration (skips
         the secret -> unsigned payloads) from verification (demands
-        signatures) - the combination 401s every delivery silently."""
+        signatures) - the combination 401s every delivery silently. Exercises
+        the real config construction, so removing the normalization from
+        config_from_args fails this test."""
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "")
-        secret = __import__("os").environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None
-        config = BridgeConfig(wake_dir=tmp_path / "wake", secret=secret)
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.secret is None
 
-        # Verification is disabled, matching registration's omitted secret
-        client = TestClient(create_bridge_app(config))
-        resp = client.post("/hook", content=json.dumps(make_event()).encode())
-        assert resp.status_code == 200
+    def test_secret_env_is_adopted(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.secret == "s3cret"
+
+    def test_registration_retries_until_bus_is_up(self, tmp_path):
+        """call_tool exits the process on connection errors, and at boot the
+        bus is often not up yet - the daemon must retry, not die."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        attempts = []
+
+        def flaky_register(cfg):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise SystemExit(1)
+            return 42
+
+        state: dict = {}
+        with patch.object(bridge, "register_with_bus", flaky_register):
+            bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
+
+        assert state["webhook_id"] == 42
+        assert len(attempts) == 3
+
+    def test_registration_retry_honors_shutdown(self, tmp_path):
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        stop = threading.Event()
+        stop.set()
+
+        def never_called(cfg):
+            raise AssertionError("should not register after stop")
+
+        with patch.object(bridge, "register_with_bus", never_called):
+            bridge.register_with_retry(config, {}, stop, initial_delay=0.01)
 
     def test_unregister_swallows_bus_unreachable(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")

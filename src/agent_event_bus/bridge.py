@@ -33,6 +33,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -79,6 +80,14 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
     return hmac.compare_digest(f"sha256={expected}", signature_header)
 
 
+# Session ids are UUIDs or display ids ("brave-trex"); nothing else. The
+# channel string is publisher-controlled wire input and the id becomes a spool
+# filename, so path separators, "..", and any other unexpected byte must never
+# reach the filesystem - the bus warns on malformed channels but does not
+# reject them.
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def resolve_target_session(event: dict) -> str | None:
     """Which session should this event wake?
 
@@ -88,9 +97,14 @@ def resolve_target_session(event: dict) -> str | None:
     are left for normal polling.
     """
     channel = event.get("channel") or ""
-    if channel.startswith("session:") and len(channel) > len("session:"):
-        return channel.split(":", 1)[1]
-    return None
+    if not channel.startswith("session:"):
+        return None
+    target = channel.split(":", 1)[1]
+    if not SESSION_ID_PATTERN.fullmatch(target):
+        if target:
+            logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
+        return None
+    return target
 
 
 class Injector:
@@ -118,16 +132,27 @@ class Injector:
             if self.config.backend != "tmux":
                 return "spool"
 
+            now = time.monotonic()
             last = self._last_wake.get(session_id)
-            if last is not None and (time.monotonic() - last) < self.config.cooldown_seconds:
+            if last is not None and (now - last) < self.config.cooldown_seconds:
                 return "spool-cooldown"
+            # Reserve the window before releasing the lock: two concurrent
+            # deliveries for the same session must not both pass the check
+            # and double-inject
+            self._last_wake[session_id] = now
 
         # tmux runs outside the lock (bounded at 5s, but other sessions'
         # deliveries shouldn't wait on it)
         if self._tmux_wake(session_id):
-            with self._lock:
-                self._last_wake[session_id] = time.monotonic()
             return "tmux"
+        with self._lock:
+            # Roll back the reservation so the failure doesn't burn the
+            # window - unless a later delivery already re-claimed it
+            if self._last_wake.get(session_id) == now:
+                if last is None:
+                    del self._last_wake[session_id]
+                else:
+                    self._last_wake[session_id] = last
         return "spool"
 
     def _spool(self, session_id: str, event: dict) -> None:
@@ -139,6 +164,11 @@ class Injector:
         self.config.wake_dir.mkdir(parents=True, exist_ok=True)
         self.config.wake_dir.chmod(0o700)
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
+        # Defense in depth behind resolve_target_session's charset check: a
+        # traversal or absolute component in a wire-supplied id must never
+        # produce a write outside the wake dir
+        if spool_file.resolve().parent != self.config.wake_dir.resolve():
+            raise ValueError(f"Spool path escapes wake dir: {session_id!r}")
         with spool_file.open("a") as f:
             f.write(json.dumps(event) + "\n")
 
@@ -167,7 +197,11 @@ class Injector:
             )
             logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
             return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        except (subprocess.SubprocessError, OSError) as e:
+            # SubprocessError covers CalledProcessError/TimeoutExpired;
+            # OSError covers a missing or non-executable tmux binary. An
+            # exception escaping here would 500 the webhook and make the bus
+            # retry an event that is already durably spooled (duplicate lines)
             logger.warning(f"tmux wake failed for {session_id[:8]}... ({e}); spooled only")
             return False
 
@@ -246,10 +280,11 @@ def register_with_bus(config: BridgeConfig) -> int | None:
         "register_webhook",
         {
             "url": hook_url,
-            # No server-side filter: payloads carry the derived signal_level,
-            # and the bridge filters to actionable locally. (Webhook filters
-            # only cover channel/event_types; "actionable" spans both DMs and
-            # specific broadcast types.)
+            # v1 acts only on session:<id> DMs, so let the bus drop broadcast
+            # traffic server-side (channel filters prefix-match). When v2
+            # widens to broadcast actionable events, remove this filter - the
+            # bridge still filters on signal_level locally either way.
+            "channel": "session:",
             **({"secret": config.secret} if config.secret else {}),
         },
         url=config.bus_url,
@@ -270,10 +305,34 @@ def unregister_from_bus(config: BridgeConfig, webhook_id: int) -> None:
         logger.warning(f"Could not unregister webhook #{webhook_id} (bus unreachable)")
 
 
-def main():
-    """Run the bridge daemon."""
-    import uvicorn
+def register_with_retry(
+    config: BridgeConfig,
+    state: dict,
+    stop: threading.Event,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+) -> None:
+    """Keep trying to register until the bus is reachable (or stop is set).
 
+    The bridge and the bus are typically launched by the same supervisor, so
+    "bus not up yet" is the normal case at boot - call_tool's SystemExit on
+    connection errors must not kill the daemon. Runs in a background thread
+    started from the app's startup hook, so the listener binds (essentially)
+    first and webhook deliveries have a live port to hit.
+    """
+    delay = initial_delay
+    while not stop.is_set():
+        try:
+            state["webhook_id"] = register_with_bus(config)
+            return
+        except SystemExit:
+            logger.warning(f"Bus unreachable at {config.bus_url}; retrying in {delay:.0f}s")
+        if stop.wait(delay):
+            return
+        delay = min(delay * 2, max_delay)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="agent-event-bus re-awakening bridge (RFC #122)")
     parser.add_argument(
         "--bus-url",
@@ -304,11 +363,12 @@ def main():
         default=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
         help="Directory for spool files and panes.json",
     )
-    args = parser.parse_args()
+    return parser
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    config = BridgeConfig(
+def config_from_args(args: argparse.Namespace) -> BridgeConfig:
+    """Build the runtime config from parsed args plus environment."""
+    return BridgeConfig(
         bus_url=args.bus_url,
         port=args.port,
         backend=args.backend,
@@ -321,14 +381,35 @@ def main():
         wake_dir=args.wake_dir,
     )
 
-    webhook_id = register_with_bus(config)
+
+def main():
+    """Run the bridge daemon."""
+    import uvicorn
+
+    args = build_parser().parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    config = config_from_args(args)
+
+    state: dict = {}
+    stop = threading.Event()
+    app = create_bridge_app(config)
+    # Register from a startup hook: uvicorn binds right after startup
+    # completes, so the thread's first attempt races the bind by microseconds
+    # at most (and the bus retries deliveries anyway)
+    app.add_event_handler(
+        "startup",
+        lambda: threading.Thread(
+            target=register_with_retry, args=(config, state, stop), daemon=True
+        ).start(),
+    )
     try:
         # Localhost only: the bus is the sole intended caller, and HMAC (when
         # a secret is set) authenticates it
-        uvicorn.run(create_bridge_app(config), host="127.0.0.1", port=config.port)
+        uvicorn.run(app, host="127.0.0.1", port=config.port)
     finally:
-        if webhook_id is not None:
-            unregister_from_bus(config, webhook_id)
+        stop.set()
+        if state.get("webhook_id") is not None:
+            unregister_from_bus(config, state["webhook_id"])
 
 
 if __name__ == "__main__":

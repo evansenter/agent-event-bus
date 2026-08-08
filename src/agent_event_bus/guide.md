@@ -332,9 +332,11 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to
   drain. This durable path is always on, in every backend. Drain contract:
   the consuming hook owns the file - read it, act, then truncate it (the
-  bridge only ever appends). The wake dir is created 0o700 (spool files
-  carry full event payloads); pruning spools for dead sessions is a
-  follow-up.
+  bridge only ever appends). Dedupe on `event_id` when acting: a delivery
+  that spools but then errors is retried by the bus, so the same event can
+  legitimately appear on more than one line. The wake dir is created 0o700
+  (spool files carry full event payloads); pruning spools for dead sessions
+  is a follow-up.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool.
