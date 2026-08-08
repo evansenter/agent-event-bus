@@ -29,6 +29,7 @@ AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -45,6 +46,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import anyio
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -67,9 +69,10 @@ DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wa
 TMUX_TIMEOUT = 2.0
 
 # Bound on joining the registration thread at shutdown. register_with_bus
-# makes up to three sequential call_tool requests (list, unregister stale,
-# register), each under the CLI's 10s timeout - so cover the worst-case
-# chain. A still-slower bus can leak a row; the startup dedupe reclaims it.
+# makes 2 + N sequential call_tool requests (list, one unregister per
+# stale row, register), each under the CLI's 10s timeout - 35s covers the
+# common N <= 1 case. A longer sweep (several unclean exits) or a slower
+# bus can still leak a row; the startup dedupe reclaims it.
 REGISTRATION_JOIN_TIMEOUT = 35.0
 
 # Real bus payloads are a few KB; the body must be read before the HMAC can
@@ -168,8 +171,16 @@ class Injector:
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event. The dir is
         # private (0o700) - spool files carry full event payloads.
-        self.config.wake_dir.mkdir(parents=True, exist_ok=True)
-        self.config.wake_dir.chmod(0o700)
+        try:
+            self.config.wake_dir.mkdir(parents=True, exist_ok=True)
+            self.config.wake_dir.chmod(0o700)
+        except OSError as e:
+            # The one startup filesystem precondition: a named config error
+            # like every other operator-facing input, not a bare traceback
+            raise SystemExit(
+                f"Cannot prepare wake dir {self.config.wake_dir} "
+                f"(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): {e}"
+            ) from None
 
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken:
@@ -207,8 +218,8 @@ class Injector:
             # and double-inject
             self._last_wake[session_id] = now
 
-        # tmux runs outside the lock (bounded at 5s, but other sessions'
-        # deliveries shouldn't wait on it)
+        # tmux runs outside the lock (bounded at TMUX_TIMEOUT, but other
+        # sessions' deliveries shouldn't wait on it)
         if self._tmux_wake(session_id):
             return "tmux"
         with self._lock:
@@ -340,7 +351,12 @@ def create_bridge_app(
         finally:
             if registration_thread is not None:
                 registration_stop.set()
-                registration_thread.join(timeout=REGISTRATION_JOIN_TIMEOUT)
+                # Off the event loop: a join that waits on an in-flight
+                # call_tool POST would otherwise freeze signal handling for
+                # up to the timeout (#112 invariant, shutdown edition)
+                await anyio.to_thread.run_sync(
+                    functools.partial(registration_thread.join, REGISTRATION_JOIN_TIMEOUT)
+                )
 
     def process(body: bytes, signature: str | None) -> tuple[dict, int]:
         """Sync webhook handling (runs in a worker thread - the file appends
@@ -748,6 +764,15 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         logger.warning(
             f"Hook URL advertises port {hook_port} but the listener binds {config.port} - "
             "correct only if something forwards between them"
+        )
+    # POST /hook is the only route this listener serves; any other
+    # advertised path 404s every dispatch. Legitimate behind a rewriting
+    # proxy, so warn-don't-refuse like the port mismatch above.
+    hook_path = urllib.parse.urlsplit(bridge_hook_url(config)).path
+    if hook_path != "/hook":
+        logger.warning(
+            f"Hook URL path {hook_path!r} isn't /hook (the only route this "
+            "listener serves) - correct only if something rewrites between them"
         )
     # Fourth quadrant: a non-loopback bind under a loopback hook URL means
     # the bridge advertises 127.0.0.1 while nothing listens there - every

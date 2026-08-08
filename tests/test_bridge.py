@@ -460,6 +460,17 @@ class TestInjectorCooldown:
         Injector(config).deliver("target-1", make_event())
         assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
 
+    def test_unpreparable_wake_dir_is_a_named_config_error(self, tmp_path):
+        """mkdir/chmod are the one startup filesystem precondition - they
+        must surface as a named SystemExit like every other config input,
+        not a bare traceback. (Parent is a FILE, not an unwritable dir:
+        NotADirectoryError fires for root too, unlike PermissionError.)"""
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+        config = BridgeConfig(wake_dir=blocker / "wake")
+        with pytest.raises(SystemExit, match="--wake-dir / AGENT_EVENT_BUS_WAKE_DIR"):
+            Injector(config)
+
 
 class TestTmuxBackend:
     def test_mapped_pane_gets_send_keys(self, tmp_path):
@@ -963,6 +974,17 @@ class TestHookUrlTopology:
         with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert any("9090" in r.message and "8082" in r.message for r in caplog.records)
+
+    def test_hook_path_mismatch_warns(self, monkeypatch, caplog):
+        """POST /hook is the only route served - any other advertised path
+        404s every dispatch, so it must be named like the port mismatch."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.local:8082/webhook")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert any("/webhook" in r.message and "/hook" in r.message for r in caplog.records)
 
     def test_registration_advertises_hook_url_override(self, tmp_path):
         config = BridgeConfig(
