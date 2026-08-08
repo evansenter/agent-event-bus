@@ -34,6 +34,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -80,6 +81,11 @@ MAX_BODY_BYTES = 1_048_576  # 1 MiB
 SPOOL_LOCK_ATTEMPTS = 50
 SPOOL_LOCK_RETRY_SECONDS = 0.1
 
+# Must stay a fixed multi-word constant: the send-keys call passes it as
+# one argument WITHOUT -l, so tmux would interpret a value matching a key
+# name (Enter, C-c, Escape) as a keystroke instead of typing it. If this
+# ever becomes configurable or carries payload text, switch the call to
+# `send-keys -l` for the text plus a separate `send-keys Enter`.
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
 
@@ -332,7 +338,11 @@ def create_bridge_app(
 
         try:
             event = json.loads(body)
-        except json.JSONDecodeError:
+        # ValueError, not just JSONDecodeError: json.loads(bytes) DECODES
+        # before parsing, and invalid UTF-8 raises UnicodeDecodeError (a
+        # ValueError but not a JSONDecodeError) - it must be a 400, not a
+        # 500 with bus retries behind it
+        except ValueError:
             return {"error": "invalid JSON"}, 400
         if not isinstance(event, dict):
             # Valid JSON that isn't an object (123, [], "x") must be a 400,
@@ -620,10 +630,13 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"Invalid port {config.port} (check --port / AGENT_EVENT_BUS_BRIDGE_PORT): "
             "expected 1-65535"
         )
-    if config.cooldown_seconds < 0:
+    # isfinite too: nan makes every prune comparison False (cooldown never
+    # engages), inf makes it always True (one wake ever, then silence)
+    if not math.isfinite(config.cooldown_seconds) or config.cooldown_seconds < 0:
         raise SystemExit(
             f"Invalid cooldown {config.cooldown_seconds} "
-            "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): must be >= 0"
+            "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): "
+            "must be finite and >= 0"
         )
     # A daemon's cwd is whatever its supervisor hands it - a relative wake
     # dir would silently relocate the durable path (and its chmod)

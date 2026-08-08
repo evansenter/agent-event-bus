@@ -198,6 +198,10 @@ class TestHookFiltering:
 
     def test_invalid_json_rejected(self, client):
         assert client.post("/hook", content=b"not-json{").status_code == 400
+        # json.loads(bytes) DECODES before parsing: invalid UTF-8 raises
+        # UnicodeDecodeError (a ValueError, not JSONDecodeError) and must
+        # be a 400 too, not a 500 with bus retries behind it
+        assert client.post("/hook", content=b"\x80abc").status_code == 400
 
     def test_non_object_json_rejected(self, client):
         """Valid JSON that isn't an object must be a 400, not an
@@ -885,6 +889,14 @@ class TestHookUrlTopology:
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "-5")
         with pytest.raises(SystemExit, match="COOLDOWN"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_non_finite_cooldown_is_refused(self, monkeypatch):
+        """nan never prunes-compares True (cooldown never engages); inf
+        never prunes at all (one wake ever, then silence)."""
+        for value in ("nan", "inf"):
+            monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", value)
+            with pytest.raises(SystemExit, match="COOLDOWN"):
+                bridge.config_from_args(bridge.build_parser().parse_args([]))
 
     def test_empty_wake_dir_env_falls_back_to_default(self, monkeypatch):
         """An empty env var would make Path('') == cwd - the bridge would

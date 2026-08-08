@@ -391,7 +391,10 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
   job: bound how often you act on a drained spool, and dedupe on `event_id`.
 - Startup is idempotent: stale active webhooks at this bridge's URL (from
   unclean exits) are removed before registering, so restarts never stack
-  duplicate deliveries.
+  duplicate deliveries. The sweep matches the URL being registered NOW -
+  after changing `--port` or `--hook-url`, drop the row at the old URL
+  yourself (`agent-event-bus-cli webhook list` / `webhook unregister`) or
+  the bus keeps dispatching to the dead address forever.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
 
