@@ -342,11 +342,26 @@ def create_bridge_app(
 
         # The bus always sends the derived signal_level; only actionable
         # events (DMs, help_needed, blockers, CI failures) justify a wake
-        if event.get("signal_level") != "actionable":
+        level = event.get("signal_level")
+        if level != "actionable":
+            if level is None:
+                # A bus predating derived levels (#129) sends none at all -
+                # every delivery would land here forever, so make the
+                # version skew visible instead of filtering silently
+                logger.info(
+                    f"Event {event.get('event_id')} carries no signal_level "
+                    "(bus predates derived levels?); filtering it"
+                )
+            else:
+                logger.debug(f"Ignoring event {event.get('event_id')}: level {level!r}")
             return {"status": "ignored", "reason": "below actionable"}, 200
 
         target = resolve_target_session(event)
         if target is None:
+            logger.debug(
+                f"Ignoring event {event.get('event_id')}: "
+                f"channel {event.get('channel')!r} has no target session"
+            )
             return {"status": "ignored", "reason": "no target session"}, 200
 
         action = injector.deliver(target, event)
@@ -511,16 +526,16 @@ def register_with_retry(
         delay = min(delay * 2, max_delay)
 
 
-def _env_number(name: str, default, cast):
-    """Read a numeric env var, turning a typo into a config error instead of
-    a bare ValueError traceback out of build_parser()."""
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
+def _to_number(value, cast, flag: str, env: str):
+    """Cast a CLI/env-supplied numeric value at CONFIG time, not at
+    parser-build time - a typo in the env var must not break --help (the
+    first thing an operator reaches for when the daemon refuses to start)."""
     try:
-        return cast(raw)
-    except ValueError:
-        raise SystemExit(f"Invalid {name}={raw!r}: expected a number") from None
+        return cast(value)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"Invalid value {value!r} (check {flag} / {env}): expected a number"
+        ) from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -532,8 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port",
-        type=int,
-        default=_env_number("AGENT_EVENT_BUS_BRIDGE_PORT", DEFAULT_BRIDGE_PORT, int),
+        # Raw string default, cast in config_from_args - see _to_number
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_PORT") or str(DEFAULT_BRIDGE_PORT),
         help=f"Localhost port to listen on (default: {DEFAULT_BRIDGE_PORT})",
     )
     parser.add_argument(
@@ -544,8 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cooldown",
-        type=float,
-        default=_env_number("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", DEFAULT_COOLDOWN_SECONDS, float),
+        # Raw string default, cast in config_from_args - see _to_number
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN") or str(DEFAULT_COOLDOWN_SECONDS),
         help="Minimum seconds between wakes per session (loop prevention)",
     )
     parser.add_argument(
@@ -583,14 +598,16 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         )
     config = BridgeConfig(
         bus_url=args.bus_url,
-        port=args.port,
+        port=_to_number(args.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT"),
         backend=args.backend,
         # `or None`: an accidentally empty env var must not put registration
         # (which would skip the secret, so unsigned payloads) and verification
         # (which would demand signatures) on opposite sides - that 401s every
         # delivery silently
         secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
-        cooldown_seconds=args.cooldown,
+        cooldown_seconds=_to_number(
+            args.cooldown, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
+        ),
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
         bind=args.bind,

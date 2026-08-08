@@ -338,27 +338,30 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
      already read). The bridge's acquire is bounded (~5s), so keep your
      hold to the renames below - never drain while holding the lock.
   2. Under the lock, claim a batch by rename (renames only, so the hold
-     stays short). Every claim targets `<sid>.jsonl.draining.$$.<seq>`
-     with ONE counter shared across all claims in this drain - rename
-     silently replaces an existing target, so any two claims onto the
-     same name would destroy a batch. First claim the live spool (if it
-     exists): `mv <sid>.jsonl <sid>.jsonl.draining.$$.0`. Then claim
-     each stale `<sid>.jsonl.draining.*` that does not already carry
-     your own pid onto the next counter value (`.1`, `.2`, ...) - a
-     drain that died mid-protocol (hook timeout, session exit, reboot)
-     leaves one behind; judge staleness by age (e.g. mtime over a
-     minute old), not pid liveness - pids recycle across reboots, so a
-     dead drainer's pid can read as live forever. `touch` each file as
+     stays short). Pick a claim id `<uniq>` unique to THIS drain - pid
+     plus a timestamp, or an mktemp-style suffix. Pid alone is NOT
+     unique: pids recycle (across reboots, or between two drains of the
+     same session), and rename silently replaces an existing target, so
+     a recycled pid would destroy a dead drain's batch with its own
+     claim. Every claim targets `<sid>.jsonl.draining.<uniq>.<seq>`
+     with one counter shared across the drain's claims. First claim the
+     live spool (if it exists):
+     `mv <sid>.jsonl <sid>.jsonl.draining.<uniq>.0`. Then claim each
+     stale `<sid>.jsonl.draining.*` not carrying your own claim id onto
+     the next counter value (`.1`, `.2`, ...) - a drain that died
+     mid-protocol (hook timeout, session exit, reboot) leaves one
+     behind; judge staleness by age (e.g. mtime over a minute old), not
+     pid liveness, for the same recycling reason. `touch` each file as
      part of claiming it: rename preserves the file's mtime (a claim
      would otherwise carry its last-append time and read as stale
      immediately), and the touch makes age mean time-since-claim.
      Release the lock.
   3. Outside the lock, drain the files you claimed
-     (`<sid>.jsonl.draining.$$.*`), then delete them. You only ever
-     delete files you claimed, so overlapping drains can never destroy
-     each other's batch - and if the age test ever claims a merely
-     *stalled* drainer's file, the `event_id` dedupe covers the
-     double-action while deletion stays claimant-only.
+     (`<sid>.jsonl.draining.<uniq>.*`), then delete them. Claim ids are
+     drain-unique, so no two drains can ever target or delete the same
+     name - and if the age test ever claims a merely *stalled*
+     drainer's file, the `event_id` dedupe covers the double-action
+     while deletion stays claimant-only.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Spooled payloads are

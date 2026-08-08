@@ -160,6 +160,27 @@ class TestPathSafety:
 
 
 class TestHookFiltering:
+    def test_session_dm_signal_level_contract(self):
+        """The bridge filters on the literal 'actionable' - pin that the bus
+        really derives that level for session: DMs, the same way sign()
+        builds on the bus's _compute_signature. If the bus stopped making
+        DMs actionable, every bridge filter test would otherwise stay green
+        while the bridge woke nobody."""
+        from datetime import datetime
+
+        from agent_event_bus.server import _get_signal_level
+        from agent_event_bus.storage import Event as BusEvent
+
+        dm = BusEvent(
+            id=1,
+            event_type="note",
+            payload="hi",
+            session_id="sender-1",
+            timestamp=datetime(2026, 8, 8),
+            channel="session:target-1",
+        )
+        assert _get_signal_level(dm) == "actionable"
+
     def test_below_actionable_ignored(self, client, config):
         for level in ("lifecycle", "info"):
             resp = client.post("/hook", content=json.dumps(make_event(signal_level=level)).encode())
@@ -744,14 +765,16 @@ class TestEnvValidation:
         assert config.backend == "tmux"
 
     def test_env_port_typo_is_a_config_error(self, monkeypatch):
+        """Named error at CONFIG time - parser-build must stay clean so
+        --help keeps working under a typo'd env var."""
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "eight")
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
-            bridge.build_parser()
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
 
     def test_env_cooldown_typo_is_a_config_error(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", "30s")
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_COOLDOWN"):
-            bridge.build_parser()
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
 
 
 class TestHookUrlTopology:
@@ -841,6 +864,18 @@ class TestHookUrlTopology:
 
     def test_out_of_range_port_is_refused(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "99999")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_bad_numeric_env_does_not_break_help(self, monkeypatch, capsys):
+        """A typo'd numeric env var must fail at CONFIG time with a named
+        error - not at parser-build time, which would break --help, the
+        first thing an operator reaches for when the daemon won't start."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "eighty")
+        with pytest.raises(SystemExit) as exc:
+            bridge.build_parser().parse_args(["--help"])
+        assert exc.value.code == 0  # help printed cleanly
+        assert "--port" in capsys.readouterr().out
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 
