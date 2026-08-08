@@ -373,7 +373,7 @@ authentication on that hop - and it authenticates but neither encrypts nor
 expires, so run the hop over an encrypted transport (your tailnet, or a TLS
 terminator); replay freshness is an RFC-level follow-up. `--bind` can pin
 the listener to a single interface (e.g. the tailnet address) instead of
-all interfaces. Keep `--port` and the port in `--hook-url` in agreement
+all interfaces - any non-loopback bind requires the secret too. Keep `--port` and the port in `--hook-url` in agreement
 unless a proxy genuinely forwards between them (a mismatch is logged). Note webhooks have no machine scoping - every bridge receives
 every `session:` DM; tmux wakes only work for sessions on the bridge's own
 machine, and spool files for foreign sessions accumulate until the pruning

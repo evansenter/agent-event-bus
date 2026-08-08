@@ -64,6 +64,10 @@ TMUX_TIMEOUT = 5.0
 # in-flight register call to commit, short enough not to hang exit
 REGISTRATION_JOIN_TIMEOUT = 10.0
 
+# Real bus payloads are a few KB; the body must be read before the HMAC can
+# be checked, so bound what an unauthenticated peer can make us buffer
+MAX_BODY_BYTES = 1_048_576  # 1 MiB
+
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
 
@@ -305,7 +309,14 @@ def create_bridge_app(
     async def hook_endpoint(request: Request) -> JSONResponse:
         from starlette.concurrency import run_in_threadpool
 
+        # Precheck the honest case cheaply; the post-read check below covers
+        # a missing or lying content-length (e.g. chunked encoding)
+        content_length = request.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+            return JSONResponse({"error": "body too large"}, status_code=413)
         body = await request.body()
+        if len(body) > MAX_BODY_BYTES:
+            return JSONResponse({"error": "body too large"}, status_code=413)
         signature = request.headers.get("x-event-bus-signature")
         payload, status = await run_in_threadpool(process, body, signature)
         return JSONResponse(payload, status_code=status)
@@ -338,23 +349,25 @@ def bridge_hook_url(config: BridgeConfig) -> str:
 LOOPBACK_HOSTS = {"localhost"}
 
 
-def _is_loopback(url: str) -> bool:
+def _is_host_loopback(host: str) -> bool:
     """Loopback is all of 127.0.0.0/8 plus ::1 (Debian/Ubuntu resolve the
     machine's own hostname to 127.0.1.1), not just the literal 127.0.0.1."""
-    host = urllib.parse.urlsplit(url).hostname
-    if host is None:
-        return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host in LOOPBACK_HOSTS
 
 
+def _is_loopback(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname
+    return True if host is None else _is_host_loopback(host)
+
+
 def bind_host(config: BridgeConfig) -> str:
-    """Which interface the listener binds. A loopback hook URL means the
-    local bus is the sole caller -> localhost only. A reachable hook URL
-    means a remote bus must reach us -> all interfaces, unless --bind pins
-    one (config_from_args guarantees an HMAC secret on that path)."""
+    """Which interface the listener binds: --bind wins, else loopback for a
+    loopback hook URL (the local bus is the sole caller), else all
+    interfaces. config_from_args requires the HMAC secret whenever the
+    effective bind OR the hook URL is non-loopback."""
     if config.bind:
         return config.bind
     if _is_loopback(bridge_hook_url(config)):
@@ -567,16 +580,43 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             "on THIS machine, address it as 127.0.0.1 or localhost - a hostname "
             "that resolves to 127.0.1.1 reads as remote."
         )
-    # A non-loopback hook URL means binding beyond localhost, where the HMAC
-    # is the only authentication: an unsigned endpoint would let anyone who
-    # can reach the port append attacker-authored lines to a session spool.
-    # Hard requirement, matching the refusal above - the bus itself defaults
-    # to auth-required, and the bridge must not invert that.
-    if not _is_loopback(bridge_hook_url(config)) and not config.secret:
+    # --bind must be an address uvicorn can actually bind - a typo would
+    # otherwise surface as a bare socket.gaierror naming neither the flag
+    # nor the env var
+    if config.bind is not None:
+        try:
+            ipaddress.ip_address(config.bind)
+        except ValueError:
+            if config.bind not in LOOPBACK_HOSTS:
+                raise SystemExit(
+                    f"Invalid bind address {config.bind!r} "
+                    "(check --bind / AGENT_EVENT_BUS_BRIDGE_BIND): expected an IP address"
+                ) from None
+    # The HMAC is the only authentication once the endpoint is reachable
+    # off-box, and exposure is decided by the EFFECTIVE bind (bind_host
+    # consults --bind first) as well as the hook URL: a non-loopback bind
+    # with no secret would let anyone who reaches the port append
+    # attacker-authored lines to a session spool, and a non-loopback hook
+    # URL means the hop exists even behind a local TLS terminator. Hard
+    # requirement either way - the bus itself defaults to auth-required,
+    # and the bridge must not invert that.
+    exposed = not _is_host_loopback(bind_host(config)) or not _is_loopback(bridge_hook_url(config))
+    if exposed and not config.secret:
         raise SystemExit(
-            "Hook URL is non-loopback, so the listener must bind beyond localhost - "
-            "set AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
-            "authentication on this hop)."
+            f"Listener would bind {bind_host(config)} with hook URL "
+            f"{bridge_hook_url(config)} - reachable off-box, so set "
+            "AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
+            "authentication on this hop). Check --bind / AGENT_EVENT_BUS_BRIDGE_BIND "
+            "and --hook-url."
+        )
+    # The inverse mismatch is silent inertness, not exposure: a loopback
+    # bind under a reachable hook URL means the bus's POSTs are refused at
+    # the TCP level. Legitimate behind a same-box TLS terminator, so warn
+    # rather than refuse - same policy as the port mismatch below.
+    if _is_host_loopback(bind_host(config)) and not _is_loopback(bridge_hook_url(config)):
+        logger.warning(
+            f"Hook URL {bridge_hook_url(config)} is reachable but the listener binds "
+            f"{bind_host(config)} (loopback) - correct only if something forwards between them"
         )
     # The bus POSTs to the hook URL's port while the listener binds --port;
     # a mismatch is legitimate behind a reverse proxy, but name it - it's

@@ -164,6 +164,12 @@ class TestHookFiltering:
         for body in (b"123", b'["x"]', b'"bare"', b"null"):
             assert client.post("/hook", content=body).status_code == 400
 
+    def test_oversized_body_rejected(self, client):
+        """The body must be read before the HMAC can be checked, so bound
+        what an unauthenticated peer can make the bridge buffer."""
+        big = b'{"payload": "' + b"x" * (2 * 1024 * 1024) + b'"}'
+        assert client.post("/hook", content=big).status_code == 413
+
     def test_actionable_dm_delivered_to_spool(self, client, config):
         resp = client.post("/hook", content=json.dumps(make_event()).encode())
 
@@ -749,6 +755,46 @@ class TestBindHost:
             bind="100.100.1.2",
         )
         assert bridge.bind_host(config) == "100.100.1.2"
+
+    def test_non_loopback_bind_without_secret_is_refused(self, monkeypatch):
+        """--bind decides exposure before the hook URL does: a wide bind
+        with the default local bus must not open an unsigned /hook off-box
+        (the round-6 refusal, reachable through the round-7 flag)."""
+        for bind in ("0.0.0.0", "100.100.1.2"):
+            args = bridge.build_parser().parse_args(["--bind", bind])
+            with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
+                bridge.config_from_args(args)
+
+    def test_non_loopback_bind_with_secret_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "0.0.0.0"]))
+        assert bridge.bind_host(config) == "0.0.0.0"
+
+    def test_loopback_bind_is_accepted_without_secret(self):
+        config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "127.0.0.1"]))
+        assert bridge.bind_host(config) == "127.0.0.1"
+
+    def test_invalid_bind_is_refused(self):
+        args = bridge.build_parser().parse_args(["--bind", "localhost:8082"])
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_BIND"):
+            bridge.config_from_args(args)
+
+    def test_loopback_bind_under_reachable_hook_warns(self, monkeypatch, caplog):
+        """The inverse mismatch is silent inertness (the bus's POSTs are
+        refused at the TCP level) - legitimate behind a same-box TLS
+        terminator, so a named warning, not a refusal."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        args = bridge.build_parser().parse_args(
+            ["--bind", "127.0.0.1", "--hook-url", "http://laptop.tailnet.example:8082/hook"]
+        )
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(args)
+        assert any(
+            "laptop.tailnet.example" in r.message and "127.0.0.1" in r.message
+            for r in caplog.records
+        )
 
     def test_main_passes_bind_through_and_unregisters(self, monkeypatch, tmp_path):
         """End-to-end main(): the default local config binds loopback, the
