@@ -109,30 +109,98 @@ class TestHookFiltering:
         assert client.get("/health").json()["status"] == "ok"
 
 
-class TestInjectorCooldown:
-    def test_second_wake_within_cooldown_spools_only(self, config):
-        injector = Injector(config)
-        event = make_event()
+def make_tmux_injector(tmp_path, sessions=("target-1",), cooldown=30.0):
+    """A tmux-backend injector with pane mappings for the given sessions."""
+    config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux", cooldown_seconds=cooldown)
+    config.wake_dir.mkdir(parents=True)
+    panes = {sid: f"%{i}" for i, sid in enumerate(sessions)}
+    (config.wake_dir / "panes.json").write_text(json.dumps(panes))
+    return Injector(config), config
 
-        assert injector.deliver("target-1", event) == "spool"
-        assert injector.deliver("target-1", event) == "spool-cooldown"
+
+def tmux_ok(cmd, **kwargs):
+    class Result:
+        returncode = 0
+
+    return Result()
+
+
+class TestInjectorCooldown:
+    """The cooldown bounds successful injections only - spool writes are
+    durable bookkeeping, and failed wakes must not burn the window."""
+
+    def test_second_wake_within_cooldown_spools_only(self, tmp_path):
+        injector, config = make_tmux_injector(tmp_path)
+
+        with patch.object(bridge.subprocess, "run", tmux_ok):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+            assert injector.deliver("target-1", make_event()) == "spool-cooldown"
 
         # Both events were spooled - cooldown bounds wakes, not durability
         lines = (config.wake_dir / "target-1.jsonl").read_text().splitlines()
         assert len(lines) == 2
 
-    def test_cooldown_is_per_session(self, config):
+    def test_cooldown_is_per_session(self, tmp_path):
+        injector, _ = make_tmux_injector(tmp_path, sessions=("target-1", "target-2"))
+
+        with patch.object(bridge.subprocess, "run", tmux_ok):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+            assert injector.deliver("target-2", make_event()) == "tmux"
+
+    def test_wake_allowed_after_cooldown_expires(self, tmp_path):
+        injector, _ = make_tmux_injector(tmp_path, cooldown=30.0)
+
+        clock = {"now": 1000.0}
+        with patch.object(bridge.time, "monotonic", lambda: clock["now"]):
+            with patch.object(bridge.subprocess, "run", tmux_ok):
+                assert injector.deliver("target-1", make_event()) == "tmux"
+                clock["now"] += 10.0
+                assert injector.deliver("target-1", make_event()) == "spool-cooldown"
+                clock["now"] += 25.0  # 35s after the successful wake
+                assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_failed_wake_does_not_burn_cooldown(self, tmp_path):
+        """A transient tmux failure must not silence the session for a full
+        cooldown - the next event retries immediately."""
+        injector, _ = make_tmux_injector(tmp_path)
+
+        def tmux_fail(cmd, **kwargs):
+            raise bridge.subprocess.CalledProcessError(1, cmd)
+
+        with patch.object(bridge.subprocess, "run", tmux_fail):
+            assert injector.deliver("target-1", make_event()) == "spool"
+
+        with patch.object(bridge.subprocess, "run", tmux_ok):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_spool_backend_never_cooldowns(self, config):
         injector = Injector(config)
 
         assert injector.deliver("target-1", make_event()) == "spool"
-        assert injector.deliver("target-2", make_event()) == "spool"
+        assert injector.deliver("target-1", make_event()) == "spool"
 
-    def test_wake_allowed_after_cooldown_expires(self, config):
-        config.cooldown_seconds = 0.0
+    def test_concurrent_spool_appends_do_not_tear(self, config):
+        """Concurrent webhook deliveries append under the lock; every line
+        must stay valid JSON even when payloads exceed the IO buffer."""
+        import threading
+
         injector = Injector(config)
+        event = make_event(payload="x" * 100_000)  # > default 8 KiB buffer
 
-        assert injector.deliver("target-1", make_event()) == "spool"
-        assert injector.deliver("target-1", make_event()) == "spool"
+        threads = [threading.Thread(target=injector.deliver, args=("t", event)) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        lines = (config.wake_dir / "t.jsonl").read_text().splitlines()
+        assert len(lines) == 8
+        for line in lines:
+            json.loads(line)
+
+    def test_wake_dir_is_private(self, config):
+        Injector(config).deliver("target-1", make_event())
+        assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
 
 
 class TestTmuxBackend:
@@ -194,16 +262,54 @@ class TestBusRegistration:
 
         def fake_call_tool(tool_name, arguments, url=None, **kwargs):
             calls.append({"tool": tool_name, "arguments": arguments, "url": url})
+            if tool_name == "list_webhooks":
+                return []
             return {"webhook_id": 42}
 
         with patch.object(bridge, "call_tool", fake_call_tool):
             webhook_id = bridge.register_with_bus(config)
 
         assert webhook_id == 42
-        assert calls[0]["tool"] == "register_webhook"
-        assert calls[0]["arguments"]["url"] == "http://127.0.0.1:9999/hook"
-        assert calls[0]["arguments"]["secret"] == "s3cret"
-        assert calls[0]["url"] == "http://bus/mcp"
+        register = next(c for c in calls if c["tool"] == "register_webhook")
+        assert register["arguments"]["url"] == "http://127.0.0.1:9999/hook"
+        assert register["arguments"]["secret"] == "s3cret"
+        assert register["url"] == "http://bus/mcp"
+
+    def test_startup_removes_stale_webhooks_at_same_url(self, tmp_path):
+        """Unclean exits leave active webhooks behind; each would duplicate
+        every wake, so startup must clean up matching URLs first."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port=9999)
+        calls = []
+
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments})
+            if tool_name == "list_webhooks":
+                return [
+                    {"webhook_id": 7, "url": "http://127.0.0.1:9999/hook"},
+                    {"webhook_id": 8, "url": "http://elsewhere/hook"},
+                ]
+            return {"webhook_id": 43}
+
+        with patch.object(bridge, "call_tool", fake_call_tool):
+            webhook_id = bridge.register_with_bus(config)
+
+        assert webhook_id == 43
+        unregisters = [c["arguments"] for c in calls if c["tool"] == "unregister_webhook"]
+        # Only the stale hook at OUR url is removed, not other consumers'
+        assert unregisters == [{"webhook_id": 7}]
+
+    def test_empty_secret_env_is_normalized_to_none(self, tmp_path, monkeypatch):
+        """An accidentally empty secret must not split registration (skips
+        the secret -> unsigned payloads) from verification (demands
+        signatures) - the combination 401s every delivery silently."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "")
+        secret = __import__("os").environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None
+        config = BridgeConfig(wake_dir=tmp_path / "wake", secret=secret)
+
+        # Verification is disabled, matching registration's omitted secret
+        client = TestClient(create_bridge_app(config))
+        resp = client.post("/hook", content=json.dumps(make_event()).encode())
+        assert resp.status_code == 200
 
     def test_unregister_swallows_bus_unreachable(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")

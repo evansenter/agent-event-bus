@@ -103,24 +103,41 @@ class Injector:
 
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken:
-        "tmux", "spool", or "spool-cooldown"."""
-        self._spool(session_id, event)
+        "tmux", "spool", or "spool-cooldown".
 
+        The cooldown bounds successful injections only: spool writes are
+        durable bookkeeping, not wakes, and a failed tmux attempt must not
+        burn the window - the next event should retry (e.g. after a
+        SessionStart hook repairs the pane mapping).
+        """
         with self._lock:
-            now = time.monotonic()
-            last = self._last_wake.get(session_id)
-            if last is not None and (now - last) < self.config.cooldown_seconds:
-                # Spooled above; the previous wake-up covers it
-                return "spool-cooldown"
-            self._last_wake[session_id] = now
+            # Locked append: concurrent webhook deliveries would otherwise
+            # interleave buffered writes and tear a JSON line
+            self._spool(session_id, event)
 
-        if self.config.backend == "tmux" and self._tmux_wake(session_id):
+            if self.config.backend != "tmux":
+                return "spool"
+
+            last = self._last_wake.get(session_id)
+            if last is not None and (time.monotonic() - last) < self.config.cooldown_seconds:
+                return "spool-cooldown"
+
+        # tmux runs outside the lock (bounded at 5s, but other sessions'
+        # deliveries shouldn't wait on it)
+        if self._tmux_wake(session_id):
+            with self._lock:
+                self._last_wake[session_id] = time.monotonic()
             return "tmux"
         return "spool"
 
     def _spool(self, session_id: str, event: dict) -> None:
-        """Always-on durable path: one JSON line per event, per session."""
+        """Always-on durable path: one JSON line per event, per session.
+
+        Callers must hold self._lock. The wake dir is kept private (0o700):
+        spool files carry full event payloads.
+        """
         self.config.wake_dir.mkdir(parents=True, exist_ok=True)
+        self.config.wake_dir.chmod(0o700)
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
         with spool_file.open("a") as f:
             f.write(json.dumps(event) + "\n")
@@ -163,7 +180,7 @@ def create_bridge_app(config: BridgeConfig, injector: Injector | None = None) ->
         """Sync webhook handling (runs in a worker thread - the file appends
         and tmux subprocess must stay off the event loop, same invariant as
         the bus server's #112 fix)."""
-        if config.secret is not None and not verify_signature(body, signature, config.secret):
+        if config.secret and not verify_signature(body, signature, config.secret):
             return {"error": "bad signature"}, 401
 
         try:
@@ -202,12 +219,33 @@ def create_bridge_app(config: BridgeConfig, injector: Injector | None = None) ->
     )
 
 
+def bridge_hook_url(config: BridgeConfig) -> str:
+    return f"http://127.0.0.1:{config.port}/hook"
+
+
 def register_with_bus(config: BridgeConfig) -> int | None:
-    """Register this bridge's webhook on the bus. Returns webhook_id."""
+    """Register this bridge's webhook on the bus. Returns webhook_id.
+
+    Idempotent: an unclean exit (SIGKILL, crash, reboot) skips main()'s
+    finally, leaving a stale active webhook at this URL - and the bus neither
+    dedupes by URL nor deactivates failing hooks, so each stale row would
+    duplicate every wake. Remove matching URLs before registering.
+    """
+    hook_url = bridge_hook_url(config)
+
+    existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url)
+    if isinstance(existing, list):
+        for wh in existing:
+            if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
+                call_tool(
+                    "unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url
+                )
+                logger.info(f"Removed stale bridge webhook #{wh['webhook_id']}")
+
     result = call_tool(
         "register_webhook",
         {
-            "url": f"http://127.0.0.1:{config.port}/hook",
+            "url": hook_url,
             # No server-side filter: payloads carry the derived signal_level,
             # and the bridge filters to actionable locally. (Webhook filters
             # only cover channel/event_types; "actionable" spans both DMs and
@@ -260,6 +298,12 @@ def main():
         default=float(os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN", DEFAULT_COOLDOWN_SECONDS)),
         help="Minimum seconds between wakes per session (loop prevention)",
     )
+    parser.add_argument(
+        "--wake-dir",
+        type=Path,
+        default=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
+        help="Directory for spool files and panes.json",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -268,9 +312,13 @@ def main():
         bus_url=args.bus_url,
         port=args.port,
         backend=args.backend,
-        secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET"),
+        # `or None`: an accidentally empty env var must not put registration
+        # (which would skip the secret, so unsigned payloads) and verification
+        # (which would demand signatures) on opposite sides - that 401s every
+        # delivery silently
+        secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
         cooldown_seconds=args.cooldown,
-        wake_dir=Path(os.environ.get("AGENT_EVENT_BUS_WAKE_DIR", str(DEFAULT_WAKE_DIR))),
+        wake_dir=args.wake_dir,
     )
 
     webhook_id = register_with_bus(config)

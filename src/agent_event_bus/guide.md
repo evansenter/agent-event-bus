@@ -330,14 +330,27 @@ agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
 
 - **spool**: every wake event is appended to
   `~/.claude/contrib/agent-event-bus/wake/<session_id>.jsonl` for a hook to
-  drain. This durable path is always on, in every backend.
+  drain. This durable path is always on, in every backend. Drain contract:
+  the consuming hook owns the file - read it, act, then truncate it (the
+  bridge only ever appends). The wake dir is created 0o700 (spool files
+  carry full event payloads); pruning spools for dead sessions is a
+  follow-up.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool.
-- Per-session cooldown (default 30s, `--cooldown`) bounds wake-ups; events
-  during cooldown are spooled, never dropped.
+- Per-session cooldown (default 30s, `--cooldown`) bounds *successful*
+  wake-ups; events during cooldown are spooled, never dropped, and a failed
+  tmux attempt doesn't burn the window.
+- Startup is idempotent: stale active webhooks at this bridge's URL (from
+  unclean exits) are removed before registering, so restarts never stack
+  duplicate deliveries.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
+
+Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
+`--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,
+`--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
+`--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`.
 
 ## Best Practices
 
