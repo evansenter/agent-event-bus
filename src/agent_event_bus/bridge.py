@@ -19,8 +19,11 @@ Injection backends:
          session-side (e.g. a SessionStart hook publishing $TMUX_PANE) must
          maintain.
 
-Loop prevention: a per-session cooldown (default 30s) bounds injections; an
-event that arrives during cooldown is spooled instead, so nothing is lost.
+Loop prevention: in the tmux backend a per-session cooldown (default 30s)
+bounds injections; an event that arrives during cooldown is spooled instead,
+so nothing is lost. In the default spool backend the cooldown never engages -
+a spool line only becomes a wake when the drain hook acts on it, so bounding
+that belongs to the drain hook.
 
 Run:  agent-event-bus-bridge [--backend tmux] [--port 8082] ...
 The bridge registers its own webhook on the bus at startup (HMAC-signed when
@@ -204,12 +207,13 @@ class Injector:
 
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken: "tmux",
-        "spool" (spool backend working as designed), "spool-cooldown", or
-        "spool-tmux-failed" (tmux backend, wake missed or failed). The
-        distinct failure value is the one in-band signal - it rides the 200
-        response's `action` field - that separates "tmux is broken on this
-        box" from the spool backend's normal path, since the unmapped-pane
-        arm logs only at debug.
+        "spool" (spool backend working as designed), "spool-cooldown",
+        "spool-unmapped" (tmux backend, no pane mapping - the NORMAL outcome
+        for a session on another machine, since webhooks have no machine
+        scoping), or "spool-tmux-failed" (tmux backend, the send-keys
+        attempt itself failed - the arm that means tmux on this box is
+        broken). The distinction rides the 200 response's `action` field,
+        the one in-band signal, since the unmapped arm logs only at debug.
 
         The cooldown bounds successful injections only: spool writes are
         durable bookkeeping, not wakes, and a failed tmux attempt must not
@@ -225,6 +229,17 @@ class Injector:
 
         if self.config.backend != "tmux":
             return "spool"
+
+        # Pane lookup BEFORE the cooldown machinery: on a multi-machine bus
+        # the unmapped arm is the normal outcome, not a failure, so there is
+        # no reservation to take or roll back. Debug, not info: per-event
+        # INFO on an arm every foreign-machine DM lands on is permanent
+        # noise - matches the below-actionable filter arm and _tmux_pane's
+        # silent missing-file case.
+        pane = self._tmux_pane(session_id)
+        if pane is None:
+            logger.debug(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
+            return "spool-unmapped"
 
         with self._lock:
             now = time.monotonic()
@@ -244,8 +259,10 @@ class Injector:
             self._last_wake[session_id] = now
 
         # tmux runs outside the lock (bounded at TMUX_TIMEOUT, but other
-        # sessions' deliveries shouldn't wait on it)
-        if self._tmux_wake(session_id):
+        # sessions' deliveries shouldn't wait on it). The pane can go stale
+        # between the lookup above and here - send-keys just fails, which is
+        # the arm below.
+        if self._tmux_wake(session_id, pane):
             return "tmux"
         with self._lock:
             # Roll back the reservation so the failure doesn't burn the
@@ -316,16 +333,8 @@ class Injector:
         pane = panes.get(session_id)
         return pane if isinstance(pane, str) and pane else None
 
-    def _tmux_wake(self, session_id: str) -> bool:
-        """Type the wake prompt into the session's pane. False on any miss."""
-        pane = self._tmux_pane(session_id)
-        if pane is None:
-            # Debug, not info: webhooks have no machine scoping, so every DM
-            # aimed at a session on another machine lands here - per-event
-            # INFO would be permanent noise. Matches the below-actionable
-            # filter arm and _tmux_pane's silent missing-file case.
-            logger.debug(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
-            return False
+    def _tmux_wake(self, session_id: str, pane: str) -> bool:
+        """Type the wake prompt into the given pane. False on failure."""
         try:
             subprocess.run(
                 ["tmux", "send-keys", "-t", pane, WAKE_PROMPT, "Enter"],
@@ -690,7 +699,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--cooldown",
         # Raw string default, cast in config_from_args - see _to_number
         default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN") or str(DEFAULT_COOLDOWN_SECONDS),
-        help="Minimum seconds between wakes per session (loop prevention)",
+        help="Minimum seconds between tmux wakes per session (tmux backend "
+        "only; the spool backend's loop prevention belongs to the drain hook)",
     )
     parser.add_argument(
         "--wake-dir",
@@ -841,14 +851,21 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # otherwise the same silent-inertness failure the guards above close.
     # SplitResult.port raises for a malformed port - keep that a named
     # config error like every other input.
+    hook_split = urllib.parse.urlsplit(bridge_hook_url(config))
     try:
-        hook_port = urllib.parse.urlsplit(bridge_hook_url(config)).port
+        hook_port = hook_split.port
     except ValueError:
         raise SystemExit(
             f"Invalid hook URL {bridge_hook_url(config)!r} "
             "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): bad port"
         ) from None
-    if hook_port is not None and hook_port != config.port:
+    if hook_port is None:
+        # A missing port is not "no opinion" - the bus POSTs to the scheme
+        # default, so a forgotten :8082 is exactly the mismatch this warning
+        # names (https behind a TLS terminator forwarding to --port is the
+        # legitimate case, same as the other mismatches)
+        hook_port = 443 if hook_split.scheme == "https" else 80
+    if hook_port != config.port:
         logger.warning(
             f"Hook URL advertises port {hook_port} but the listener binds {config.port} - "
             "correct only if something forwards between them"

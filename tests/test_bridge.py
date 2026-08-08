@@ -547,10 +547,11 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run") as mock_run:
             action = injector.deliver("target-1", make_event())
 
-        # Distinct from plain "spool": the unmapped-pane arm logs only at
-        # debug, so the action field is the one in-band signal separating a
-        # broken tmux setup from the spool backend's normal path
-        assert action == "spool-tmux-failed"
+        # Distinct from "spool" AND from "spool-tmux-failed": unmapped is
+        # the normal outcome for a foreign-machine session (webhooks have no
+        # machine scoping), so it must not read as a broken tmux setup - and
+        # it logs only at debug, so the action field is the in-band signal
+        assert action == "spool-unmapped"
         mock_run.assert_not_called()
 
     def test_tmux_failure_falls_back_to_spool(self, tmp_path):
@@ -589,7 +590,7 @@ class TestTmuxBackend:
         for content in (b'["not", "an", "object"]', b'"bare string"', b"null", b"\xff\xfe{}"):
             panes.write_bytes(content)
             with patch.object(bridge.subprocess, "run") as mock_run:
-                assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
             mock_run.assert_not_called()
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
@@ -598,7 +599,7 @@ class TestTmuxBackend:
         (config.wake_dir / "panes.json").mkdir()  # IsADirectoryError on read
 
         with patch.object(bridge.subprocess, "run") as mock_run:
-            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
+            assert injector.deliver("target-1", make_event()) == "spool-unmapped"
         mock_run.assert_not_called()
 
 
@@ -1126,6 +1127,37 @@ class TestHookUrlTopology:
         with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert any("9090" in r.message and "8082" in r.message for r in caplog.records)
+
+    def test_hook_url_without_port_warns_on_scheme_default_mismatch(self, monkeypatch, caplog):
+        """A missing port is not 'no opinion' - the bus POSTs to the scheme
+        default (80/443), so a forgotten :8082 is exactly the mismatch the
+        warning names, and skipping it left the likeliest typo silent."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        for url, default in (
+            ("http://box.local/hook", "80"),
+            ("https://box.local/hook", "443"),
+        ):
+            caplog.clear()
+            monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", url)
+            with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+                bridge.config_from_args(bridge.build_parser().parse_args([]))
+            assert any(
+                f"advertises port {default} " in r.message and "8082" in r.message
+                for r in caplog.records
+            )
+
+    def test_hook_url_scheme_default_matching_port_is_quiet(self, monkeypatch, caplog):
+        """https behind a TLS terminator with --port 443 is the legitimate
+        shape - the substituted default must not warn when it matches."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "https://box.local/hook")
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args(["--port", "443"]))
+        assert not any("advertises port" in r.message for r in caplog.records)
 
     def test_hook_path_mismatch_warns(self, monkeypatch, caplog):
         """POST /hook is the only route served - any other advertised path
