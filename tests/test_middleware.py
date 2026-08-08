@@ -666,3 +666,60 @@ class TestTailscaleAuthMiddleware:
 
         assert not mock_app.called
         assert responses[0]["status"] == 401
+
+
+class TestLoggingOffLoop:
+    """Request logging hits SQLite (display-id lookups) and the disk-backed
+    logger; per the #112 invariant it must run in a worker thread."""
+
+    def test_tool_call_logging_runs_off_the_loop_thread(self, monkeypatch):
+        import asyncio
+        import json
+        import threading
+
+        from agent_event_bus import middleware as mw
+
+        seen = {}
+
+        def fake_lookup(session_id):
+            seen["thread"] = threading.current_thread()
+            return "brave-trex"
+
+        monkeypatch.setattr(mw, "_lookup_session_display_id", fake_lookup)
+
+        async def fake_app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'event: message\ndata: {"result": {}}\n\n',
+                    "more_body": False,
+                }
+            )
+
+        app = mw.RequestLoggingMiddleware(fake_app)
+        request_body = json.dumps(
+            {
+                "method": "tools/call",
+                "params": {"name": "get_events", "arguments": {"session_id": "abc-123"}},
+            }
+        ).encode()
+
+        async def main():
+            scope = {"type": "http", "path": "/mcp", "method": "POST"}
+            messages = [{"type": "http.request", "body": request_body, "more_body": False}]
+
+            async def receive():
+                return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+            async def send(message):
+                pass
+
+            await app(scope, receive, send)
+
+        asyncio.run(main())
+
+        # The lookup ran (the log line was built) but not on the loop thread
+        assert "thread" in seen
+        assert seen["thread"] is not threading.current_thread()

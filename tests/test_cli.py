@@ -246,7 +246,7 @@ class TestCmdPublish:
 
         mock_call.assert_called_once_with(
             "publish_event",
-            {"event_type": "test_event", "payload": "hello"},
+            {"event_type": "test_event", "payload": "hello", "channel": "all"},
             url=None,
             debug=False,
         )

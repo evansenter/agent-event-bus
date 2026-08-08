@@ -139,7 +139,7 @@ def make_publish_args(**overrides):
     defaults = dict(
         type="test_event",
         payload="hello",
-        channel=None,
+        channel="all",  # The publish subparser defaults --channel to "all"
         session_id=None,
         title=None,
         tags=None,
