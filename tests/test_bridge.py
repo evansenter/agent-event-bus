@@ -64,6 +64,18 @@ def clean_bridge_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def reset_unsafe_warn_state():
+    """The unsafe-id rate limit is deliberately process-wide module state
+    (resolve_target_session runs before any Injector exists), so any test
+    driving that arm leaves a real monotonic reading behind - a later test
+    asserting the WARNING would then pass or fail on 60s of wall clock and
+    run ordering, with no hint why. Reset it around every test."""
+    bridge._unsafe_warn_state["last"] = -float("inf")
+    yield
+    bridge._unsafe_warn_state["last"] = -float("inf")
+
+
+@pytest.fixture(autouse=True)
 def restore_bridge_logger_level():
     """main() pins a level on the module logger (the DEV_MODE switch), so
     any test driving main() end to end would otherwise leak that level into
@@ -398,7 +410,11 @@ class TestInjectorCooldown:
 
         def slow_tmux(cmd, **kwargs):
             wakes.append(cmd)
-            release.wait(timeout=5)
+            # Unbounded on purpose: the poll loop below is the failure
+            # detector, and a timeout here would let a slow second thread
+            # turn the snapshot assertions into a confusing wrong-thread
+            # failure. release.set() runs unconditionally before the joins.
+            release.wait()
 
             class Result:
                 returncode = 0
@@ -699,12 +715,32 @@ class TestTmuxBackend:
             return [r for r in caplog.records if r.levelno == logging.WARNING]
 
         with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
-            for bad in (0, "", None):
+            # null FIRST: .get() can't tell null from absent, so ordering
+            # null last would let a .get()-based implementation pass on the
+            # other two values' warnings. null is also the likeliest real
+            # misconfiguration (TMUX_PANE unset -> panes[sid] = null).
+            for bad in (None, 0, ""):
                 panes.write_text(json.dumps({"target-1": bad}))
                 with patch.object(bridge.subprocess, "run") as mock_run:
                     assert injector.deliver("target-1", make_event()) == "spool-unmapped"
                 mock_run.assert_not_called()
-        assert len(warnings()) == 1  # same reason across values - repeats debug
+            assert len(warnings()) == 1  # same reason across values - repeats debug
+            # Per-shape, not aggregate: the two repeats were DEMOTED (seen,
+            # logged at debug), not skipped - an aggregate count can't tell
+            # those apart
+            demoted = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.DEBUG and "not a pane id" in r.message
+            ]
+            assert len(demoted) == 2
+            # A genuinely ABSENT key is the healthy shape and re-arms; a bad
+            # value must not - so bad -> absent -> bad warns twice
+            panes.write_text(json.dumps({"other-session": "%1"}))
+            injector.deliver("target-1", make_event())
+            panes.write_text(json.dumps({"target-1": None}))
+            injector.deliver("target-1", make_event())
+        assert len(warnings()) == 2
         assert "not a pane id" in warnings()[0].message
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):

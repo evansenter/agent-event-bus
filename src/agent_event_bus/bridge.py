@@ -167,7 +167,11 @@ SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # instead: at most one WARNING per interval regardless of content, repeats
 # at debug (DEV_MODE surfaces every offending string). A persistent
 # condition re-warns each interval instead of going dark forever. Unlocked -
-# a rare race just duplicates a warning.
+# a rare race just duplicates a warning. Deliberately PROCESS-WIDE module
+# state, unlike the per-Injector panes guard: resolve_target_session is a
+# module function that runs before any Injector exists, and the log the
+# bound protects is per-process anyway. (Two apps mounted in one process
+# therefore share the window - acceptable for v1.)
 _UNSAFE_WARN_INTERVAL_SECONDS = 60.0
 _unsafe_warn_state = {"last": -math.inf}
 
@@ -391,10 +395,15 @@ class Injector:
                 "not-an-object", "panes.json is not an object; treating as unmapped"
             )
             return None
-        pane = panes.get(session_id)
-        if pane is None:
-            self._last_panes_warn_reason = None  # healthy read re-arms the warning
+        # Membership, not .get(): a JSON null value and an absent key both
+        # come back None from .get(), and null is the LIKELIEST bad value in
+        # practice (panes[sid] = os.environ.get("TMUX_PANE") emits exactly
+        # that outside tmux) - it must land in the bad-value arm below, not
+        # read as healthy-absent and re-arm the guard
+        if session_id not in panes:
+            self._last_panes_warn_reason = None  # genuinely absent - re-arms
             return None
+        pane = panes[session_id]
         if not (isinstance(pane, str) and pane):
             # Present but wrong-typed (0 instead of "%0", "", null): a
             # misconfiguration whose repair is nothing like "the mapping is
@@ -962,15 +971,19 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
                 "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): "
                 "expected http(s)://host[:port]/path"
             )
+    # One derivation for the whole topology block below: every guard
+    # reasons about the same (hook URL, effective bind) pair, and nothing
+    # in between mutates config. `bind` is hoisted after --bind validation.
+    hook = bridge_hook_url(config)
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
     # delivered - and every machine would claim the same URL string, so the
     # startup dedupe could remove a live webhook belonging to the bus host.
     # Refuse the combination instead of failing silently.
-    if not _is_loopback(config.bus_url) and _is_loopback(bridge_hook_url(config)):
+    if not _is_loopback(config.bus_url) and _is_loopback(hook):
         raise SystemExit(
             f"Bus at {config.bus_url} is remote but the advertised hook URL "
-            f"{bridge_hook_url(config)} is loopback - the bus would POST to itself. "
+            f"{hook} is loopback - the bus would POST to itself. "
             "Set --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL to an address the bus "
             "host can reach (and set AGENT_EVENT_BUS_BRIDGE_SECRET). If the bus is "
             "on THIS machine, address it as 127.0.0.1 or localhost - a hostname "
@@ -988,6 +1001,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
                     f"Invalid bind address {config.bind!r} "
                     "(check --bind / AGENT_EVENT_BUS_BRIDGE_BIND): expected an IP address"
                 ) from None
+    bind = bind_host(config)
     # The HMAC is the only authentication once the endpoint is reachable
     # off-box, and exposure is decided by the EFFECTIVE bind (bind_host
     # consults --bind first) as well as the hook URL: a non-loopback bind
@@ -996,11 +1010,11 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # URL means the hop exists even behind a local TLS terminator. Hard
     # requirement either way - the bus itself defaults to auth-required,
     # and the bridge must not invert that.
-    exposed = not _is_host_loopback(bind_host(config)) or not _is_loopback(bridge_hook_url(config))
+    exposed = not _is_host_loopback(bind) or not _is_loopback(hook)
     if exposed and not config.secret:
         raise SystemExit(
-            f"Listener would bind {bind_host(config)} with hook URL "
-            f"{bridge_hook_url(config)} - reachable off-box, so set "
+            f"Listener would bind {bind} with hook URL "
+            f"{hook} - reachable off-box, so set "
             "AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
             "authentication on this hop). Check --bind / AGENT_EVENT_BUS_BRIDGE_BIND "
             "and --hook-url."
@@ -1009,22 +1023,22 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # bind under a reachable hook URL means the bus's POSTs are refused at
     # the TCP level. Legitimate behind a same-box TLS terminator, so warn
     # rather than refuse - same policy as the port mismatch below.
-    if _is_host_loopback(bind_host(config)) and not _is_loopback(bridge_hook_url(config)):
+    if _is_host_loopback(bind) and not _is_loopback(hook):
         logger.warning(
-            f"Hook URL {bridge_hook_url(config)} is reachable but the listener binds "
-            f"{bind_host(config)} (loopback) - correct only if something forwards between them"
+            f"Hook URL {hook} is reachable but the listener binds "
+            f"{bind} (loopback) - correct only if something forwards between them"
         )
     # The bus POSTs to the hook URL's port while the listener binds --port;
     # a mismatch is legitimate behind a reverse proxy, but name it - it's
     # otherwise the same silent-inertness failure the guards above close.
     # SplitResult.port raises for a malformed port - keep that a named
     # config error like every other input.
-    hook_split = urllib.parse.urlsplit(bridge_hook_url(config))
+    hook_split = urllib.parse.urlsplit(hook)
     try:
         hook_port = hook_split.port
     except ValueError:
         raise SystemExit(
-            f"Invalid hook URL {bridge_hook_url(config)!r} "
+            f"Invalid hook URL {hook!r} "
             "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): bad port"
         ) from None
     if hook_port is None:
@@ -1051,14 +1065,14 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # shape is already named by the check above.
     if hook_split.scheme == "https" and hook_port == config.port:
         logger.warning(
-            f"Hook URL {bridge_hook_url(config)} is https but this listener serves "
+            f"Hook URL {hook} is https but this listener serves "
             "plain HTTP on that same port - correct only if a TLS terminator "
             "(e.g. an off-host proxy) forwards between them"
         )
     # POST /hook is the only route this listener serves; any other
     # advertised path 404s every dispatch. Legitimate behind a rewriting
     # proxy, so warn-don't-refuse like the port mismatch above.
-    hook_path = urllib.parse.urlsplit(bridge_hook_url(config)).path
+    hook_path = hook_split.path
     if hook_path != "/hook":
         logger.warning(
             f"Hook URL path {hook_path!r} isn't /hook (the only route this "
@@ -1069,14 +1083,10 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # every dispatch is refused at TCP. Wildcard binds are exempt: 0.0.0.0
     # and :: listen on loopback too, so that combination works exactly as
     # advertised. Same warn-don't-refuse policy as above.
-    if (
-        not _is_host_loopback(bind_host(config))
-        and not _is_host_wildcard(bind_host(config))
-        and _is_loopback(bridge_hook_url(config))
-    ):
+    if not _is_host_loopback(bind) and not _is_host_wildcard(bind) and _is_loopback(hook):
         logger.warning(
-            f"Listener binds {bind_host(config)} but the hook URL "
-            f"{bridge_hook_url(config)} advertises loopback - the bus can't reach it; "
+            f"Listener binds {bind} but the hook URL "
+            f"{hook} advertises loopback - the bus can't reach it; "
             "set --hook-url to an address on the bound interface"
         )
     # Address-family mismatch: 0.0.0.0 binds IPv4 only, so an IPv6 hook
@@ -1087,19 +1097,17 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # binds ("localhost") are exempt the other way - the resolver decides
     # their family.
     try:
-        hook_family = ipaddress.ip_address(
-            urllib.parse.urlsplit(bridge_hook_url(config)).hostname
-        ).version
+        hook_family = ipaddress.ip_address(hook_split.hostname).version
     except ValueError:
         hook_family = None  # hostname - the resolver decides its family
     try:
-        bind_ip = ipaddress.ip_address(bind_host(config))
+        bind_ip = ipaddress.ip_address(bind)
     except ValueError:
         bind_ip = None  # "localhost" - the resolver decides its family
     if hook_family == 6 and bind_ip is not None and bind_ip.version == 4:
         logger.warning(
             f"Hook URL host is an IPv6 address but the listener binds "
-            f"{bind_host(config)} (IPv4 only) - the bus can't reach it; "
+            f"{bind} (IPv4 only) - the bus can't reach it; "
             "set --bind to '::' (dual-stack) or an IPv6 address"
         )
     # The mirror direction: a v4 hook literal with a PINNED v6 bind (::1, a
@@ -1112,11 +1120,11 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         hook_family == 4
         and bind_ip is not None
         and bind_ip.version == 6
-        and not _is_host_wildcard(bind_host(config))
+        and not _is_host_wildcard(bind)
     ):
         logger.warning(
             f"Hook URL host is an IPv4 address but the listener binds "
-            f"{bind_host(config)} (IPv6 only) - the bus can't reach it; "
+            f"{bind} (IPv6 only) - the bus can't reach it; "
             "bind an IPv4 or dual-stack ('::') address, or advertise an "
             "IPv6 hook URL"
         )
