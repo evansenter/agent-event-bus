@@ -78,6 +78,9 @@ logger = logging.getLogger("agent-event-bus-bridge")
 DEFAULT_BRIDGE_PORT = 8082
 DEFAULT_COOLDOWN_SECONDS = 30.0
 DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wake"
+# Fixed home for the hook-URL singleton lock, independent of --wake-dir (two
+# bridges with different wake dirs but the same hook URL must still contend).
+DEFAULT_LOCK_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "bridge-locks"
 
 # tmux send-keys is bounded like the notifier subprocesses in helpers.py -
 # a hung tmux must not wedge the bridge. Sized under the bus's
@@ -781,15 +784,26 @@ def create_bridge_app(
     # exposed-listener secret requirement) must hold on this path too
     validate_config(config)
     injector = Injector(config)
-    # The /hook Host allowlist (see hook_endpoint): loopback literals plus
-    # the hook URL's hostname - exactly the names a legitimate caller can
-    # arrive under (the bus fills Host from the URL it was told to POST to;
-    # local tools use a loopback literal). urlsplit().hostname already
-    # lowercases and strips IPv6 brackets.
+    # The Host allowlist (see _HostAllowlistMiddleware): loopback literals,
+    # the hook URL's hostname, and the effective bind address - exactly the
+    # names a legitimate caller can arrive under (the bus fills Host from the
+    # URL it was told to POST to; local tools use a loopback literal; a
+    # monitoring probe may address the bound interface by IP). urlsplit()
+    # .hostname already lowercases and strips IPv6 brackets. The bind
+    # address is safe to allow: a DNS-rebinding page's Host carries the
+    # attacker hostname by construction, never the bound literal.
     hook_host = urllib.parse.urlsplit(bridge_hook_url(config)).hostname
     allowed_hook_hosts = {"127.0.0.1", "localhost", "::1"}
     if hook_host:
         allowed_hook_hosts.add(hook_host)
+    bind = bind_host(config)
+    try:
+        # Skip the wildcards (0.0.0.0 / ::): nobody probes an unspecified
+        # address, and "localhost" is already covered above.
+        if not ipaddress.ip_address(bind).is_unspecified:
+            allowed_hook_hosts.add(bind)
+    except ValueError:
+        pass  # "localhost" - already present; the resolver decides its family
     # Version-skew line bound (a closure cell: the arm lives in process(),
     # not on the injector). The condition - a bus predating derived levels -
     # is persistent and per-deployment, so it gets the same first-sighting
@@ -1527,7 +1541,8 @@ def validate_config(config: BridgeConfig) -> None:
             if config.bind not in LOOPBACK_HOSTS:
                 raise BridgeConfigError(
                     f"Invalid bind address {config.bind!r} "
-                    "(check --bind / AGENT_EVENT_BUS_BRIDGE_BIND): expected an IP address"
+                    "(check --bind / AGENT_EVENT_BUS_BRIDGE_BIND): expected an IP "
+                    "address or localhost"
                 ) from None
     bind = bind_host(config)
     # The HMAC is the only authentication once the endpoint is reachable
@@ -1735,38 +1750,70 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     return config
 
 
-def _acquire_singleton_lock(config: BridgeConfig):
-    """flock a per-wake-dir singleton so a SECOND bridge on the same wake
-    dir refuses to start before it ever touches the bus. Rationale: the
-    startup sweep removes any active webhook at this bridge's hook URL and
-    cannot tell a stale row (unclean exit) from a LIVE PEER's - so a plain
-    double-start would unregister the running bridge's webhook, register its
-    own, then fail to bind (EADDRINUSE) and unregister that on exit, leaving
-    the original bridge listening, still reporting registered:true, and deaf
-    with nothing in its own log. Failing here turns that into the
-    "already running" message a double-start should give, upstream of the
-    destructive sweep. Two bridges must not share a wake dir anyway - they'd
-    share spool and lock files. Returns the held fd; the caller keeps it for
-    the process's lifetime (the lock releases when it closes, on exit).
-
-    CLI-only: embedders own their process model. The name carries a "." so
-    it can never collide with a <session_id>.lock spool file (the id charset
-    forbids "."). O_NOFOLLOW matches the spool/lock opens (a planted symlink
-    in the wake dir is not followed)."""
-    lock_path = config.wake_dir / "bridge.singleton.lock"
+def _flock_or_exit(lock_path: Path, conflict_message: str) -> int:
+    """Take an exclusive, non-blocking advisory flock on lock_path, or
+    SystemExit(conflict_message) if another holder has it. Returns the held
+    fd - the caller keeps it for the process's lifetime (the lock releases
+    when the fd closes). O_NOFOLLOW so a symlink planted at the path is not
+    followed; the parent dir is created 0o700 first (both lock homes hold no
+    payload, but private is the right default)."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.chmod(0o700)
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
-        raise SystemExit(
-            f"Another agent-event-bus-bridge is already running on wake dir "
-            f"{config.wake_dir} ({lock_path} is locked). Refusing to start: a "
-            "second instance would steal the running bridge's webhook "
-            "registration and leave it deaf. Stop the other instance, or run "
-            "this one with a different --wake-dir / AGENT_EVENT_BUS_WAKE_DIR."
-        ) from None
+        raise SystemExit(conflict_message) from None
     return fd
+
+
+def _acquire_singleton_locks(config: BridgeConfig) -> list[int]:
+    """Refuse a SECOND bridge that would collide on either resource a
+    running instance owns, before it ever touches the bus. Two INDEPENDENT
+    hazards, so two locks:
+
+    - HOOK URL: the startup sweep removes any active webhook at this hook
+      URL and cannot tell a stale row (unclean exit) from a LIVE PEER's, so
+      a second instance registering the same URL unregisters the first's
+      row, then fails to bind (EADDRINUSE) and unregisters its own on exit -
+      leaving the running bridge listening, reporting registered:true, and
+      deaf. This is keyed on the hook URL (not the wake dir) because that is
+      what the sweep contends on: two instances with different --wake-dir
+      and the same port still collide. The lock lives in a FIXED dir
+      independent of --wake-dir, keyed by a hash of the URL and the uid (so
+      a different user's same-URL lock - which they couldn't open under
+      0o600 anyway - never blocks this one).
+    - WAKE DIR: two bridges sharing a wake dir would interleave spool and
+      lock files regardless of their hook URLs.
+
+    Returns the held fds (both kept for the process's lifetime). CLI-only:
+    embedders own their process model. Each lock name carries a "." so it
+    can never collide with a <session_id>.lock spool file (the id charset
+    forbids ".")."""
+    hook = bridge_hook_url(config)
+    digest = hashlib.sha256(hook.encode()).hexdigest()[:16]
+    hook_lock = DEFAULT_LOCK_DIR / f"hook.{os.getuid()}.{digest}.lock"
+    wake_lock = config.wake_dir / "bridge.singleton.lock"
+    return [
+        _flock_or_exit(
+            hook_lock,
+            f"Another agent-event-bus-bridge is already registered for hook URL "
+            f"{hook} ({hook_lock} is locked). Refusing to start: a second instance "
+            "would unregister the running bridge's webhook and leave it deaf. Stop "
+            "the other instance, or give this one a distinct hook URL - a different "
+            "--port AND --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL (a different "
+            "--wake-dir alone does NOT change the hook URL, so it would not help).",
+        ),
+        _flock_or_exit(
+            wake_lock,
+            f"Another agent-event-bus-bridge is already running on wake dir "
+            f"{config.wake_dir} ({wake_lock} is locked). Refusing to start: two "
+            "bridges would interleave the same spool and lock files. Stop the other "
+            "instance, or run this one with a different --wake-dir / "
+            "AGENT_EVENT_BUS_WAKE_DIR.",
+        ),
+    ]
 
 
 def main():
@@ -1797,10 +1844,10 @@ def main():
     # After create_bridge_app (the Injector created + chmodded the wake dir)
     # and BEFORE uvicorn.run triggers the lifespan's registration sweep: a
     # second instance must refuse here, upstream of the bus mutation. Held
-    # for the whole run; released when the fd closes in the finally (process
+    # for the whole run; released when the fds close in the finally (process
     # exit in production - the finally also lets a re-entered main() in the
     # same process, e.g. tests, re-acquire).
-    singleton_fd = _acquire_singleton_lock(config)
+    singleton_fds = _acquire_singleton_locks(config)
     try:
         uvicorn.run(app, host=bind_host(config), port=config.port)
     finally:
@@ -1810,7 +1857,8 @@ def main():
         stop.set()
         if state.get("webhook_id") is not None:
             unregister_from_bus(config, state["webhook_id"])
-        os.close(singleton_fd)  # release the singleton lock
+        for fd in singleton_fds:
+            os.close(fd)  # release the singleton locks
 
 
 if __name__ == "__main__":

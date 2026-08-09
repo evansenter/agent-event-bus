@@ -475,12 +475,16 @@ That lands with the supervision story.)
   after changing `--port` or `--hook-url`, drop the row at the old URL
   yourself (`agent-event-bus-cli webhook list` / `webhook unregister`) or
   the bus keeps dispatching to the dead address forever. Because that sweep
-  can't tell a stale row from a *live peer's*, the CLI takes an flock'd
-  singleton (`bridge.singleton.lock` in the wake dir) at startup: a second
-  instance on the same wake dir refuses to start with a named error rather
-  than stealing the running bridge's registration and leaving it deaf. Two
-  bridges therefore need distinct `--wake-dir`s (they'd share spool files
-  otherwise). Embedders manage their own single-instance story.
+  can't tell a stale row from a *live peer's*, the CLI takes two flock'd
+  singletons at startup (both released on exit): one keyed on the **hook
+  URL** (in a fixed lock dir, so a second instance registering the same URL
+  refuses *regardless of wake dir* - the URL is what the sweep contends on),
+  and one on the **wake dir** (`bridge.singleton.lock` there - two bridges
+  would otherwise interleave the same spool files). To run two bridges at
+  once they need BOTH a distinct hook URL (a different `--port` *and*
+  `--hook-url`) and a distinct `--wake-dir`; changing only `--wake-dir`
+  leaves the hook URL colliding, and changing only the port leaves the wake
+  dir colliding. Embedders manage their own single-instance story.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
 - The hook body is capped at 1 MiB (the HMAC can only be checked after

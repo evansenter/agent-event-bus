@@ -92,6 +92,16 @@ def restore_bridge_logger_level():
     bridge.logger.setLevel(level)
 
 
+@pytest.fixture(autouse=True)
+def isolate_lock_dir(monkeypatch, tmp_path):
+    """The hook-URL singleton lock lives in a FIXED dir (DEFAULT_LOCK_DIR)
+    independent of --wake-dir, so tests driving _acquire_singleton_locks or
+    main() would otherwise write into the developer's real
+    ~/.claude/.../bridge-locks and collide on the shared default-hook-URL
+    lock. Point it at a per-test tmp dir."""
+    monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", tmp_path / "bridge-locks")
+
+
 @pytest.fixture
 def config(tmp_path):
     return BridgeConfig(wake_dir=tmp_path / "wake", cooldown_seconds=30.0)
@@ -688,6 +698,22 @@ class TestHookFiltering:
         # A legitimate loopback Host reaches the router's real 405/404
         assert client.get("/hook", headers={"Host": "127.0.0.1"}).status_code == 405
         assert client.get("/nope", headers={"Host": "127.0.0.1"}).status_code == 404
+
+    def test_bind_address_is_an_allowed_host(self, tmp_path):
+        """A monitoring probe addressing the bound interface by IP is
+        ordinary in the pinned non-loopback topology the guide recommends,
+        so the effective bind address is allowlisted - else the probe 421s.
+        A foreign Host is still rejected (the rebound-page Host carries the
+        attacker hostname, never the bound literal)."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            bind="100.100.1.2",
+            hook_url="http://host.tailnet.example:8082/hook",
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config))
+        assert client.get("/health", headers={"Host": "100.100.1.2"}).status_code == 200
+        assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
 
     def test_oversized_body_rejected(self, client):
         """The body must be read before the HMAC can be checked, so bound
@@ -2596,15 +2622,72 @@ class TestBindHost:
         """The startup sweep can't tell a stale row from a live peer's, so a
         second bridge on the same wake dir must refuse BEFORE it touches the
         bus - otherwise a double-start unregisters the running bridge's
-        webhook and leaves it deaf. The flock'd singleton gives the
-        'already running' error; the holder keeps it until its fd closes."""
+        webhook and leaves it deaf. The flock'd singletons give the
+        'already running' error; the holder keeps them until the fds close."""
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         config.wake_dir.mkdir(parents=True)
-        fd = bridge._acquire_singleton_lock(config)
+        fds = bridge._acquire_singleton_locks(config)
         try:
-            with pytest.raises(SystemExit, match="already running"):
-                bridge._acquire_singleton_lock(config)
+            with pytest.raises(SystemExit, match="already"):
+                bridge._acquire_singleton_locks(config)
         finally:
-            os.close(fd)
+            for fd in fds:
+                os.close(fd)
         # Released - a fresh instance acquires cleanly
-        os.close(bridge._acquire_singleton_lock(config))
+        for fd in bridge._acquire_singleton_locks(config):
+            os.close(fd)
+
+    def test_singleton_hook_url_lock_blocks_across_wake_dirs(self, tmp_path):
+        """The destructive sweep contends on the HOOK URL, not the wake dir:
+        a second instance with a DIFFERENT --wake-dir but the same port must
+        still refuse (else it unregisters the running bridge's row and fails
+        EADDRINUSE, deafening it). The hook-URL lock closes that."""
+        a = BridgeConfig(wake_dir=tmp_path / "a")  # both default hook URL
+        b = BridgeConfig(wake_dir=tmp_path / "b")
+        a.wake_dir.mkdir(parents=True)
+        b.wake_dir.mkdir(parents=True)
+        fds = bridge._acquire_singleton_locks(a)
+        try:
+            # Different wake dir, same hook URL -> the hook-URL lock refuses
+            with pytest.raises(SystemExit, match="hook URL"):
+                bridge._acquire_singleton_locks(b)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        # A genuinely distinct hook URL coexists
+        c = BridgeConfig(wake_dir=tmp_path / "c", hook_url="http://127.0.0.1:9099/hook", secret="s")
+        c.wake_dir.mkdir(parents=True)
+        fds_a = bridge._acquire_singleton_locks(a)
+        fds_c = bridge._acquire_singleton_locks(c)
+        for fd in (*fds_a, *fds_c):
+            os.close(fd)
+
+    def test_main_refuses_and_never_sweeps_when_singleton_held(self, monkeypatch, tmp_path):
+        """Pins the acquisition AND its ordering: with the lock already held,
+        main() must SystemExit before uvicorn.run runs the lifespan (the
+        destructive sweep). So neither uvicorn.run nor register_with_bus may
+        be called. Deleting the _acquire call, or moving it after
+        uvicorn.run, fails this."""
+        import sys
+
+        import uvicorn
+
+        wake = tmp_path / "wake"
+        config = BridgeConfig(wake_dir=wake)
+        # Injector creates the wake dir; do it up front so the held lock and
+        # main()'s lock target the same file
+        Injector(config)
+        held = bridge._acquire_singleton_locks(config)
+        ran = []
+        try:
+            monkeypatch.setattr(sys, "argv", ["agent-event-bus-bridge", "--wake-dir", str(wake)])
+            with patch.object(uvicorn, "run", lambda *a, **k: ran.append("uvicorn")):
+                with patch.object(
+                    bridge, "register_with_bus", lambda cfg: ran.append("register") or 1
+                ):
+                    with pytest.raises(SystemExit, match="already"):
+                        bridge.main()
+        finally:
+            for fd in held:
+                os.close(fd)
+        assert ran == []  # neither the bind nor the sweep ran
