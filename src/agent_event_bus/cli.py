@@ -82,26 +82,48 @@ HEADERS = {
 }
 
 
+class BusError(Exception):
+    """A call to the event bus failed."""
+
+
+class BusUnreachableError(BusError):
+    """Nothing answered at the bus URL - wrong address, or the bus is down.
+
+    Distinguished from every other failure because it is the one that means
+    "try again later" rather than "this request was wrong": the bridge
+    retries on it at boot, while a 401 or a malformed body is a real fault.
+    """
+
+
 def call_tool(
     tool_name: str,
     arguments: dict,
     url: str = DEFAULT_URL,
     timeout_ms: int | None = None,
-    debug: bool = False,
 ) -> dict:
     """Call an MCP tool and return the result.
+
+    Raises BusUnreachableError when nothing answers at `url`, and lets every other
+    failure (HTTP status, timeout, undecodable body) propagate with its own
+    type and message.
+
+    This is a library function, not a command: it never prints and never
+    exits. Rendering a failure and picking an exit code belong to main().
+    That split matters beyond tidiness - bridge.py imports this function, and
+    it needs to tell a retryable "bus not up yet" from a genuine fault by
+    exception type rather than by inspecting a process exit code.
 
     Args:
         tool_name: Name of the MCP tool to call
         arguments: Tool arguments
         url: Event bus URL
         timeout_ms: Timeout in milliseconds (default: 10000)
-        debug: If True, show full stack traces on errors
     """
     timeout_sec = (timeout_ms / 1000) if timeout_ms else 10
+    target = url or DEFAULT_URL
     try:
         resp = requests.post(
-            url or DEFAULT_URL,
+            target,
             headers=HEADERS,
             json={
                 "jsonrpc": "2.0",
@@ -112,30 +134,23 @@ def call_tool(
             timeout=timeout_sec,
         )
         resp.raise_for_status()
+    except requests.exceptions.ConnectionError as e:
+        raise BusUnreachableError(f"Cannot connect to agent event bus at {target}") from e
 
-        # Parse SSE response
-        for line in resp.text.split("\n"):
-            if line.startswith("data: "):
-                data = json.loads(line[6:])
-                result = data.get("result", {})
-                # Try structured content first, fall back to text
-                structured = result.get("structuredContent", {}).get("result")
-                if structured is not None:
-                    return structured
-                content = result.get("content", [])
-                if content and content[0].get("text"):
-                    return json.loads(content[0]["text"])
-                return result
-        return {}
-    except requests.exceptions.ConnectionError:
-        print("Error: Cannot connect to agent event bus. Is it running?", file=sys.stderr)
-        print("Start with: agent-event-bus", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        if debug:
-            raise
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Parse SSE response
+    for line in resp.text.split("\n"):
+        if line.startswith("data: "):
+            data = json.loads(line[6:])
+            result = data.get("result", {})
+            # Try structured content first, fall back to text
+            structured = result.get("structuredContent", {}).get("result")
+            if structured is not None:
+                return structured
+            content = result.get("content", [])
+            if content and content[0].get("text"):
+                return json.loads(content[0]["text"])
+            return result
+    return {}
 
 
 def cmd_register(args):
@@ -150,7 +165,7 @@ def cmd_register(args):
         arguments["client_id"] = args.client_id
     arguments["cwd"] = os.getcwd()
 
-    result = call_tool("register_session", arguments, url=args.url, debug=args.debug)
+    result = call_tool("register_session", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
     # Print session info for easy capture in scripts
@@ -174,7 +189,7 @@ def cmd_unregister(args):
         print("Error: Must provide --session-id or --client-id", file=sys.stderr)
         sys.exit(1)
 
-    result = call_tool("unregister_session", arguments, url=args.url, debug=args.debug)
+    result = call_tool("unregister_session", arguments, url=args.url)
 
     if "error" in result:
         print(f"Error: {result['error']}", file=sys.stderr)
@@ -185,7 +200,7 @@ def cmd_unregister(args):
 
 def cmd_sessions(args):
     """List active sessions."""
-    result = call_tool("list_sessions", {}, url=args.url, debug=args.debug)
+    result = call_tool("list_sessions", {}, url=args.url)
     if not result:
         print("No active sessions")
         return
@@ -216,7 +231,7 @@ def cmd_sessions(args):
 
 def cmd_channels(args):
     """List active channels."""
-    result = call_tool("list_channels", {}, url=args.url, debug=args.debug)
+    result = call_tool("list_channels", {}, url=args.url)
     if not result:
         print("No active channels")
         return
@@ -253,7 +268,7 @@ def cmd_publish(args):
     if args.signal_level:
         arguments["signal_level"] = args.signal_level
 
-    result = call_tool("publish_event", arguments, url=args.url, debug=args.debug)
+    result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
 
@@ -288,9 +303,7 @@ def cmd_events(args):
     if args.min_level:
         arguments["min_level"] = args.min_level
 
-    result = call_tool(
-        "get_events", arguments, url=args.url, timeout_ms=args.timeout, debug=args.debug
-    )
+    result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
 
     # Check for server-side errors (e.g., session not found)
     if "error" in result:
@@ -351,7 +364,7 @@ def cmd_notify(args):
     if args.sound:
         arguments["sound"] = True
 
-    result = call_tool("notify", arguments, url=args.url, debug=args.debug)
+    result = call_tool("notify", arguments, url=args.url)
     if result.get("success"):
         print("Notification sent")
     else:
@@ -373,7 +386,7 @@ def cmd_webhook_register(args):
     if args.secret:
         arguments["secret"] = args.secret
 
-    result = call_tool("register_webhook", arguments, url=args.url, debug=args.debug)
+    result = call_tool("register_webhook", arguments, url=args.url)
     print(json.dumps(result, indent=2))
     if "webhook_id" in result:
         print(f"\nWebhook registered: #{result['webhook_id']}", file=sys.stderr)
@@ -382,7 +395,7 @@ def cmd_webhook_register(args):
 def cmd_webhook_list(args):
     """List registered webhooks."""
     arguments = {"active_only": not args.all}
-    result = call_tool("list_webhooks", arguments, url=args.url, debug=args.debug)
+    result = call_tool("list_webhooks", arguments, url=args.url)
 
     if not result:
         print("No webhooks registered")
@@ -404,12 +417,7 @@ def cmd_webhook_list(args):
 
 def cmd_webhook_unregister(args):
     """Unregister a webhook."""
-    result = call_tool(
-        "unregister_webhook",
-        {"webhook_id": args.webhook_id},
-        url=args.url,
-        debug=args.debug,
-    )
+    result = call_tool("unregister_webhook", {"webhook_id": args.webhook_id}, url=args.url)
     if result.get("success"):
         print(f"Webhook #{args.webhook_id} removed")
     else:
@@ -588,7 +596,21 @@ def main():
             p_webhook.print_help()
             sys.exit(1)
 
-    args.func(args)
+    # The one place that turns a failure into output and an exit code.
+    # call_tool and the cmd_* handlers stay quiet about transport failures so
+    # that policy lives here; a handler's own sys.exit for a logical error
+    # (SystemExit is not an Exception) passes through untouched.
+    try:
+        args.func(args)
+    except BusUnreachableError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        print("Start with: agent-event-bus", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        if args.debug:
+            raise
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
