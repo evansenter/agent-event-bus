@@ -325,7 +325,14 @@ session. Broadcast events stay pull-only. Address DMs by **`session_id`**
 (the UUID) - `display_id` is display-only bus-wide, so a
 `session:<display-id>` event still spools (a `session:` channel is
 actionable unless the publisher overrides `signal_level`) but into a file
-no drain hook ever reads.
+no drain hook ever reads. One more addressability caveat: a session
+registered with a `client_id` adopts it as its `session_id` verbatim, and
+the bridge can only wake ids matching `[A-Za-z0-9_-]{1,64}` (the id
+becomes a spool filename). A `client_id` carrying a `.`, `/`, space, or
+over 64 chars (a cwd- or `repo:branch`-derived key) registers fine but is
+unwakeable - its DMs resolve to no target and log only a rate-limited
+"unsafe session id" warning. Keep `client_id` within that charset until
+bus-side validation lands.
 
 ```
 uv run agent-event-bus-bridge                    # spool backend (default)
@@ -431,7 +438,15 @@ That lands with the supervision story.)
   the same directory + `os.replace`), write UTF-8 (the bridge reads it as
   UTF-8, not its locale codec - a supervisor-launched daemon often runs
   under the C locale, where a bytewise-different codec would misread any
-  non-ASCII), and serialize the read-modify-write
+  non-ASCII), write each value as a non-empty printable pane id (`"%0"`)
+  and OMIT the entry entirely when `$TMUX_PANE` is unset rather than
+  writing `null` or `""` - `panes[sid] = os.environ.get("TMUX_PANE")`
+  emits `null` outside tmux, which the bridge treats as a *present-but-bad*
+  value (it warns and names the entry to fix), a different diagnosis and
+  repair than the quiet *absent* path an omitted entry takes; a value with
+  a control character (e.g. an embedded NUL) is rejected the same way
+  before it can reach the `send-keys` argv - and serialize the
+  read-modify-write
   under an flock on a sibling `panes.lock` - concurrent SessionStart hooks
   otherwise silently lose entries (the loser reads as absent, the
   documented *normal* outcome, so nothing errors on either side), and a
@@ -486,7 +501,11 @@ That lands with the supervision story.)
   webhook by hand (or restoring the bus DB from a backup) leaves
   `registered: true` on a bridge the bus no longer dispatches to - restart
   the bridge after manual webhook surgery. Periodic re-assertion is a
-  follow-up.
+  follow-up. `/health` carries the same `Host` allowlist as `/hook` (421
+  otherwise) - a supervisor probing `http://127.0.0.1:<port>/health` sends
+  a loopback `Host` and passes, but a rebound browser tab cannot even
+  confirm a bridge runs here. Probe it by a loopback literal or the hook
+  URL's hostname, same as `/hook`.
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux

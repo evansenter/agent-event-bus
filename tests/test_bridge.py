@@ -481,6 +481,49 @@ class TestHookFiltering:
         assert start["status"] == 200  # fell through the precheck, delivered
         assert (config.wake_dir / "target-1.jsonl").exists()
 
+    def test_unserializable_payload_is_a_named_400_not_500(self, config):
+        """json.dumps in _spool has the same recursion sibling the
+        json.loads arm catches, one screen up - and it runs a few frames
+        deeper, so a payload nested just under the parse limit is admitted
+        and then fails to encode. Deterministic (all three bus retries
+        raise identically), so process() maps it to the same named 400
+        every other wire-input path gives, not three tracebacks. Driven by
+        forcing the encoder failure rather than tuning a fragile
+        cross-version depth band."""
+        client = TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE, headers=JSON_CT)
+        with patch.object(bridge.Injector, "deliver", side_effect=RecursionError):
+            resp = client.post("/hook", content=json.dumps(make_event()).encode())
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "invalid JSON"}
+
+    def test_spool_serialization_failure_creates_no_file_or_lock(self, config):
+        """_spool serializes BEFORE it opens the file or takes the flock,
+        so a RecursionError out of json.dumps leaves nothing behind - the
+        spool line and lock file must not exist, and no lock is held."""
+        injector = Injector(config)
+        with patch.object(bridge.json, "dumps", side_effect=RecursionError):
+            with pytest.raises(RecursionError):
+                injector.deliver("target-1", make_event())
+        assert not (config.wake_dir / "target-1.jsonl").exists()
+        assert not (config.wake_dir / "target-1.lock").exists()
+
+    def test_symlinked_lock_file_does_not_write_through(self, config, tmp_path):
+        """--wake-dir may have been group/world-writable before the daemon
+        first ran; the startup chmod narrows the dir but does not remove a
+        pre-planted <sid>.lock symlink already inside it. O_NOFOLLOW makes
+        the open fail (ELOOP -> OSError, the retryable arm) instead of
+        following the link and taking an flock on a foreign inode - which
+        would silently protect the wrong file. The link target must stay
+        untouched (never created)."""
+        injector = Injector(config)  # creates + chmods the wake dir
+        outside = tmp_path / "outside-target"
+        (config.wake_dir / "target-1.lock").symlink_to(outside)
+        # The open of the symlinked lock raises ELOOP; deliver does not
+        # swallow it (only the /hook path maps spool failures to a status)
+        with pytest.raises(OSError):
+            injector.deliver("target-1", make_event())
+        assert not outside.exists()  # never followed through the link
+
     def test_browser_shaped_post_is_rejected(self, config):
         """The loopback-needs-no-secret posture holds only if a browser
         cannot reach the handler: fetch(mode:"no-cors") from any web page
@@ -548,6 +591,16 @@ class TestHookFiltering:
         resp = client.post("/hook", content=body, headers=signed)
         assert resp.status_code == 200
         assert resp.json()["status"] == "delivered"
+
+    def test_health_carries_the_same_host_guard(self, config):
+        """The DNS-rebinding guard covers /health too: a rebound tab must
+        not even be able to CONFIRM a bridge runs here (the signal that the
+        /hook probe is worth the round trip). A supervisor's loopback probe
+        still passes."""
+        client = TestClient(create_bridge_app(config))  # no default Host override
+        assert client.get("/health", headers={"Host": "evil.example:8082"}).status_code == 421
+        assert client.get("/health", headers={"Host": "127.0.0.1:8082"}).status_code == 200
+        assert client.get("/health", headers={"Host": "[::1]"}).status_code == 200
 
     def test_non_object_json_rejected(self, client):
         """Valid JSON that isn't an object must be a 400, not an
@@ -1619,7 +1672,7 @@ class TestDaemonLifecycle:
                 bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
             ):
                 app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-                with TestClient(app) as client:
+                with TestClient(app, base_url=LOOPBACK_BASE) as client:
                     assert registered.wait(timeout=5), "startup never fired registration"
                     # /health surfaces the registration outcome - the one signal
                     # that separates "working" from "listening but never registered"
@@ -1723,7 +1776,7 @@ class TestDaemonLifecycle:
                 bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
             ):
                 app = create_bridge_app(config, registration_state=state, registration_stop=stop)
-                with TestClient(app) as client:
+                with TestClient(app, base_url=LOOPBACK_BASE) as client:
                     # Registration is in flight, deterministically not yet
                     # committed (blocked on `release`)
                     assert client.get("/health").json()["registered"] is False
@@ -1816,7 +1869,7 @@ class TestDaemonLifecycle:
             create_bridge_app(config, registration_stop=threading.Event())
 
     def test_app_without_registration_has_inert_lifespan(self, config):
-        with TestClient(create_bridge_app(config)) as client:
+        with TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE) as client:
             payload = client.get("/health").json()
         assert payload["status"] == "ok"
         # No registration state -> no claim either way
@@ -2138,6 +2191,23 @@ class TestBindHost:
     def test_loopback_hook_binds_localhost(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         assert bridge.bind_host(config) == "127.0.0.1"
+
+    def test_loopback_literal_hook_binds_that_literal(self, tmp_path):
+        """The derived bind must be the loopback address the hook URL
+        NAMES, not a hardcoded 127.0.0.1: loopback is all of 127.0.0.0/8
+        plus ::1, so a hook on 127.0.1.1 (Debian's own-hostname address),
+        a 127.0.0.2 alias, or [::1] would otherwise bind an interface the
+        bus can never reach - ECONNREFUSED on every dispatch, with both
+        sides still reading as loopback so every exposure/quadrant/family
+        guard stays silent and /health reports registered:true."""
+        for host, expected in (
+            ("127.0.1.1", "127.0.1.1"),
+            ("127.0.0.2", "127.0.0.2"),
+            ("[::1]", "::1"),
+            ("localhost", "127.0.0.1"),  # no single literal - keep the v4 default
+        ):
+            config = BridgeConfig(wake_dir=tmp_path / "wake", hook_url=f"http://{host}:8082/hook")
+            assert bridge.bind_host(config) == expected, host
 
     def test_reachable_hook_binds_wide(self, tmp_path):
         config = BridgeConfig(

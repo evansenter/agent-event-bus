@@ -185,12 +185,19 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
 # the filesystem - the bus warns on malformed channels but does not reject
 # them. The length bound keeps a too-long name from turning into an
 # unretryable OSError out of the spool open (and caps spool-file blast
-# radius). The charset happens to cover display ids ("brave-trex") as well
-# as the UUIDs sessions are actually addressed by - but the bus resolves
-# DMs by session_id only (display_id is display-only bus-wide), so a
-# session:<display-id> DM (actionable by default - an explicit lower
-# signal_level is filtered before spooling) lands in a file no drain hook
-# will ever read.
+# radius). The charset covers display ids ("brave-trex") and the UUIDs the
+# bus GENERATES - but not necessarily the id a session is addressed by: a
+# session registered with a client_id becomes that string verbatim
+# (server.py register_session sets session_id = client_id or uuid4(), and
+# nothing validates it), so a cwd- or repo:branch-derived client_id with a
+# ".", "/", space, or >64 chars gets a session_id this pattern REJECTS. A
+# DM to such a session then resolves to no target and spools nowhere, with
+# only the rate-limited "unsafe session id" WARNING below - which reads as
+# a hostile publisher, not a legitimate own registration. Loosening the
+# pattern is not the fix (the id still becomes a filename); validating
+# client_id bus-side at registration is, and belongs in its own change.
+# Same dead end round 26 documented for display_id, reached from the
+# client_id side.
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # The unsafe-id rejection below is publisher-drivable (the bus warns on
@@ -389,6 +396,14 @@ class Injector:
 
         Serialized by the per-session flock below - against other threads in
         this process and against the drain hook alike.
+
+        A serialization failure (RecursionError out of json.dumps on a
+        pathologically nested payload - the same recursion sibling the
+        json.loads arms catch, one screen up in process()) is raised BEFORE
+        any file is created or lock taken, and process() maps it to the
+        named 400 every other wire-input path returns. Every OTHER raise
+        here is retry-meaningful: nothing is durably stored, so the bus
+        retry is real (unlike a post-spool error).
         """
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
         # Defense in depth behind resolve_target_session's charset check: a
@@ -396,6 +411,12 @@ class Injector:
         # produce a write outside the wake dir
         if spool_file.resolve().parent != self.config.wake_dir.resolve():
             raise ValueError(f"Spool path escapes wake dir: {session_id!r}")
+        # Serialize BEFORE the lock/open: json.dumps can raise RecursionError
+        # on a payload nested just under the parse limit (loads and dumps
+        # spend their recursion budgets independently, and this call sits a
+        # few frames deeper than the loads that admitted the body), and a
+        # failure must create no file and take no lock. process() catches it.
+        line = json.dumps(event) + "\n"
         # flock a sibling lock file around the append: flock contends per
         # open file description, so it serializes writers in this process and
         # the drain hook (another process) alike - without it, the drainer's
@@ -421,6 +442,18 @@ class Injector:
             # shared path, and the documented manual workflows invite a
             # later chmod on it. Create-time only; the append path pays
             # nothing once the file exists.
+            # O_NOFOLLOW covers BOTH the spool and lock opens: --wake-dir may
+            # have been group/world-writable before the daemon first ran,
+            # and Injector.__init__'s chmod narrows the dir but does not
+            # remove a pre-planted <sid>.lock / <sid>.jsonl SYMLINK already
+            # inside it - a plain open would follow it and create/open the
+            # target as the operator. The spool path's resolve() check
+            # catches its own link but is TOCTOU-racy by construction;
+            # O_NOFOLLOW is kernel-enforced at open time and guards the lock
+            # sibling (which has no resolve() check) too. Neither file is
+            # ever legitimately a symlink, so the happy path pays nothing;
+            # a symlinked final component fails ELOOP - an OSError, already
+            # the retryable arm.
             # encoding="utf-8" explicitly: fdopen(..., "a") otherwise picks
             # the locale codec (ASCII under a C-locale daemon), and the
             # spool line is a UTF-8-JSON cross-process contract the drain
@@ -429,7 +462,7 @@ class Injector:
             # ensure_ascii=False from raising UnicodeEncodeError mid-append
             # under the held flock, 500ing an already-committed delivery.
             return os.fdopen(
-                os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+                os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600),
                 "a",
                 encoding="utf-8",
             )
@@ -450,7 +483,7 @@ class Injector:
                         time.sleep(SPOOL_LOCK_RETRY_SECONDS)
                 try:
                     with _open_append_0600(spool_file) as f:
-                        f.write(json.dumps(event) + "\n")
+                        f.write(line)
                 finally:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
@@ -808,22 +841,36 @@ def create_bridge_app(
             )
             return {"status": "ignored", "reason": "no target session"}, 200
 
-        action = injector.deliver(target, event)
+        try:
+            action = injector.deliver(target, event)
+        except RecursionError:
+            # json.dumps in _spool has the same non-ValueError recursion
+            # sibling the json.loads arm above catches - and it runs a few
+            # frames deeper, so a payload nested just under the parse limit
+            # is admitted here and then fails to encode. Deterministic
+            # (all three bus retries would raise identically), so answer
+            # with the named 400 every wire-input path gives, not three
+            # tracebacks. _spool serializes before it locks, so nothing is
+            # stored and no lock is held when this fires.
+            return {"error": "invalid JSON"}, 400
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
-    async def hook_endpoint(request: Request) -> JSONResponse:
-        # Host allowlist - the half of the browser guard the Content-Type
-        # check below cannot carry: DNS rebinding makes the attacker page
-        # SAME-origin (served from evil.example:<our port>, then the A
-        # record flips to 127.0.0.1), and a same-origin POST is outside
-        # CORS entirely - no preflight, arbitrary headers, the JSON media
-        # type sent verbatim. What rebinding cannot forge is the Host
-        # header: the browser fills it from the page's URL, so a rebound
-        # request necessarily carries the attacker's hostname - never a
-        # loopback literal, never the hook URL host the bus was told to
-        # POST to. Hand-rolled rather than TrustedHostMiddleware: its
-        # host.split(":")[0] mangles bracketed IPv6 ("[::1]:8082" -> "["),
-        # and --bind ::1 is a supported shape. 421 Misdirected Request.
+    def _host_rejection(request: Request) -> JSONResponse | None:
+        # DNS-rebinding guard, shared by /hook and /health: a page served
+        # from evil.example:<our port> whose A record then flips to
+        # 127.0.0.1 is SAME-origin with the bridge, so CORS never applies -
+        # no preflight, arbitrary headers, the request reaches the handler.
+        # What rebinding cannot forge is the Host header: the browser fills
+        # it from the page's URL, so a rebound request necessarily carries
+        # the attacker's hostname, never a loopback literal or the hook URL
+        # host the bus was told to POST to. Both routes need it - /hook so
+        # the write is refused, /health so a rebound tab cannot even
+        # CONFIRM a bridge is running here (the signal that the probe is
+        # worth the round trip). A supervisor probing 127.0.0.1/health
+        # sends a loopback Host and still passes. Hand-rolled rather than
+        # TrustedHostMiddleware: its host.split(":")[0] mangles bracketed
+        # IPv6 ("[::1]:8082" -> "["), and --bind ::1 is a supported shape.
+        # 421 Misdirected Request.
         raw_host = request.headers.get("host", "")
         if raw_host.startswith("["):  # bracketed IPv6, with or without port
             host = raw_host.split("]", 1)[0].lstrip("[").lower()
@@ -831,7 +878,14 @@ def create_bridge_app(
             host = raw_host.rsplit(":", 1)[0].lower()
         if host not in allowed_hook_hosts:
             return JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
-        # The other half, for CROSS-origin pages: fetch(mode:"no-cors")
+        return None
+
+    async def hook_endpoint(request: Request) -> JSONResponse:
+        rejected = _host_rejection(request)
+        if rejected is not None:
+            return rejected
+        # The other half of the browser guard, for CROSS-origin pages:
+        # fetch(mode:"no-cors")
         # from any web page the operator has open can POST to 127.0.0.1 as
         # long as its Content-Type stays CORS-safelisted (a string body
         # defaults to text/plain) - no preflight is sent, the opaque
@@ -878,6 +932,13 @@ def create_bridge_app(
         return JSONResponse(payload, status_code=status)
 
     async def health(request: Request) -> JSONResponse:
+        # Same DNS-rebinding Host guard as /hook: a rebound tab must not
+        # even confirm a bridge runs here. A supervisor's loopback probe
+        # passes; the readiness-probe story is intact for the callers that
+        # matter.
+        rejected = _host_rejection(request)
+        if rejected is not None:
+            return rejected
         payload = {"status": "ok", "service": "agent-event-bus-bridge"}
         if registration_state is not None:
             # Registration is deliberately non-fatal, so this is the one
@@ -941,12 +1002,30 @@ def _is_loopback(url: str) -> bool:
 def bind_host(config: BridgeConfig) -> str:
     """Which interface the listener binds: --bind wins, else loopback for a
     loopback hook URL (the local bus is the sole caller), else all
-    interfaces. config_from_args requires the HMAC secret whenever the
-    effective bind OR the hook URL is non-loopback."""
+    interfaces. validate_config requires the HMAC secret whenever the
+    effective bind OR the hook URL is non-loopback - on every path, not
+    just the CLI (the refusal moved there in round 41 so it travels with a
+    hand-built config onto the embedding paths)."""
     if config.bind:
         return config.bind
-    if _is_loopback(bridge_hook_url(config)):
+    hook_host = urllib.parse.urlsplit(bridge_hook_url(config)).hostname
+    if hook_host is None:
+        # A hostless hook URL reads as loopback; validate_config refuses it
+        # upstream, so this is only reachable via a direct bind_host call
         return "127.0.0.1"
+    if _is_host_loopback(hook_host):
+        # Bind the SPECIFIC loopback address the hook URL names, not a
+        # hardcoded 127.0.0.1: loopback is all of 127.0.0.0/8 plus ::1, so
+        # a hook on 127.0.1.1 (Debian's own-hostname address), a 127.0.0.2
+        # alias, or [::1] all read as loopback here - and the old hardcode
+        # bound an interface the bus could never reach (ECONNREFUSED on
+        # every dispatch) while both sides still counted as loopback, so
+        # every exposure and topology guard stayed silent. urlsplit lowered
+        # the host and stripped IPv6 brackets, so ip_address parses it.
+        try:
+            return str(ipaddress.ip_address(hook_host))  # 127.0.1.1, ::1, ...
+        except ValueError:
+            return "127.0.0.1"  # "localhost" - no single literal to bind
     return "0.0.0.0"  # noqa: S104 - deliberate; secret enforced at config time
 
 
