@@ -683,6 +683,30 @@ class TestTmuxBackend:
             injector.deliver("target-1", make_event())
         assert len(warnings()) == 4
 
+    def test_bad_pane_value_warns_and_degrades_to_spool(self, tmp_path, caplog):
+        """A present-but-wrong-typed pane value (0 instead of "%0", "",
+        null) is a misconfiguration whose repair is nothing like "the
+        mapping is absent" - it must warn (once, via the reason-keyed
+        bound) instead of folding into the unmapped debug line, and still
+        degrade to spool."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            for bad in (0, "", None):
+                panes.write_text(json.dumps({"target-1": bad}))
+                with patch.object(bridge.subprocess, "run") as mock_run:
+                    assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+                mock_run.assert_not_called()
+        assert len(warnings()) == 1  # same reason across values - repeats debug
+        assert "not a pane id" in warnings()[0].message
+
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
         injector = Injector(config)

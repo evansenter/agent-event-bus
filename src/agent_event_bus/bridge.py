@@ -391,9 +391,25 @@ class Injector:
                 "not-an-object", "panes.json is not an object; treating as unmapped"
             )
             return None
-        self._last_panes_warn_reason = None  # healthy read re-arms the warning
         pane = panes.get(session_id)
-        return pane if isinstance(pane, str) and pane else None
+        if pane is None:
+            self._last_panes_warn_reason = None  # healthy read re-arms the warning
+            return None
+        if not (isinstance(pane, str) and pane):
+            # Present but wrong-typed (0 instead of "%0", "", null): a
+            # misconfiguration whose repair is nothing like "the mapping is
+            # absent", so it must not fold into the unmapped debug line.
+            # Same bound as the file failures - and the re-arm deliberately
+            # does NOT run before this check, or every delivery would
+            # re-arm-then-warn.
+            self._warn_panes_once(
+                "bad-pane-value",
+                f"panes.json entry for {session_id[:8]}... is not a pane id "
+                f"({pane!r}); treating as unmapped",
+            )
+            return None
+        self._last_panes_warn_reason = None  # healthy read re-arms the warning
+        return pane
 
     def _warn_panes_once(self, reason: str, message: str) -> None:
         """A persistently broken panes.json must not emit one WARNING per
