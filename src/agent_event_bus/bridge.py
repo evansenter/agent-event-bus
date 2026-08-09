@@ -923,16 +923,21 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             "correct only if something forwards between them"
         )
     # The listener only ever speaks plain HTTP (uvicorn.run gets no TLS
-    # config), so an https hook URL needs a terminator in front - and a
+    # config), so an https hook URL needs a terminator in front. A SAME-BOX
     # terminator fronts one port while forwarding to another, so https with
-    # the ports AGREEING is precisely the no-terminator shape: every
-    # dispatch dies in the TLS handshake with every other guard quiet. The
-    # mismatched-port terminator shape is already named by the check above.
+    # the ports agreeing usually means no terminator exists - every dispatch
+    # dies in the TLS handshake with every other guard quiet. An OFF-HOST
+    # terminator (an LB at the same port number, forwarding here) is the
+    # legitimate shape the warning text names; it can't be told apart
+    # locally - the bind is a wildcard in the common case, and hook
+    # hostnames don't compare against bind addresses - so warn-don't-refuse
+    # like the port and path mismatches. The mismatched-port terminator
+    # shape is already named by the check above.
     if hook_split.scheme == "https" and hook_port == config.port:
         logger.warning(
             f"Hook URL {bridge_hook_url(config)} is https but this listener serves "
             "plain HTTP on that same port - correct only if a TLS terminator "
-            "forwards between them"
+            "(e.g. an off-host proxy) forwards between them"
         )
     # POST /hook is the only route this listener serves; any other
     # advertised path 404s every dispatch. Legitimate behind a rewriting

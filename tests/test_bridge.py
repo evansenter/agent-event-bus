@@ -63,6 +63,17 @@ def clean_bridge_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def restore_bridge_logger_level():
+    """main() pins a level on the module logger (the DEV_MODE switch), so
+    any test driving main() end to end would otherwise leak that level into
+    later tests' caplog expectations - records silently dropped with no
+    hint why. Snapshot and restore around every test."""
+    level = bridge.logger.level
+    yield
+    bridge.logger.setLevel(level)
+
+
 @pytest.fixture
 def config(tmp_path):
     return BridgeConfig(wake_dir=tmp_path / "wake", cooldown_seconds=30.0)
@@ -1457,19 +1468,16 @@ class TestBindHost:
         def run_quiet(app, host=None, port=None):
             return None
 
-        try:
-            monkeypatch.delenv("DEV_MODE", raising=False)
-            with patch.object(uvicorn, "run", run_quiet):
-                bridge.main()
-            assert not bridge.logger.isEnabledFor(logging.DEBUG)
-            monkeypatch.setenv("DEV_MODE", "1")
-            with patch.object(uvicorn, "run", run_quiet):
-                bridge.main()
-            assert bridge.logger.isEnabledFor(logging.DEBUG)
-        finally:
-            # main() sets a level on the module logger; don't leak it into
-            # tests that rely on the default NOTSET-inherits-root behavior
-            bridge.logger.setLevel(logging.NOTSET)
+        # The autouse restore_bridge_logger_level fixture undoes the level
+        # main() pins here, for this and every other main()-driving test
+        monkeypatch.delenv("DEV_MODE", raising=False)
+        with patch.object(uvicorn, "run", run_quiet):
+            bridge.main()
+        assert not bridge.logger.isEnabledFor(logging.DEBUG)
+        monkeypatch.setenv("DEV_MODE", "1")
+        with patch.object(uvicorn, "run", run_quiet):
+            bridge.main()
+        assert bridge.logger.isEnabledFor(logging.DEBUG)
 
     def test_main_passes_bind_through_and_unregisters(self, monkeypatch, tmp_path):
         """End-to-end main(): the default local config binds loopback, the
