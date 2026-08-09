@@ -1301,10 +1301,10 @@ class TestTmuxBackend:
             os.close(writer)
 
     def test_oversized_panes_json_degrades_to_spool(self, tmp_path, monkeypatch):
-        """The read is bounded (MAX_PANES_BYTES), so a runaway file can't pull
-        unbounded bytes into memory per DM; the truncated read is invalid
-        JSON and degrades to spool."""
-        monkeypatch.setattr(bridge, "MAX_PANES_BYTES", 64)
+        """The read is bounded (MAX_PANES_CHARS), so a runaway file can't
+        pull unbounded data into memory per DM; the truncated read is
+        invalid JSON and degrades to spool."""
+        monkeypatch.setattr(bridge, "MAX_PANES_CHARS", 64)
         injector, config = make_tmux_injector(tmp_path)
         big = {"target-1": "%0", "_pad": "x" * 500}  # valid, but past the cap
         (config.wake_dir / "panes.json").write_text(json.dumps(big), encoding="utf-8")
@@ -1390,6 +1390,41 @@ class TestTmuxBackend:
             panes.mkdir()  # IsADirectoryError on read
             injector.deliver("target-1", make_event())
         assert len(warnings()) == 4
+
+    def test_unexpected_panes_error_degrades_and_warns_once(self, tmp_path, caplog):
+        """The never-500 catch-all: an exception OUTSIDE (ValueError,
+        RecursionError, TypeError, OSError) - here a KeyError from a
+        monkeypatched json.loads - must still degrade to spool (never 500 an
+        already-spooled delivery), warn once, demote repeats, and re-arm on a
+        healthy read. Pins the arm itself AND the 'unexpected' key's
+        membership in the re-arm sets (a healthy read clears it)."""
+        import logging
+
+        injector, config = make_tmux_injector(tmp_path)  # panes.json maps target-1
+        real_loads = bridge.json.loads
+        boom = {"raise": True}
+
+        def flaky_loads(s, *a, **k):
+            if boom["raise"]:
+                raise KeyError("outside the enumerated arms")
+            return real_loads(s, *a, **k)
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.json, "loads", flaky_loads):
+                # Never 500: the KeyError degrades to spool, not an escape
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+                assert len(warnings()) == 1  # the repeat demoted to debug
+                # A healthy read clears 'unexpected' (it's in _PANES_READ_KEYS)
+                boom["raise"] = False
+                with patch.object(bridge.subprocess, "run", tmux_ok):
+                    assert injector.deliver("target-1", make_event()) == "tmux"
+                boom["raise"] = True
+                injector.deliver("target-1", make_event())  # warns only if re-armed
+            assert len(warnings()) == 2
 
     def test_bad_pane_value_warns_and_degrades_to_spool(self, tmp_path, caplog):
         """A present-but-wrong-typed pane value (0 instead of "%0", "",

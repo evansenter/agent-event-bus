@@ -119,10 +119,13 @@ MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
 # panes.json is a small {session_id: pane_id} map maintained by an external
 # component, read on the delivery path for every tmux-backend DM. Bound the
-# read so a runaway or malicious file can't pull unbounded bytes into memory
+# read so a runaway or malicious file can't pull unbounded data into memory
 # per DM (a real mapping is orders of magnitude smaller); a truncated read
-# is almost certainly invalid JSON and lands on the unparseable arm.
-MAX_PANES_BYTES = 262_144  # 256 KiB
+# is almost certainly invalid JSON and lands on the unparseable arm. This is
+# a CHARACTER cap - the read is text-mode UTF-8, so the bytes pulled off disk
+# are up to ~4x this for multibyte content (~1 MiB here), still bounded and
+# still far above any real mapping.
+MAX_PANES_CHARS = 262_144  # 256 Ki characters
 
 # Bound the wait for the per-session spool flock. The drain contract keeps
 # the drainer's hold down to a couple of renames, so seconds of contention
@@ -622,11 +625,11 @@ class Injector:
             #    daemon no LC_ALL/LANG, glibc resolves C -> ASCII, and a
             #    healthy file with any byte >0x7f would wrongly hit the
             #    unparseable arm. The writer contract (guide) says UTF-8.
-            #  - read(MAX_PANES_BYTES): bound the per-DM buffer against a
+            #  - read(MAX_PANES_CHARS): bound the per-DM buffer against a
             #    runaway file; a truncated read is invalid JSON -> unparseable.
             fd = os.open(panes_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, encoding="utf-8") as f:
-                panes = json.loads(f.read(MAX_PANES_BYTES))
+                panes = json.loads(f.read(MAX_PANES_CHARS))
         except FileNotFoundError:
             # A missing file IS this session's absent read: clear the
             # file-level keys AND this session's entry key, matching the
