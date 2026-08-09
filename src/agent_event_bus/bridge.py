@@ -58,6 +58,7 @@ from pathlib import Path
 import anyio.to_thread
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -173,6 +174,13 @@ def _now() -> float:
     caller in the process (portal threads included), not just the code
     under test."""
     return time.monotonic()
+
+
+def _reject_json_constant(literal: str):
+    """json.loads parse_constant hook: reject NaN/Infinity/-Infinity so
+    nothing non-standard reaches a spool line. Raises ValueError, which the
+    hook's named-400 arm catches."""
+    raise ValueError(f"non-standard JSON constant {literal!r}")
 
 
 def verify_signature(body: bytes, signature_header: str | None, secret: str) -> bool:
@@ -782,7 +790,6 @@ def create_bridge_app(
     allowed_hook_hosts = {"127.0.0.1", "localhost", "::1"}
     if hook_host:
         allowed_hook_hosts.add(hook_host)
-    registration_thread: threading.Thread | None = None
     # Version-skew line bound (a closure cell: the arm lives in process(),
     # not on the injector). The condition - a bus predating derived levels -
     # is persistent and per-deployment, so it gets the same first-sighting
@@ -792,19 +799,29 @@ def create_bridge_app(
 
     @asynccontextmanager
     async def lifespan(app):
-        nonlocal registration_thread
+        # registration_thread and cycle_stop are LOCALS, deliberately not
+        # nonlocal/shared: @asynccontextmanager makes a fresh generator per
+        # startup/shutdown cycle, so each cycle gets its own stop event and
+        # thread handle. The old design cleared ONE shared event on
+        # re-entry, which could resurrect a prior cycle's thread that
+        # outlived REGISTRATION_JOIN_TIMEOUT - it would see the shared event
+        # un-set and resume its retry loop, and both threads would then
+        # register and race state["webhook_id"], leaking the loser row until
+        # a later startup sweep reclaimed it. A per-cycle event can never be
+        # un-set by a later startup.
+        registration_thread: threading.Thread | None = None
+        cycle_stop: threading.Event | None = None
         if registration_state is not None and registration_stop is not None:
-            # A re-entered lifespan must register again: the previous
-            # cycle's shutdown set() this event, and register_with_retry
-            # checks it before its first attempt - without the clear, a
-            # second cycle on the same app binds, serves /health, and never
-            # registers (the silent shape the pair check above closes for
-            # half-wired calls). main() constructs the event unset, so this
-            # is a no-op on the first cycle.
-            registration_stop.clear()
+            # The per-cycle cycle_stop is what the thread actually waits on;
+            # the caller's registration_stop is only the observable "stopped"
+            # flag (mirrored in the finally). Old code cleared the shared
+            # event on startup, so a pre-set one was already ignored - a
+            # fresh cycle here matches that while never sharing an event a
+            # stale thread could be woken through.
+            cycle_stop = threading.Event()
             registration_thread = threading.Thread(
                 target=register_with_retry,
-                args=(config, registration_state, registration_stop),
+                args=(config, registration_state, cycle_stop),
                 daemon=True,
             )
             registration_thread.start()
@@ -815,8 +832,14 @@ def create_bridge_app(
         try:
             yield
         finally:
-            if registration_thread is not None:
-                registration_stop.set()
+            if registration_thread is not None and cycle_stop is not None:
+                cycle_stop.set()
+                # Mirror onto the caller's event: the thread waits on the
+                # per-cycle cycle_stop, but registration_stop stays the
+                # observable "stopped" flag main()'s belt-and-braces finally
+                # and external code read.
+                if registration_stop is not None:
+                    registration_stop.set()
                 # Off the event loop: a join that waits on an in-flight
                 # call_tool POST would otherwise freeze signal handling for
                 # up to the timeout (#112 invariant, shutdown edition).
@@ -847,7 +870,16 @@ def create_bridge_app(
             return {"error": "bad signature"}, 401
 
         try:
-            event = json.loads(body)
+            # parse_constant rejects the non-standard NaN/Infinity/-Infinity
+            # literals json.loads accepts by DEFAULT: json.dumps would write
+            # them straight back into a spool line no other parser accepts
+            # (jq, JSON.parse, Go's encoding/json all reject them), so a
+            # contract-following drainer skips the line under its
+            # skip-unparseable rule and the wake is silently lost while the
+            # bus counted it delivered. The rejector's ValueError folds into
+            # the named-400 arm, making "everything appended is standard
+            # JSON" true by construction, not by the bus's good behavior.
+            event = json.loads(body, parse_constant=_reject_json_constant)
         # ValueError, not just JSONDecodeError: json.loads(bytes) DECODES
         # before parsing, and invalid UTF-8 raises UnicodeDecodeError (a
         # ValueError but not a JSONDecodeError). RecursionError is the
@@ -915,37 +947,10 @@ def create_bridge_app(
             return {"error": "invalid JSON"}, 400
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
-    def _host_rejection(request: Request) -> JSONResponse | None:
-        # DNS-rebinding guard, shared by /hook and /health: a page served
-        # from evil.example:<our port> whose A record then flips to
-        # 127.0.0.1 is SAME-origin with the bridge, so CORS never applies -
-        # no preflight, arbitrary headers, the request reaches the handler.
-        # What rebinding cannot forge is the Host header: the browser fills
-        # it from the page's URL, so a rebound request necessarily carries
-        # the attacker's hostname, never a loopback literal or the hook URL
-        # host the bus was told to POST to. Both routes need it - /hook so
-        # the write is refused, /health so a rebound tab cannot even
-        # CONFIRM a bridge is running here (the signal that the probe is
-        # worth the round trip). A supervisor probing 127.0.0.1/health
-        # sends a loopback Host and still passes. Hand-rolled rather than
-        # TrustedHostMiddleware: its host.split(":")[0] mangles bracketed
-        # IPv6 ("[::1]:8082" -> "["), and --bind ::1 is a supported shape.
-        # 421 Misdirected Request.
-        raw_host = request.headers.get("host", "")
-        if raw_host.startswith("["):  # bracketed IPv6, with or without port
-            host = raw_host.split("]", 1)[0].lstrip("[").lower()
-        else:
-            host = raw_host.rsplit(":", 1)[0].lower()
-        if host not in allowed_hook_hosts:
-            return JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
-        return None
-
     async def hook_endpoint(request: Request) -> JSONResponse:
-        rejected = _host_rejection(request)
-        if rejected is not None:
-            return rejected
-        # The other half of the browser guard, for CROSS-origin pages:
-        # fetch(mode:"no-cors")
+        # The Host allowlist (DNS-rebinding guard) runs in middleware ahead
+        # of routing - see _HostAllowlistMiddleware. This is the OTHER half
+        # of the browser guard, for CROSS-origin pages: fetch(mode:"no-cors")
         # from any web page the operator has open can POST to 127.0.0.1 as
         # long as its Content-Type stays CORS-safelisted (a string body
         # defaults to text/plain) - no preflight is sent, the opaque
@@ -1000,13 +1005,10 @@ def create_bridge_app(
         return JSONResponse(payload, status_code=status)
 
     async def health(request: Request) -> JSONResponse:
-        # Same DNS-rebinding Host guard as /hook: a rebound tab must not
-        # even confirm a bridge runs here. A supervisor's loopback probe
-        # passes; the readiness-probe story is intact for the callers that
-        # matter.
-        rejected = _host_rejection(request)
-        if rejected is not None:
-            return rejected
+        # The Host guard runs in middleware ahead of routing (see
+        # _HostAllowlistMiddleware), so a rebound tab cannot confirm a
+        # bridge runs here even via a 405/404. A supervisor's loopback
+        # probe passes.
         payload = {"status": "ok", "service": "agent-event-bus-bridge"}
         if registration_state is not None:
             # Registration is deliberately non-fatal, so this is the one
@@ -1020,6 +1022,9 @@ def create_bridge_app(
             Route("/hook", hook_endpoint, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
         ],
+        # Ahead of the router: the Host guard must answer before a method or
+        # path mismatch (405/404) can confirm a bridge is here.
+        middleware=[Middleware(_HostAllowlistMiddleware, allowed=allowed_hook_hosts)],
         lifespan=lifespan,
     )
     # POST /hook/ must be a loud 404 (bus retries and logs it), not a 307:
@@ -1029,6 +1034,47 @@ def create_bridge_app(
     # bridge processes nothing.
     app.router.redirect_slashes = False
     return app
+
+
+def _host_from_header(raw_host: str) -> str:
+    """Strip the port from a Host header value, handling bracketed IPv6
+    ("[::1]:8082" -> "::1"). Lowercased for comparison."""
+    if raw_host.startswith("["):  # bracketed IPv6, with or without a port
+        return raw_host.split("]", 1)[0].lstrip("[").lower()
+    return raw_host.rsplit(":", 1)[0].lower()
+
+
+class _HostAllowlistMiddleware:
+    """DNS-rebinding guard applied AHEAD of routing, so it covers method and
+    path mismatches too. A page served from evil.example:<our port> whose A
+    record then flips to 127.0.0.1 is SAME-origin with the bridge, so CORS
+    never applies and the request reaches us - but the browser fills Host
+    from the page's URL, so a rebound request never carries a loopback
+    literal or the hook URL host the bus was told to POST to. Enforcing this
+    inside the endpoints (the round-57 shape) left GET /hook -> 405 and
+    /anything -> 404 answerable BEFORE the endpoint ran, and 405-vs-404 still
+    confirms a bridge is here - the exact existence signal extending the
+    guard to /health was meant to deny. As middleware it runs before the
+    router. Hand-rolled rather than TrustedHostMiddleware, whose
+    host.split(':')[0] mangles bracketed IPv6 (--bind ::1 is supported).
+    421 Misdirected Request."""
+
+    def __init__(self, app, allowed: set[str]):
+        self.app = app
+        self.allowed = allowed
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            raw_host = ""
+            for key, value in scope.get("headers") or ():
+                if key == b"host":
+                    raw_host = value.decode("latin-1")
+                    break
+            if _host_from_header(raw_host) not in self.allowed:
+                response = JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def bridge_hook_url(config: BridgeConfig) -> str:
@@ -1365,6 +1411,13 @@ def validate_config(config: BridgeConfig) -> None:
         (config.bus_url, "--bus-url / AGENT_EVENT_BUS_URL"),
         (config.hook_url, "--hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL"),
         (config.bind, "--bind / AGENT_EVENT_BUS_BRIDGE_BIND"),
+        # secret is truthy when bytes, so it satisfies the exposed-listener
+        # requirement and then fails at RUNTIME instead: register_with_bus'
+        # json= serialization raises TypeError (retried forever, /health
+        # registered:false), and verify_signature's secret.encode() would
+        # AttributeError into a 500. HMAC keys are conventionally bytes, so
+        # b"..." is a plausible embedder slip.
+        (config.secret, "AGENT_EVENT_BUS_BRIDGE_SECRET / secret="),
     ):
         if value is not None and not isinstance(value, str):
             raise BridgeConfigError(f"Invalid value {value!r} (check {label}): expected a string")
@@ -1682,6 +1735,40 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     return config
 
 
+def _acquire_singleton_lock(config: BridgeConfig):
+    """flock a per-wake-dir singleton so a SECOND bridge on the same wake
+    dir refuses to start before it ever touches the bus. Rationale: the
+    startup sweep removes any active webhook at this bridge's hook URL and
+    cannot tell a stale row (unclean exit) from a LIVE PEER's - so a plain
+    double-start would unregister the running bridge's webhook, register its
+    own, then fail to bind (EADDRINUSE) and unregister that on exit, leaving
+    the original bridge listening, still reporting registered:true, and deaf
+    with nothing in its own log. Failing here turns that into the
+    "already running" message a double-start should give, upstream of the
+    destructive sweep. Two bridges must not share a wake dir anyway - they'd
+    share spool and lock files. Returns the held fd; the caller keeps it for
+    the process's lifetime (the lock releases when it closes, on exit).
+
+    CLI-only: embedders own their process model. The name carries a "." so
+    it can never collide with a <session_id>.lock spool file (the id charset
+    forbids "."). O_NOFOLLOW matches the spool/lock opens (a planted symlink
+    in the wake dir is not followed)."""
+    lock_path = config.wake_dir / "bridge.singleton.lock"
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise SystemExit(
+            f"Another agent-event-bus-bridge is already running on wake dir "
+            f"{config.wake_dir} ({lock_path} is locked). Refusing to start: a "
+            "second instance would steal the running bridge's webhook "
+            "registration and leave it deaf. Stop the other instance, or run "
+            "this one with a different --wake-dir / AGENT_EVENT_BUS_WAKE_DIR."
+        ) from None
+    return fd
+
+
 def main():
     """Run the bridge daemon."""
     import uvicorn
@@ -1707,6 +1794,13 @@ def main():
         app = create_bridge_app(config, registration_state=state, registration_stop=stop)
     except BridgeConfigError as e:
         raise SystemExit(str(e)) from None
+    # After create_bridge_app (the Injector created + chmodded the wake dir)
+    # and BEFORE uvicorn.run triggers the lifespan's registration sweep: a
+    # second instance must refuse here, upstream of the bus mutation. Held
+    # for the whole run; released when the fd closes in the finally (process
+    # exit in production - the finally also lets a re-entered main() in the
+    # same process, e.g. tests, re-acquire).
+    singleton_fd = _acquire_singleton_lock(config)
     try:
         uvicorn.run(app, host=bind_host(config), port=config.port)
     finally:
@@ -1716,6 +1810,7 @@ def main():
         stop.set()
         if state.get("webhook_id") is not None:
             unregister_from_bus(config, state["webhook_id"])
+        os.close(singleton_fd)  # release the singleton lock
 
 
 if __name__ == "__main__":

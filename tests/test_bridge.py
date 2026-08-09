@@ -666,6 +666,29 @@ class TestHookFiltering:
         for body in (b"123", b'["x"]', b'"bare"', b"null"):
             assert client.post("/hook", content=body).status_code == 400
 
+    def test_nan_infinity_literals_rejected(self, client):
+        """json.loads accepts NaN/Infinity/-Infinity by default and
+        json.dumps writes them straight back, producing a spool line no
+        other parser (jq, JSON.parse, Go) accepts - a silently-lost wake. A
+        parse_constant rejector folds them into the named 400."""
+        for body in (b'{"payload": NaN}', b'{"payload": Infinity}', b'{"x": -Infinity}'):
+            assert client.post("/hook", content=body).status_code == 400, body
+
+    def test_host_guard_precedes_routing(self, config):
+        """The Host allowlist runs in middleware, ahead of the router, so a
+        method or path mismatch cannot confirm a bridge is here: a foreign
+        Host gets 421 even on GET /hook (else 405) and an unknown path
+        (else 404). A loopback Host still sees the router's real codes."""
+        client = TestClient(create_bridge_app(config))  # Host: testserver
+        assert client.get("/hook", headers={"Host": "evil.example"}).status_code == 421
+        assert client.get("/nope", headers={"Host": "evil.example"}).status_code == 421
+        assert (
+            client.request("HEAD", "/health", headers={"Host": "evil.example"}).status_code == 421
+        )
+        # A legitimate loopback Host reaches the router's real 405/404
+        assert client.get("/hook", headers={"Host": "127.0.0.1"}).status_code == 405
+        assert client.get("/nope", headers={"Host": "127.0.0.1"}).status_code == 404
+
     def test_oversized_body_rejected(self, client):
         """The body must be read before the HMAC can be checked, so bound
         what an unauthenticated peer can make the bridge buffer."""
@@ -1880,11 +1903,10 @@ class TestDaemonLifecycle:
         assert unregistered == [77]
 
     def test_lifespan_is_reentrant(self, tmp_path):
-        """A second lifespan cycle on the same app must register again: the
-        first shutdown set() the stop event, and without clearing it on
-        startup the second cycle binds, serves /health, and never registers
-        - the silent shape the pair check exists to prevent, reached
-        through the embedding surface the docstring advertises."""
+        """A second lifespan cycle on the same app must register again.
+        Each cycle gets its own fresh stop event (see
+        test_each_cycle_gets_its_own_stop_event), so re-entry naturally
+        starts a new registration rather than resuming a stopped one."""
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         registrations = []
         unregistered: list = []
@@ -1906,6 +1928,35 @@ class TestDaemonLifecycle:
                     pass
         assert len(registrations) == 2
         assert unregistered == [41, 42]
+
+    def test_each_cycle_gets_its_own_stop_event(self, tmp_path):
+        """Regression for the resurrect-a-stale-thread bug: each cycle must
+        hand register_with_retry a FRESH stop event, never the shared caller
+        event. The old design cleared ONE shared event on re-entry, which
+        could un-set the event a prior cycle's thread (parked past the join
+        timeout) still waited on - resurrecting it into a second
+        registration that races state['webhook_id']."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        stops_seen: list = []
+
+        def fake_retry(cfg, state, stop):
+            stops_seen.append(stop)
+            state["webhook_id"] = 41 + len(stops_seen)
+
+        caller_stop = threading.Event()
+        state: dict = {}
+        with patch.object(bridge, "register_with_retry", fake_retry):
+            with patch.object(bridge, "unregister_from_bus", lambda cfg, wid: None):
+                app = create_bridge_app(
+                    config, registration_state=state, registration_stop=caller_stop
+                )
+                with TestClient(app):
+                    pass
+                with TestClient(app):
+                    pass
+        assert len(stops_seen) == 2
+        assert stops_seen[0] is not stops_seen[1]  # a fresh event per cycle
+        assert caller_stop not in stops_seen  # never the shared caller event
 
     def test_create_bridge_app_validates_hand_built_configs(self, tmp_path):
         """Embedders skip argparse, so the invariants - including the
@@ -1956,6 +2007,10 @@ class TestDaemonLifecycle:
             ({"bus_url": 123}, "AGENT_EVENT_BUS_URL"),
             ({"hook_url": tmp_path}, "AGENT_EVENT_BUS_BRIDGE_HOOK_URL"),
             ({"bind": 123, "secret": "s"}, "AGENT_EVENT_BUS_BRIDGE_BIND"),
+            # a bytes secret is truthy (satisfies the exposure requirement)
+            # and then fails at RUNTIME - register_with_bus' json= raises
+            # TypeError, verify_signature's .encode() AttributeErrors
+            ({"secret": b"s3cret"}, "AGENT_EVENT_BUS_BRIDGE_SECRET"),
         ):
             bad_str = BridgeConfig(wake_dir=tmp_path / "wake", **kwargs)
             with pytest.raises(bridge.BridgeConfigError, match=env):
@@ -2536,3 +2591,20 @@ class TestBindHost:
         assert seen["host"] == "127.0.0.1"
         assert seen["port"] == bridge.DEFAULT_BRIDGE_PORT
         assert unregistered == [99]
+
+    def test_singleton_lock_blocks_a_second_instance(self, tmp_path):
+        """The startup sweep can't tell a stale row from a live peer's, so a
+        second bridge on the same wake dir must refuse BEFORE it touches the
+        bus - otherwise a double-start unregisters the running bridge's
+        webhook and leaves it deaf. The flock'd singleton gives the
+        'already running' error; the holder keeps it until its fd closes."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        config.wake_dir.mkdir(parents=True)
+        fd = bridge._acquire_singleton_lock(config)
+        try:
+            with pytest.raises(SystemExit, match="already running"):
+                bridge._acquire_singleton_lock(config)
+        finally:
+            os.close(fd)
+        # Released - a fresh instance acquires cleanly
+        os.close(bridge._acquire_singleton_lock(config))

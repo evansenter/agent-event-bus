@@ -357,9 +357,11 @@ That lands with the supervision story.)
   `signal_level` is always `actionable` on a spooled line by construction
   (the bridge filters before spooling), so a hook need not re-check it -
   and pass-through means bus-side payload additions appear additively:
-  read the keys you know, ignore the rest. Each line is UTF-8 JSON
-  (`json.dumps`, one object per line); read it as UTF-8, not the drain
-  hook's locale codec. Drain contract:
+  read the keys you know, ignore the rest. Each line is UTF-8, STANDARD
+  JSON (`json.dumps`, one object per line) - the hook rejects the
+  non-standard `NaN`/`Infinity` literals at the door, so every spooled line
+  parses in `jq`, `JSON.parse`, and Go's `encoding/json`. Read it as UTF-8,
+  not the drain hook's locale codec. Drain contract:
   1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
@@ -472,7 +474,13 @@ That lands with the supervision story.)
   duplicate deliveries. The sweep matches the URL being registered NOW -
   after changing `--port` or `--hook-url`, drop the row at the old URL
   yourself (`agent-event-bus-cli webhook list` / `webhook unregister`) or
-  the bus keeps dispatching to the dead address forever.
+  the bus keeps dispatching to the dead address forever. Because that sweep
+  can't tell a stale row from a *live peer's*, the CLI takes an flock'd
+  singleton (`bridge.singleton.lock` in the wake dir) at startup: a second
+  instance on the same wake dir refuses to start with a named error rather
+  than stealing the running bridge's registration and leaving it deaf. Two
+  bridges therefore need distinct `--wake-dir`s (they'd share spool files
+  otherwise). Embedders manage their own single-instance story.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
 - The hook body is capped at 1 MiB (the HMAC can only be checked after
