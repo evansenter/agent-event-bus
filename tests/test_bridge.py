@@ -592,8 +592,9 @@ class TestTmuxBackend:
 
         # Distinct from "spool" AND from "spool-tmux-failed": unmapped is
         # the normal outcome for a foreign-machine session (webhooks have no
-        # machine scoping), so it must not read as a broken tmux setup - and
-        # it logs only at debug, so the action field is the in-band signal
+        # machine scoping), so it must not read as a broken tmux setup. The
+        # distinct return value is what a direct /hook caller sees; the
+        # debug line under DEV_MODE is what an operator sees.
         assert action == "spool-unmapped"
         mock_run.assert_not_called()
 
@@ -672,7 +673,15 @@ class TestTmuxBackend:
             injector.deliver("target-1", make_event())
             panes.write_bytes(b"{again")  # same reason - warns only if re-armed
             injector.deliver("target-1", make_event())
-        assert len(warnings()) == 3
+            assert len(warnings()) == 3
+            # Escalation across classes: a parse failure turning into a
+            # persistent I/O failure is a DIFFERENT reason and must warn,
+            # not be demoted as a repeat - there may never be a healthy
+            # read to re-arm once the file is a directory
+            panes.unlink()
+            panes.mkdir()  # IsADirectoryError on read
+            injector.deliver("target-1", make_event())
+        assert len(warnings()) == 4
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
@@ -691,8 +700,8 @@ class TestBusRegistration:
         )
         calls = []
 
-        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
-            calls.append({"tool": tool_name, "arguments": arguments, "url": url})
+        def fake_call_tool(tool_name, arguments, url=None, debug=False, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments, "url": url, "debug": debug})
             if tool_name == "list_webhooks":
                 return []
             return {"webhook_id": 42}
@@ -701,6 +710,12 @@ class TestBusRegistration:
             webhook_id = bridge.register_with_bus(config)
 
         assert webhook_id == 42
+        # debug=True is the whole mechanism behind the named-cause logs:
+        # without it call_tool swallows a 401/timeout/bad body into a bare
+        # SystemExit(1) with the reason on stderr. Every registration call
+        # must carry it, or the daemon silently reverts to logging
+        # "SystemExit(1)" for every failure alike.
+        assert all(c["debug"] is True for c in calls)
         register = next(c for c in calls if c["tool"] == "register_webhook")
         assert register["arguments"]["url"] == "http://127.0.0.1:9999/hook"
         assert register["arguments"]["secret"] == "s3cret"
@@ -793,15 +808,20 @@ class TestBusRegistration:
         config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
         calls = []
 
-        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
-            calls.append({"tool": tool_name, "arguments": arguments, "url": url})
+        def fake_call_tool(tool_name, arguments, url=None, debug=False, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments, "url": url, "debug": debug})
             return {"success": True}
 
         with patch.object(bridge, "call_tool", fake_call_tool):
             bridge.unregister_from_bus(config, 42)
 
         assert calls == [
-            {"tool": "unregister_webhook", "arguments": {"webhook_id": 42}, "url": "http://bus/mcp"}
+            {
+                "tool": "unregister_webhook",
+                "arguments": {"webhook_id": 42},
+                "url": "http://bus/mcp",
+                "debug": True,
+            }
         ]
 
     def test_startup_removes_stale_webhooks_at_same_url(self, tmp_path):
@@ -844,9 +864,13 @@ class TestBusRegistration:
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert config.secret == "s3cret"
 
-    def test_registration_retries_until_bus_is_up(self, tmp_path):
+    def test_registration_retries_until_bus_is_up(self, tmp_path, caplog):
         """call_tool exits the process on connection errors, and at boot the
-        bus is often not up yet - the daemon must retry, not die."""
+        bus is often not up yet - the daemon must retry, not die. The bare
+        SystemExit(1) must render as the connection error it provably is
+        (debug=True re-raises everything else), not as "SystemExit(1)"."""
+        import logging
+
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         attempts = []
 
@@ -857,11 +881,13 @@ class TestBusRegistration:
             return 42
 
         state: dict = {}
-        with patch.object(bridge, "register_with_bus", flaky_register):
-            bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "register_with_bus", flaky_register):
+                bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
 
         assert state["webhook_id"] == 42
         assert len(attempts) == 3
+        assert any("bus unreachable (connection error)" in r.message for r in caplog.records)
 
     def test_registration_without_id_is_retryable(self, tmp_path):
         """A bus that answers but returns no webhook_id must be a retryable
@@ -907,9 +933,13 @@ class TestBusRegistration:
             with pytest.raises(SystemExit, match="list_webhooks"):
                 bridge.register_with_bus(config)
 
-    def test_registration_retries_on_unexpected_errors(self, tmp_path):
+    def test_registration_retries_on_unexpected_errors(self, tmp_path, caplog):
         """Any surprise inside register_with_bus must degrade to
-        backoff-and-retry, not a dead thread and a deaf daemon."""
+        backoff-and-retry, not a dead thread and a deaf daemon - and the
+        log must carry the real cause (the repr arm), not misrender it as
+        a connection error."""
+        import logging
+
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         attempts = []
 
@@ -920,11 +950,16 @@ class TestBusRegistration:
             return 42
 
         state: dict = {}
-        with patch.object(bridge, "register_with_bus", flaky_register):
-            bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "register_with_bus", flaky_register):
+                bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
 
         assert state["webhook_id"] == 42
         assert len(attempts) == 2
+        assert any(
+            "ValueError" in r.message and "unexpected shape" in r.message for r in caplog.records
+        )
+        assert not any("bus unreachable" in r.message for r in caplog.records)
 
     def test_registration_retry_honors_shutdown(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake")
@@ -945,6 +980,49 @@ class TestBusRegistration:
 
         with patch.object(bridge, "call_tool", fake_call_tool):
             bridge.unregister_from_bus(config, 42)  # must not raise
+
+    def test_unregister_logs_real_cause_for_non_connection_failures(self, tmp_path, caplog):
+        """The except-Exception arm: with debug=True a 401/timeout/bad body
+        re-raises out of call_tool - shutdown must stay best-effort AND the
+        one log line an operator has when a row leaks must carry the real
+        cause, not the connection-error misdiagnosis."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+
+        def raising_call_tool(*args, **kwargs):
+            raise RuntimeError("401 Unauthorized")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "call_tool", raising_call_tool):
+                bridge.unregister_from_bus(config, 42)  # must not raise
+        assert any("401" in r.message and "#42" in r.message for r in caplog.records)
+        assert not any("bus unreachable" in r.message for r in caplog.records)
+
+    def test_call_tool_debug_contract(self):
+        """A bare SystemExit(1) meaning 'connection error' is a cross-module
+        contract with cli.call_tool: its ConnectionError arm exits WITHOUT
+        consulting debug, while the trailing except honours debug=True and
+        re-raises. Pin both halves against the real call_tool - the same
+        idiom as sign() and the signal-level and session-filter contract
+        tests - since either half moving would turn the named-cause log
+        lines into confident misdiagnoses with every mocked test green."""
+        import requests
+
+        from agent_event_bus import cli
+
+        with patch.object(
+            cli.requests, "post", side_effect=requests.exceptions.ConnectionError("refused")
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp", debug=True)
+        assert exc.value.code == 1
+
+        with patch.object(
+            cli.requests, "post", side_effect=requests.exceptions.HTTPError("401 Client Error")
+        ):
+            with pytest.raises(requests.exceptions.HTTPError, match="401"):
+                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp", debug=True)
 
 
 class TestDaemonLifecycle:

@@ -366,7 +366,20 @@ class Injector:
         except FileNotFoundError:
             self._last_panes_warn_reason = None  # normal unmapped state re-arms
             return None
-        except (OSError, ValueError) as e:
+        except ValueError as e:
+            # Parse failures (JSONDecodeError, UnicodeDecodeError from a
+            # torn write) - typically transient, self-healing on the
+            # writer's next write. Separate reason from the OSError arm: a
+            # torn write escalating into a permanently unreadable file must
+            # WARN again, not be demoted as a repeat of the same condition.
+            self._warn_panes_once(
+                "unparseable", f"Unparseable panes.json ({e}); treating as unmapped"
+            )
+            return None
+        except OSError as e:
+            # I/O failures (PermissionError, IsADirectoryError) - typically
+            # persistent, and there may never be a healthy read to re-arm
+            # the guard, so this class carries its own reason key
             self._warn_panes_once(
                 "unreadable", f"Unreadable panes.json ({e}); treating as unmapped"
             )
