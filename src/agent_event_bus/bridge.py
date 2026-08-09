@@ -124,6 +124,14 @@ class BridgeConfig:
     bind: str | None = None
 
 
+def _now() -> float:
+    """Monotonic-clock seam: tests freeze THIS, not time.monotonic itself -
+    patching the stdlib module attribute would freeze the clock for every
+    caller in the process (portal threads included), not just the code
+    under test."""
+    return time.monotonic()
+
+
 def verify_signature(body: bytes, signature_header: str | None, secret: str) -> bool:
     """Check the bus's X-Event-Bus-Signature HMAC against the raw body."""
     if not signature_header or not signature_header.startswith("sha256="):
@@ -178,7 +186,7 @@ def resolve_target_session(event: dict) -> str | None:
         return None
     target = channel.split(":", 1)[1]
     if not SESSION_ID_PATTERN.fullmatch(target):
-        now = time.monotonic()
+        now = _now()
         if now - _unsafe_warn_state["last"] >= _UNSAFE_WARN_INTERVAL_SECONDS:
             _unsafe_warn_state["last"] = now
             logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
@@ -261,7 +269,7 @@ class Injector:
             return "spool-unmapped"
 
         with self._lock:
-            now = time.monotonic()
+            now = _now()
             # Housekeeping: entries past the cooldown can never gate a wake
             # again, and sessions are ephemeral - don't retain them forever
             self._last_wake = {
@@ -619,7 +627,10 @@ def bind_host(config: BridgeConfig) -> str:
 
 def register_with_bus(config: BridgeConfig) -> int:
     """Register this bridge's webhook on the bus. Returns webhook_id;
-    raises SystemExit on any failure (bus unreachable, or no id returned).
+    raises on any failure - SystemExit for this module's own named checks
+    and for call_tool's connection-error arm, the original transport
+    exception (debug=True) for everything else. register_with_retry treats
+    both shapes as retry-with-backoff.
 
     Idempotent: an unclean exit (SIGKILL, crash, reboot) skips main()'s
     finally, leaving a stale active webhook at this URL - and the bus neither
@@ -628,7 +639,14 @@ def register_with_bus(config: BridgeConfig) -> int:
     """
     hook_url = bridge_hook_url(config)
 
-    existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url)
+    # debug=True: call_tool would otherwise funnel every failure into a bare
+    # SystemExit(1) with the real cause printed to stderr - a stream a
+    # supervisor may discard - leaving the retry loop logging
+    # "SystemExit(1)" for a 401, timeout, and bad body alike. With the flag,
+    # those re-raise and their repr reaches the daemon's own log; the one
+    # failure still funneled into a bare exit is a connection error, which
+    # the retry loop renders as exactly that.
+    existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url, debug=True)
     if not isinstance(existing, list):
         # Proceeding without the dedupe would stack the duplicate deliveries
         # this sweep exists to prevent - retryable failure, like the no-id
@@ -641,7 +659,10 @@ def register_with_bus(config: BridgeConfig) -> int:
             continue
         if wh.get("url") == hook_url and wh.get("webhook_id") is not None:
             removal = call_tool(
-                "unregister_webhook", {"webhook_id": wh["webhook_id"]}, url=config.bus_url
+                "unregister_webhook",
+                {"webhook_id": wh["webhook_id"]},
+                url=config.bus_url,
+                debug=True,
             )
             # unregister_webhook reports logical failure in-band (a
             # success-False dict) rather than raising, and call_tool only
@@ -670,6 +691,7 @@ def register_with_bus(config: BridgeConfig) -> int:
             **({"secret": config.secret} if config.secret else {}),
         },
         url=config.bus_url,
+        debug=True,
     )
     webhook_id = result.get("webhook_id") if isinstance(result, dict) else None
     if webhook_id is None:
@@ -683,10 +705,20 @@ def register_with_bus(config: BridgeConfig) -> int:
 def unregister_from_bus(config: BridgeConfig, webhook_id: int) -> None:
     """Best-effort webhook cleanup on shutdown."""
     try:
-        result = call_tool("unregister_webhook", {"webhook_id": webhook_id}, url=config.bus_url)
+        result = call_tool(
+            "unregister_webhook", {"webhook_id": webhook_id}, url=config.bus_url, debug=True
+        )
     except SystemExit:
-        # call_tool exits on connection errors; shutdown must not care
+        # With debug=True the only failure call_tool still funnels into
+        # SystemExit is its connection-error arm - so this log line now
+        # reports a diagnosis it actually observed
         logger.warning(f"Could not unregister webhook #{webhook_id} (bus unreachable)")
+        return
+    except Exception as e:
+        # Everything else re-raises with its cause (401, timeout, bad
+        # body); shutdown stays best-effort, but the one log line an
+        # operator has when a row leaks should carry the real reason
+        logger.warning(f"Could not unregister webhook #{webhook_id} ({e!r})")
         return
     # Same accept-shape as the startup sweep: the bus reports logical
     # failure in-band (success-False dict), and already-gone is the goal
@@ -722,12 +754,23 @@ def register_with_retry(
         try:
             state["webhook_id"] = register_with_bus(config)
             return
-        # SystemExit is call_tool's failure shape; Exception covers anything
-        # unexpected inside register_with_bus - either way the thread must
-        # back off and retry, never die silently
+        # SystemExit is call_tool's failure shape; Exception covers the
+        # transport errors debug=True re-raises and anything unexpected
+        # inside register_with_bus - either way the thread must back off
+        # and retry, never die silently
         except (SystemExit, Exception) as e:
+            # With debug=True at the call sites, a BARE SystemExit(1) means
+            # exactly one thing - call_tool's connection-error arm - so name
+            # it instead of logging "SystemExit(1)" for every cause alike
+            # (the real reason went to stderr, a stream a supervisor may
+            # discard). The bridge's own SystemExits carry their message.
+            reason = (
+                "bus unreachable (connection error)"
+                if isinstance(e, SystemExit) and e.code == 1
+                else repr(e)
+            )
             logger.warning(
-                f"Registration on {config.bus_url} failed ({e!r}); retrying in {delay:.0f}s"
+                f"Registration on {config.bus_url} failed ({reason}); retrying in {delay:.0f}s"
             )
         if stop.wait(delay):
             return

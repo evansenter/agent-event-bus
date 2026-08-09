@@ -165,7 +165,7 @@ class TestPathSafety:
 
         monkeypatch.setitem(bridge._unsafe_warn_state, "last", -float("inf"))
         clock = {"now": 1000.0}
-        monkeypatch.setattr(bridge.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(bridge, "_now", lambda: clock["now"])
 
         def warnings():
             return [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -254,6 +254,20 @@ class TestHookFiltering:
         for level in ("lifecycle", "info"):
             resp = client.post("/hook", content=json.dumps(make_event(signal_level=level)).encode())
             assert resp.json() == {"status": "ignored", "reason": "below actionable"}
+        assert not (config.wake_dir / "target-1.jsonl").exists()
+
+    def test_missing_signal_level_filtered_loudly(self, client, config, caplog):
+        """A bus predating derived levels (#129) sends no signal_level at
+        all - every delivery lands on this arm forever, so the version skew
+        must be visible at INFO rather than silently filtering 100% of
+        deliveries. The INFO line IS the point of the branch; pin it like
+        the spool breadcrumb."""
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="agent-event-bus-bridge"):
+            resp = client.post("/hook", content=json.dumps(make_event(signal_level=None)).encode())
+        assert resp.json() == {"status": "ignored", "reason": "below actionable"}
+        assert any("no signal_level" in r.message for r in caplog.records)
         assert not (config.wake_dir / "target-1.jsonl").exists()
 
     def test_untargeted_actionable_ignored(self, client):
@@ -366,7 +380,7 @@ class TestInjectorCooldown:
         injector, _ = make_tmux_injector(tmp_path, cooldown=30.0)
 
         clock = {"now": 1000.0}
-        with patch.object(bridge.time, "monotonic", lambda: clock["now"]):
+        with patch.object(bridge, "_now", lambda: clock["now"]):
             with patch.object(bridge.subprocess, "run", tmux_ok):
                 assert injector.deliver("target-1", make_event()) == "tmux"
                 clock["now"] += 10.0
@@ -446,7 +460,7 @@ class TestInjectorCooldown:
         injector, _ = make_tmux_injector(tmp_path, sessions=("target-1", "target-2"), cooldown=30.0)
 
         clock = {"now": 1000.0}
-        with patch.object(bridge.time, "monotonic", lambda: clock["now"]):
+        with patch.object(bridge, "_now", lambda: clock["now"]):
             with patch.object(bridge.subprocess, "run", tmux_ok):
                 assert injector.deliver("target-1", make_event()) == "tmux"
                 clock["now"] += 35.0
