@@ -729,10 +729,13 @@ def create_bridge_app(
             event = json.loads(body)
         # ValueError, not just JSONDecodeError: json.loads(bytes) DECODES
         # before parsing, and invalid UTF-8 raises UnicodeDecodeError (a
-        # ValueError but not a JSONDecodeError). The bus retries any >=400
+        # ValueError but not a JSONDecodeError). RecursionError is the
+        # sibling case OUTSIDE ValueError: ~500k nested brackets fit well
+        # under MAX_BODY_BYTES and blow the interpreter limit before any
+        # JSONDecodeError can be raised. The bus retries any >=400
         # identically, so a 400 buys a clean named error in both logs
         # instead of a traceback per attempt - not fewer retries.
-        except ValueError:
+        except (ValueError, RecursionError):
             return {"error": "invalid JSON"}, 400
         if not isinstance(event, dict):
             # Valid JSON that isn't an object (123, [], "x"): a named 400,
@@ -778,6 +781,22 @@ def create_bridge_app(
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
     async def hook_endpoint(request: Request) -> JSONResponse:
+        # The check that keeps the loopback-needs-no-secret posture true
+        # against BROWSERS: fetch(mode:"no-cors") from any web page the
+        # operator has open can POST to 127.0.0.1 as long as its
+        # Content-Type stays CORS-safelisted (a string body defaults to
+        # text/plain) - no preflight is sent, the opaque response doesn't
+        # matter, the write would already have happened: attacker-authored
+        # spool lines from a background tab. Requiring the bus's actual
+        # media type forces a preflight the bridge never answers, so the
+        # browser never sends the POST at all; the bus (httpx,
+        # "Content-Type: application/json") is unaffected. Parameters are
+        # tolerated ("application/json; charset=utf-8") - the guard is
+        # about which media types a browser can send preflight-free, not
+        # about strictness for its own sake.
+        content_type = request.headers.get("content-type", "")
+        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
         # Precheck the honest case cheaply; the streamed count below covers
         # a missing or lying content-length (e.g. chunked encoding)
         content_length = request.headers.get("content-length")
@@ -1122,7 +1141,16 @@ def validate_config(config: BridgeConfig) -> None:
     config.cooldown_seconds = _to_number(
         config.cooldown_seconds, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
     )
-    config.wake_dir = Path(config.wake_dir)
+    try:
+        config.wake_dir = Path(config.wake_dir)
+    except (TypeError, ValueError):
+        # The one normalization Path() doesn't cover with a named error -
+        # Path(None), Path(123), Path(b"...") raise bare TypeErrors, the
+        # exact shape this block's comment promises to prevent
+        raise BridgeConfigError(
+            f"Invalid wake dir {config.wake_dir!r} "
+            "(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): expected a filesystem path"
+        ) from None
 
     # argparse `choices` only guards command-line values, and an embedder
     # skips argparse entirely - an unknown backend would silently mean
@@ -1189,6 +1217,21 @@ def validate_config(config: BridgeConfig) -> None:
                 "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): "
                 "expected http(s)://host[:port]/path"
             )
+        # SplitResult.port parses lazily - urlsplit itself accepts
+        # "http://host:80o82/hook" (scheme and hostname above read fine),
+        # and the bus stores the registered URL verbatim with no validation
+        # of its own, so a malformed port would register cleanly and then
+        # fail EVERY dispatch bus-side (httpx.InvalidURL) with /health
+        # green - the silent-inertness shape the scheme refusal above
+        # closes. Refuse it here so the embedding path gets the same named
+        # error as the CLI.
+        try:
+            parsed_hook.port
+        except ValueError:
+            raise BridgeConfigError(
+                f"Invalid hook URL {config.hook_url!r} "
+                "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): bad port"
+            ) from None
     hook = bridge_hook_url(config)
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
@@ -1298,16 +1341,12 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # The bus POSTs to the hook URL's port while the listener binds --port;
     # a mismatch is legitimate behind a reverse proxy, but name it - it's
     # otherwise the same silent-inertness failure the guards above close.
-    # SplitResult.port raises for a malformed port - keep that a named
-    # config error like every other input.
+    # Cannot raise: validate_config already refused a malformed hook-URL
+    # port (the refusal lives there so the embedding path gets it too),
+    # and the derived loopback default is well-formed - only the advisory
+    # COMPARISON lives here, per the docstring split.
     hook_split = urllib.parse.urlsplit(hook)
-    try:
-        hook_port = hook_split.port
-    except ValueError:
-        raise SystemExit(
-            f"Invalid hook URL {hook!r} "
-            "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): bad port"
-        ) from None
+    hook_port = hook_split.port
     if hook_port is None:
         # A missing port is not "no opinion" - the bus POSTs to the scheme
         # default, so a forgotten :8082 is exactly the mismatch this warning

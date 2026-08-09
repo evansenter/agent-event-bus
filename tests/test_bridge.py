@@ -97,9 +97,16 @@ def config(tmp_path):
     return BridgeConfig(wake_dir=tmp_path / "wake", cooldown_seconds=30.0)
 
 
+# The bus's httpx dispatch always sends this (server.py _dispatch_webhook);
+# the endpoint requires it so browser fetch() cannot reach the handler
+# preflight-free - a client-level default keeps every test speaking the
+# bus's wire shape without per-call noise
+JSON_CT = {"Content-Type": "application/json"}
+
+
 @pytest.fixture
 def client(config):
-    return TestClient(create_bridge_app(config))
+    return TestClient(create_bridge_app(config), headers=JSON_CT)
 
 
 class TestSignature:
@@ -121,7 +128,7 @@ class TestSignature:
 
     def test_hook_rejects_unsigned_when_secret_configured(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", secret="s3cret")
-        client = TestClient(create_bridge_app(config))
+        client = TestClient(create_bridge_app(config), headers=JSON_CT)
         body = json.dumps(make_event()).encode()
 
         assert client.post("/hook", content=body).status_code == 401
@@ -368,6 +375,37 @@ class TestHookFiltering:
         # UnicodeDecodeError (a ValueError, not JSONDecodeError) and must
         # be a 400 too, not a 500 with bus retries behind it
         assert client.post("/hook", content=b"\x80abc").status_code == 400
+        # Deep nesting blows the interpreter recursion limit inside
+        # json.loads - RecursionError, which is NOT a ValueError - at a
+        # size far under MAX_BODY_BYTES. Same named 400, not a 500 with
+        # bus retries behind it.
+        assert client.post("/hook", content=b"[" * 300_000).status_code == 400
+
+    def test_browser_shaped_post_is_rejected(self, config):
+        """The loopback-needs-no-secret posture holds only if a browser
+        cannot reach the handler: fetch(mode:"no-cors") from any web page
+        can POST to 127.0.0.1 preflight-free as long as the Content-Type
+        is CORS-safelisted (a string body defaults to text/plain) - the
+        response is opaque but the spool write would already have
+        happened. Requiring application/json (what the bus's httpx
+        dispatch actually sends) forces a preflight the bridge never
+        answers, so the browser never sends the POST at all."""
+        client = TestClient(create_bridge_app(config))  # no default headers
+        body = json.dumps(make_event()).encode()
+        # The exact shape a page can emit without a preflight: fetch()
+        # string-body default, form enctype, and no header at all
+        for content_type in ("text/plain;charset=UTF-8", "application/x-www-form-urlencoded", None):
+            headers = {"Content-Type": content_type} if content_type else {}
+            resp = client.post("/hook", content=body, headers=headers)
+            assert resp.status_code == 415, content_type
+        assert not (config.wake_dir / "target-1.jsonl").exists()
+        # Media-type parameters must not defeat the guard - the check is
+        # about what a browser can send preflight-free, not strictness
+        ok = client.post(
+            "/hook", content=body, headers={"Content-Type": "application/json; charset=utf-8"}
+        )
+        assert ok.status_code == 200
+        assert ok.json()["status"] == "delivered"
 
     def test_non_object_json_rejected(self, client):
         """Valid JSON that isn't an object must be a 400, not an
@@ -1592,6 +1630,11 @@ class TestDaemonLifecycle:
         bad = BridgeConfig(wake_dir=tmp_path / "wake", port="eighty")
         with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
             create_bridge_app(bad)
+        # Path() was the one normalization that could still raise a bare
+        # TypeError - the exact shape this block exists to prevent
+        non_path = BridgeConfig(wake_dir=123)
+        with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_WAKE_DIR"):
+            create_bridge_app(non_path)
 
     def test_half_wired_registration_pair_is_rejected(self, config):
         """Passing only one of registration_state/registration_stop would
@@ -1746,6 +1789,22 @@ class TestHookUrlTopology:
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://box.example:99999/hook")
         with pytest.raises(SystemExit, match="bad port"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+    def test_malformed_hook_port_refused_for_hand_built_configs(self, tmp_path):
+        """SplitResult.port parses lazily, so a malformed port sails past
+        the scheme/hostname refusals - and the bus stores the registered
+        URL verbatim, so on the embedding path it would register cleanly
+        and then fail every dispatch bus-side (httpx.InvalidURL) with
+        /health green: the silent-inertness shape the scheme refusal
+        closed in round 7. The refusal must live in validate_config so
+        embedders get the same named error as the CLI."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.example:80o82/hook",
+            secret="s3cret",
+        )
+        with pytest.raises(bridge.BridgeConfigError, match="bad port"):
+            create_bridge_app(config)
 
     def test_out_of_range_port_is_refused(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_PORT", "99999")

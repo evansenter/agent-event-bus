@@ -410,11 +410,18 @@ That lands with the supervision story.)
   full event payloads). Spool and lock files are created 0o600 for the
   same reason, independent of the process umask - and rename preserves
   the mode, so your `.draining.*` claims inherit it; anything you
-  *create* in the wake dir yourself should match. Pruning spools and
-  lock files for dead sessions is a follow-up - with one constraint: flock
-  binds to an inode, so unlink a `<sid>.lock` only while holding its flock
-  and only when no `<sid>.jsonl*` remains, or the next appender locks a
-  fresh inode and mutual exclusion is silently gone.
+  *create* in the wake dir yourself should match. Pruning spools for dead
+  sessions is a follow-up whose safe target is `<sid>.jsonl*` only -
+  `<sid>.lock` files are never reclaimed in v1. The obvious recipe
+  (unlink the lock while holding its flock, once no `<sid>.jsonl*`
+  remains) has an unobservable precondition: during a contended first
+  delivery for a new session, an appender already holds an open fd on the
+  lock and is blocked in its retry loop *before any `.jsonl` exists* -
+  flock binds to an inode, so unlinking there hands that appender an
+  orphaned inode whose lock excludes nobody, and the tearing the flock
+  prevents comes back with no way to observe it. Lock files are zero
+  bytes: retaining them is noise, not cost - the payload-bearing spool
+  files are the thing worth pruning.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool. The writer's
@@ -453,6 +460,14 @@ That lands with the supervision story.)
   can make the bridge hold). The bus does not cap event payloads, so a DM
   larger than that is refused (413, retried twice, then dropped) and stays
   pull-only: it reaches the session by polling, never as a wake.
+- `POST /hook` requires `Content-Type: application/json` (415 otherwise) -
+  what the bus's dispatch always sends. This is a security boundary, not
+  pedantry: without it, a web page open in the operator's browser could
+  POST to the loopback listener preflight-free via `fetch(mode:"no-cors")`
+  with a CORS-safelisted content type, writing attacker-authored spool
+  lines with no secret configured. Requiring the bus's media type forces a
+  preflight the bridge never answers. Remember the header when poking the
+  endpoint with `curl`.
 - `GET /health` reports `registered`: whether the *startup* registration
   succeeded. The row is not re-verified afterwards, so unregistering the
   webhook by hand (or restoring the bus DB from a backup) leaves
