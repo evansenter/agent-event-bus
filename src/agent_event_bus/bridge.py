@@ -178,13 +178,14 @@ class BridgeConfigError(ValueError):
 
 
 class _UnserializablePayloadError(Exception):
-    """json.dumps hit the recursion limit encoding a pathologically nested
-    payload. Raised out of _spool BEFORE any file is created or lock taken,
-    so process() can map it to a named 400 with a STRUCTURAL guarantee that
-    nothing durable happened - rather than catching a bare RecursionError
-    around all of deliver(), which also runs the tmux steps AFTER the spool
-    line is committed (a 400 there would make the bus retry an event whose
-    line already landed, duplicating it)."""
+    """_spool's json.dumps could not produce a standard-JSON line - the
+    payload was nested past the recursion limit, or carried an inf/nan value
+    (json.dumps(allow_nan=False) rejects those). Raised BEFORE any file is
+    created or lock taken, so process() can map it to a named 400 with a
+    STRUCTURAL guarantee that nothing durable happened - rather than catching
+    a bare error around all of deliver(), which also runs the tmux steps
+    AFTER the spool line is committed (a 400 there would make the bus retry
+    an event whose line already landed, duplicating it)."""
 
 
 def _now() -> float:
@@ -284,6 +285,17 @@ class Injector:
 
     def __init__(self, config: BridgeConfig):
         self.config = config
+        # Resolve the wake dir ONCE: validate_config normalized it to an
+        # absolute path and nothing reassigns it, so its resolved target is
+        # fixed for this Injector's life. _spool's containment check runs on
+        # every delivery - including the many foreign-session DMs a
+        # machine-unscoped bus delivers here just to conclude "not ours" - so
+        # keeping this off the per-event path drops one readlink/lstat chain
+        # per event. (The FileNotFoundError self-heal recreates the dir BY
+        # NAME, matching this by-name identity; a wake dir whose path
+        # components are re-symlinked mid-run is compared against the cached
+        # target, which is strictly less exposure than the per-call resolve.)
+        self._wake_dir_resolved = config.wake_dir.resolve()
         self._lock = threading.Lock()
         self._last_wake: dict[str, float] = {}
         # Armed panes.json warning KEYS (not messages - a torn write varies
@@ -459,18 +471,31 @@ class Injector:
         # Defense in depth behind resolve_target_session's charset check: a
         # traversal or absolute component in a wire-supplied id must never
         # produce a write outside the wake dir
-        if spool_file.resolve().parent != self.config.wake_dir.resolve():
+        if spool_file.resolve().parent != self._wake_dir_resolved:
             raise ValueError(f"Spool path escapes wake dir: {session_id!r}")
-        # Serialize BEFORE the lock/open: json.dumps can raise RecursionError
-        # on a payload nested just under the parse limit (loads and dumps
-        # spend their recursion budgets independently, and this call sits a
-        # few frames deeper than the loads that admitted the body), and a
-        # failure must create no file and take no lock. Re-raised as a
-        # dedicated type so process() maps ONLY the pre-durable failure to a
-        # 400 - never a post-spool error from deliver's later tmux steps.
+        # Serialize BEFORE the lock/open: a failure must create no file and
+        # take no lock. Two non-standard-JSON producers are rejected here, so
+        # the "every spooled line is standard JSON" invariant holds by
+        # construction (not by the bus's good behavior):
+        #  - allow_nan=False: an overflowing numeric literal (payload: 1e400)
+        #    parses through json.loads' parse_float=float, which returns inf
+        #    WITHOUT raising - so process()'s parse_constant never sees it -
+        #    and default json.dumps would write it back as bare Infinity, a
+        #    line jq / JSON.parse / Go's encoding/json all reject (the drain
+        #    hook then skips it and the wake is silently lost). allow_nan=False
+        #    raises ValueError on inf/nan here instead. (parse_constant still
+        #    rejects the bare NaN/Infinity TOKENS earlier, for events that
+        #    never reach the spool too.)
+        #  - RecursionError: a payload nested just under the parse limit
+        #    (loads and dumps spend their recursion budgets independently, and
+        #    this call sits a few frames deeper than the loads that admitted
+        #    the body).
+        # Both re-raise as the dedicated type so process() maps ONLY this
+        # pre-durable failure to a 400 - never a post-spool error from
+        # deliver's later tmux steps.
         try:
-            line = json.dumps(event) + "\n"
-        except RecursionError as e:
+            line = json.dumps(event, allow_nan=False) + "\n"
+        except (RecursionError, ValueError) as e:
             raise _UnserializablePayloadError from e
         # flock a sibling lock file around the append: flock contends per
         # open file description, so it serializes writers in this process and
@@ -570,14 +595,26 @@ class Injector:
         """
         panes_file = self.config.wake_dir / "panes.json"
         try:
-            # encoding="utf-8" explicitly, NOT the locale codec read_text()
-            # defaults to: a supervisor hands the daemon no LC_ALL/LANG,
-            # glibc resolves the C locale, and the default codec becomes
-            # ASCII - a healthy panes.json with any byte >0x7f would then
-            # raise UnicodeDecodeError and wrongly route into the
-            # unparseable arm, leaving every session on the box permanently
-            # spool-unmapped. The writer contract (guide) says UTF-8.
-            panes = json.loads(panes_file.read_text(encoding="utf-8"))
+            # os.open with O_NOFOLLOW + O_NONBLOCK, not read_text():
+            #  - O_NOFOLLOW: panes.json shares the wake dir's history (may have
+            #    been group/world-writable before the daemon narrowed it to
+            #    0o700), so a symlink planted at the name must not be followed -
+            #    the same guard _open_append_0600 carries for the spool/lock
+            #    files. ELOOP is an OSError, landing on the unreadable arm.
+            #  - O_NONBLOCK: a planted FIFO would otherwise block a threadpool
+            #    worker forever inside a deliver() that already committed its
+            #    spool line - each tmux-backend delivery parks one and /hook
+            #    starves once they are all consumed. This path has no
+            #    TMUX_TIMEOUT/deadline of its own. On a FIFO the read returns
+            #    EOF (empty -> unparseable) or EAGAIN (OSError -> unreadable);
+            #    on a regular file O_NONBLOCK is a no-op.
+            #  - encoding="utf-8", NOT the locale codec: a supervisor hands the
+            #    daemon no LC_ALL/LANG, glibc resolves C -> ASCII, and a
+            #    healthy file with any byte >0x7f would wrongly hit the
+            #    unparseable arm. The writer contract (guide) says UTF-8.
+            fd = os.open(panes_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, encoding="utf-8") as f:
+                panes = json.loads(f.read())
         except FileNotFoundError:
             # A missing file IS this session's absent read: clear the
             # file-level keys AND this session's entry key, matching the
@@ -913,15 +950,15 @@ def create_bridge_app(
             return {"error": "bad signature"}, 401
 
         try:
-            # parse_constant rejects the non-standard NaN/Infinity/-Infinity
-            # literals json.loads accepts by DEFAULT: json.dumps would write
-            # them straight back into a spool line no other parser accepts
-            # (jq, JSON.parse, Go's encoding/json all reject them), so a
-            # contract-following drainer skips the line under its
-            # skip-unparseable rule and the wake is silently lost while the
-            # bus counted it delivered. The rejector's ValueError folds into
-            # the named-400 arm, making "everything appended is standard
-            # JSON" true by construction, not by the bus's good behavior.
+            # parse_constant rejects the bare NaN/Infinity/-Infinity TOKENS
+            # json.loads accepts by DEFAULT, early and for every event
+            # (including ones that never reach the spool). It is NOT the whole
+            # guard: an overflowing number (1e400) reaches parse_float=float,
+            # which returns inf without raising, so it slips past here - that
+            # producer is caught at the write side by _spool's
+            # allow_nan=False, which is where the standard-JSON invariant
+            # actually holds. The rejector's ValueError folds into the
+            # named-400 arm below.
             event = json.loads(body, parse_constant=_reject_json_constant)
         # ValueError, not just JSONDecodeError: json.loads(bytes) DECODES
         # before parsing, and invalid UTF-8 raises UnicodeDecodeError (a
@@ -1081,10 +1118,20 @@ def create_bridge_app(
 
 def _host_from_header(raw_host: str) -> str:
     """Strip the port from a Host header value, handling bracketed IPv6
-    ("[::1]:8082" -> "::1"). Lowercased for comparison."""
+    ("[::1]:8082" -> "::1"), and normalize an IP literal to its canonical
+    form. Normalizing HERE (both the incoming Host and the allowlist entries
+    go through the same canonicalization) collapses every wire spelling of
+    an IPv6 address - compressed, expanded, upper/lower - onto one key, so
+    the guard does not depend on which spelling the bus's httpx client
+    happens to render the Host as. A hostname passes through lowercased."""
     if raw_host.startswith("["):  # bracketed IPv6, with or without a port
-        return raw_host.split("]", 1)[0].lstrip("[").lower()
-    return raw_host.rsplit(":", 1)[0].lower()
+        host = raw_host.split("]", 1)[0].lstrip("[").lower()
+    else:
+        host = raw_host.rsplit(":", 1)[0].lower()
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return host  # a hostname (or garbage) - compare verbatim
 
 
 class _HostAllowlistMiddleware:
@@ -1833,7 +1880,12 @@ def _flock_or_exit(lock_path: Path, conflict_message: str) -> int:
     wake dir is Injector's). A failed open becomes a named SystemExit rather
     than the bare traceback every other failure here avoids (e.g. EACCES on
     a foreign lock file, ELOOP on a symlinked one)."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # mode=0o700, matching _ensure_private_lock_dir's create mode: normally a
+    # no-op (both callers reach here with the parent present), but if the
+    # hook-lock dir vanished between the verify and this call, a default-mode
+    # re-create (0o777 & ~umask) would make the NEXT start's verify refuse
+    # our own dir as group/world-accessible.
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as e:

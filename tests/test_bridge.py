@@ -330,11 +330,11 @@ class TestHookFiltering:
         assert bridge.resolve_target_session(payload) == "target-1"
 
     def test_bus_dispatch_sends_the_media_type_the_hook_requires(self):
-        """Round 54 made Content-Type a hard delivery precondition, which
-        promotes it to a cross-module wire contract - and the client
-        fixture supplies the header itself, so without this pin the bus
-        could drop or change it and every bridge test would stay green
-        while every real delivery 415d with /health still registered:true.
+        """Content-Type is a hard delivery precondition, which promotes it
+        to a cross-module wire contract - and the client fixture supplies
+        the header itself, so without this pin the bus could drop or change
+        it and every bridge test would stay green while every real delivery
+        415d with /health still registered:true.
         Captured off the REAL dispatch path, not asserted from a local
         literal (the constant is single-sourced in helpers.py, but
         single-sourcing can't catch the header being dropped entirely)."""
@@ -677,12 +677,31 @@ class TestHookFiltering:
             assert client.post("/hook", content=body).status_code == 400
 
     def test_nan_infinity_literals_rejected(self, client):
-        """json.loads accepts NaN/Infinity/-Infinity by default and
-        json.dumps writes them straight back, producing a spool line no
-        other parser (jq, JSON.parse, Go) accepts - a silently-lost wake. A
-        parse_constant rejector folds them into the named 400."""
+        """A spooled line must be STANDARD JSON - no NaN/Infinity, which
+        jq/JSON.parse/Go all reject (a drainer skips the line and the wake is
+        silently lost). Two producers turn a body into a non-standard value:
+        the bare NaN/Infinity/-Infinity TOKENS json.loads accepts (caught by
+        parse_constant), and an OVERFLOWING numeric literal (1e400 ->
+        float(inf), which parse_constant never sees - caught at the write
+        side by _spool's allow_nan=False). Both must be a named 400."""
         for body in (b'{"payload": NaN}', b'{"payload": Infinity}', b'{"x": -Infinity}'):
             assert client.post("/hook", content=body).status_code == 400, body
+        # The overflow route needs an ACTIONABLE event so it reaches _spool
+        for value in ("1e400", "-1e400"):
+            body = json.dumps(make_event()).replace('"need a review"', value).encode()
+            assert client.post("/hook", content=body).status_code == 400, value
+
+    def test_spooled_line_round_trips_through_a_strict_parser(self, client, config):
+        """Pin the guarantee on what gets WRITTEN, not only on what's
+        rejected at the door: a delivered event's spool line must parse
+        under a strict parser that rejects the non-standard constants."""
+        assert client.post("/hook", content=json.dumps(make_event()).encode()).status_code == 200
+        line = (config.wake_dir / "target-1.jsonl").read_text().splitlines()[0]
+
+        def strict(literal):
+            raise ValueError(f"non-standard constant {literal!r}")
+
+        assert json.loads(line, parse_constant=strict)["event_id"] == 1
 
     def test_host_guard_precedes_routing(self, config):
         """The Host allowlist runs in middleware, ahead of the router, so a
@@ -727,22 +746,35 @@ class TestHookFiltering:
             secret="s3cret",
         )
         client = TestClient(create_bridge_app(config))
-        for host in ("[fd7a:115c:a1e0::1]:8082", "[fd7a:115c:a1e0::1]"):
+        # BOTH wire spellings must match: normalization happens on both the
+        # stored entry and the incoming Host (in _host_from_header), so the
+        # guard never depends on which spelling the probe/bus renders.
+        for host in (
+            "[fd7a:115c:a1e0::1]:8082",  # compressed
+            "[FD7A:115C:A1E0::1]:8082",  # compressed, upper
+            "[fd7a:115c:a1e0:0:0:0:0:1]:8082",  # expanded
+            "[fd7a:115c:a1e0::1]",  # no port
+        ):
             assert client.get("/health", headers={"Host": host}).status_code == 200, host
 
     def test_ipv6_hook_host_normalized_in_allowlist(self, tmp_path):
-        """Same normalization on the hook side: an EXPANDED IPv6 hook-URL
-        literal must still match the compressed Host a probe (or curl to the
-        hook hostname) sends - urlsplit lowercases but does not compress."""
+        """Same normalization on the hook side, and BOTH directions: an
+        EXPANDED IPv6 hook-URL literal must match a compressed probe Host AND
+        the expanded Host the bus's httpx client may render from the
+        registered URL - _host_from_header normalizes the incoming side too,
+        so the guard doesn't rest on httpx's spelling choice."""
         config = BridgeConfig(
             wake_dir=tmp_path / "wake",
             hook_url="http://[FD7A:115C:A1E0:0:0:0:0:1]:8082/hook",  # expanded
             secret="s3cret",
         )
         client = TestClient(create_bridge_app(config))
-        assert (
-            client.get("/health", headers={"Host": "[fd7a:115c:a1e0::1]:8082"}).status_code == 200
-        )
+        for host in (
+            "[fd7a:115c:a1e0::1]:8082",  # compressed
+            "[fd7a:115c:a1e0:0:0:0:0:1]:8082",  # expanded (as registered)
+            "[FD7A:115C:A1E0:0:0:0:0:1]:8082",  # expanded, upper
+        ):
+            assert client.get("/health", headers={"Host": host}).status_code == 200, host
 
     def test_oversized_body_rejected(self, client):
         """The body must be read before the HMAC can be checked, so bound
@@ -1214,32 +1246,42 @@ class TestTmuxBackend:
                 assert injector.deliver("target-1", make_event()) == "spool-unmapped"
             mock_run.assert_not_called()
 
-    def test_panes_json_is_read_as_utf8_not_locale_codec(self, tmp_path, monkeypatch):
-        """read_text() with no encoding uses the locale codec, which a
-        supervisor-launched daemon (launchd/systemd hand no LANG) resolves
-        to ASCII - a HEALTHY panes.json with any byte >0x7f would then
-        UnicodeDecodeError and wrongly route into the 'unparseable' arm,
-        leaving every session on the box permanently spool-unmapped. The
-        C-locale failure can't be reproduced under this suite's UTF-8
-        locale, so pin the contract directly: the read must ask for utf-8.
-        A non-ASCII decoy value round-trips to prove the parse is real."""
+    def test_panes_json_is_read_as_utf8_not_locale_codec(self, tmp_path):
+        """The read decodes as UTF-8, not the locale codec (a
+        supervisor-launched daemon gets no LANG, so glibc resolves C ->
+        ASCII, and a healthy file with any byte >0x7f would wrongly hit the
+        unparseable arm). A non-ASCII decoy value ('café') round-trips to
+        the tmux wake, which proves the decode is UTF-8: an ASCII codec
+        would UnicodeDecodeError on it and degrade to spool-unmapped."""
         injector, config = make_tmux_injector(tmp_path)
         (config.wake_dir / "panes.json").write_text(
             json.dumps({"target-1": "%0", "_note": "café"}), encoding="utf-8"
         )
-        seen = {}
-        real_read_text = bridge.Path.read_text
-
-        def capture(self, *args, **kwargs):
-            if self.name == "panes.json":
-                seen["encoding"] = kwargs.get("encoding")
-            return real_read_text(self, *args, **kwargs)
-
-        monkeypatch.setattr(bridge.Path, "read_text", capture)
         with patch.object(bridge.subprocess, "run", tmux_ok):
-            # The non-ASCII decoy parses and the real pane id is used
             assert injector.deliver("target-1", make_event()) == "tmux"
-        assert seen["encoding"] == "utf-8"
+
+    def test_symlinked_panes_json_degrades_to_spool(self, tmp_path):
+        """panes.json shares the wake dir's history, so a symlink planted at
+        the name must not be followed (O_NOFOLLOW -> ELOOP -> the unreadable
+        arm), degrading to spool rather than reading a foreign file."""
+        injector, config = make_tmux_injector(tmp_path)
+        (config.wake_dir / "panes.json").unlink()
+        (config.wake_dir / "panes.json").symlink_to(tmp_path / "elsewhere.json")
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+        mock_run.assert_not_called()
+
+    def test_fifo_panes_json_does_not_hang(self, tmp_path):
+        """A planted FIFO must not park the delivery worker forever (this
+        path has no TMUX_TIMEOUT). O_NONBLOCK makes the read return promptly;
+        the delivery degrades to spool instead of hanging."""
+        injector, config = make_tmux_injector(tmp_path)
+        (config.wake_dir / "panes.json").unlink()
+        os.mkfifo(config.wake_dir / "panes.json")  # no writer -> would block
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            # Returns (does not hang); the empty/blocking read degrades
+            assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+        mock_run.assert_not_called()
 
     def test_valid_nondict_read_clears_stale_read_keys(self, tmp_path, caplog):
         """A valid-JSON-but-non-dict read (a list) proves the read AND parse
