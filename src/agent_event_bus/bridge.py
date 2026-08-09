@@ -1052,11 +1052,16 @@ def validate_config(config: BridgeConfig) -> None:
     calls it again for embedders (uvicorn --factory, an ASGI mount) that
     build a BridgeConfig by hand and never pass through argparse - the
     security posture (an exposed listener requires the HMAC secret) must
-    travel with the config, not with the entry point. Raises BridgeConfigError (a
-    ValueError - embedder-catchable, unlike SystemExit); config_from_args
-    translates it for the CLI. Error messages name flags and env vars
-    because the CLI is the common path; the invariants are runtime ones. The advisory topology WARNINGS stay in
-    config_from_args - they are startup diagnostics, not invariants.
+    travel with the config, not with the entry point. Raises
+    BridgeConfigError (a ValueError - embedder-catchable, unlike
+    SystemExit); config_from_args translates it for the CLI. NORMALIZES
+    port / cooldown_seconds / wake_dir on the config IN PLACE before
+    checking (int/float/Path - note int() truncates a float port rather
+    than rejecting it), so a caller keeping the config as its source of
+    truth reads back the coerced values. Error messages name flags and env
+    vars because the CLI is the common path; the invariants are runtime
+    ones. The advisory topology WARNINGS stay in config_from_args - they
+    are startup diagnostics, not invariants.
     """
     # Normalize BEFORE checking: the CLI hands strings through argparse
     # defaults, and a hand-built config may carry raw env values - a wrong
