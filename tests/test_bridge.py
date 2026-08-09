@@ -607,7 +607,7 @@ class TestInjectorCooldown:
         Injector(config).deliver("target-1", make_event())
         assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
 
-    def test_unpreparable_wake_dir_is_a_named_config_error(self, tmp_path):
+    def test_unpreparable_wake_dir_is_a_named_config_error(self, tmp_path, monkeypatch):
         """mkdir/chmod are the one startup filesystem precondition - they
         must surface as a named SystemExit like every other config input,
         not a bare traceback. (Parent is a FILE, not an unwritable dir:
@@ -615,8 +615,19 @@ class TestInjectorCooldown:
         blocker = tmp_path / "not-a-dir"
         blocker.write_text("")
         config = BridgeConfig(wake_dir=blocker / "wake")
-        with pytest.raises(SystemExit, match="--wake-dir / AGENT_EVENT_BUS_WAKE_DIR"):
+        # BridgeConfigError on the construction path, so an embedder's
+        # `except Exception` around app assembly can catch it
+        with pytest.raises(bridge.BridgeConfigError, match="--wake-dir / AGENT_EVENT_BUS_WAKE_DIR"):
             Injector(config)
+        # The CLI path still gets a clean message-and-exit via main()'s
+        # translation, not a traceback
+        import sys
+
+        monkeypatch.setattr(
+            sys, "argv", ["agent-event-bus-bridge", "--wake-dir", str(blocker / "wake")]
+        )
+        with pytest.raises(SystemExit, match="--wake-dir"):
+            bridge.main()
 
 
 class TestTmuxBackend:

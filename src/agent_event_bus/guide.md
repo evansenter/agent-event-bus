@@ -459,7 +459,11 @@ Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--cooldown`/`AGENT_EVENT_BUS_BRIDGE_COOLDOWN`,
 `--wake-dir`/`AGENT_EVENT_BUS_WAKE_DIR`, `--bus-url`/`AGENT_EVENT_BUS_URL`,
 `--hook-url`/`AGENT_EVENT_BUS_BRIDGE_HOOK_URL`,
-`--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`. `AGENT_EVENT_BUS_BRIDGE_SECRET` is
+`--bind`/`AGENT_EVENT_BUS_BRIDGE_BIND`. `AGENT_EVENT_BUS_WAKE_DIR`
+deliberately lacks the `_BRIDGE_` infix its siblings carry: the wake dir is
+the one bridge setting a *non-bridge* process (the drain hook) must also
+read, so its name must not read as bridge-internal.
+`AGENT_EVENT_BUS_BRIDGE_SECRET` is
 deliberately env-only - a `--secret` flag would expose the value in `ps`
 output and shell history. `DEV_MODE=1` turns on debug logging (the
 per-event reasons a delivery did nothing) - the same switch the bus server

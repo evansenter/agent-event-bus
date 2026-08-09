@@ -114,6 +114,13 @@ SPOOL_LOCK_RETRY_SECONDS = 0.1
 # name (Enter, C-c, Escape) as a keystroke instead of typing it. If this
 # ever becomes configurable or carries payload text, switch the call to
 # `send-keys -l` for the text plus a separate `send-keys Enter`.
+# Cap on the warn-once key sets (wake failures and panes conditions): a
+# session that ends while broken never sheds its key - only a later
+# delivery for that same session can - so on a weeks-long daemon the sets
+# are pure retention for dead sessions. Housekeeping, not correctness:
+# clearing costs one repeat warning per still-live condition.
+_WARN_KEYS_CAP = 256
+
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
 
@@ -253,8 +260,11 @@ class Injector:
             self.config.wake_dir.chmod(0o700)
         except OSError as e:
             # The one startup filesystem precondition: a named config error
-            # like every other operator-facing input, not a bare traceback
-            raise SystemExit(
+            # like every other operator-facing input, not a bare traceback.
+            # BridgeConfigError, not SystemExit: Injector is constructed by
+            # create_bridge_app, so this raise crosses the embedding surface
+            # too - main() translates it for the CLI, same as validate_config
+            raise BridgeConfigError(
                 f"Cannot prepare wake dir {self.config.wake_dir} "
                 f"(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): {e}"
             ) from None
@@ -374,8 +384,13 @@ class Injector:
         # ONE deadline shared across the self-heal retry below: a per-call
         # attempt counter would let contended-then-vanished-dir double the
         # worst case past the sum-under-WEBHOOK_TIMEOUT invariant that
-        # TestBusTimingContract pins on the constants
-        deadline = _now() + SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS
+        # TestBusTimingContract pins on the constants. time.monotonic
+        # directly, NOT the _now() seam: the seam exists for the cooldown's
+        # semantics and tests freeze it - a frozen clock here would turn a
+        # held flock into an unbounded spin instead of the deadline raise.
+        # (ATTEMPTS x RETRY defines the budget; the loop is wall-clock
+        # gated, so ATTEMPTS is a budget multiplier, not a literal count.)
+        deadline = time.monotonic() + SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS
 
         def _append() -> None:
             with lock_file.open("a") as lock_fd:
@@ -384,7 +399,7 @@ class Injector:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except BlockingIOError:
-                        if _now() >= deadline:
+                        if time.monotonic() >= deadline:
                             raise OSError(
                                 f"Could not lock spool for {session_id} within "
                                 f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
@@ -512,6 +527,9 @@ class Injector:
         if key in self._warned_panes_keys:
             logger.debug(message)
         else:
+            if len(self._warned_panes_keys) >= _WARN_KEYS_CAP:
+                # Same dead-session retention bound as the wake-failure set
+                self._warned_panes_keys.clear()
             self._warned_panes_keys.add(key)
             logger.warning(message)
 
@@ -553,6 +571,13 @@ class Injector:
             with self._lock:
                 first_sighting = key not in self._warned_wake_fail_keys
                 if first_sighting:
+                    if len(self._warned_wake_fail_keys) >= _WARN_KEYS_CAP:
+                        # Housekeeping, not correctness: a session whose pane
+                        # never recovers never sheds its key (only success
+                        # discards), and sessions are ephemeral - so clear at
+                        # a cap; one repeat warning per condition after that
+                        # many distinct ones is the lesser noise
+                        self._warned_wake_fail_keys.clear()
                     self._warned_wake_fail_keys.add(key)
             if first_sighting:
                 logger.warning(message)
@@ -1324,7 +1349,13 @@ def main():
 
     state: dict = {}
     stop = threading.Event()
-    app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+    # Same translation as config_from_args: app construction raises the
+    # embedder-catchable BridgeConfigError (Injector's wake-dir check runs
+    # in there), and the CLI turns it into a clean message-and-exit
+    try:
+        app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+    except BridgeConfigError as e:
+        raise SystemExit(str(e)) from None
     try:
         uvicorn.run(app, host=bind_host(config), port=config.port)
     finally:
