@@ -78,6 +78,11 @@ if (
 MAX_PAYLOAD_PREVIEW = 50  # Max chars to show in notification previews
 WEBHOOK_TIMEOUT = 5.0  # Seconds to wait for webhook response
 WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
+# One name, three readers: _dispatch_webhook sets it, the bridge reads it,
+# and the bridge tests build theirs from this constant - a rename that
+# touched only some of them would 401 every delivery silently (the bus
+# retries twice, then drops), with every mocked test still green.
+SIGNATURE_HEADER = "X-Event-Bus-Signature"
 
 # Known signal levels (RFC #121 / #129). Validation is soft: unknown values
 # are stored as-is with a warning, never rejected.
@@ -825,7 +830,7 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
     headers = {"Content-Type": "application/json"}
     if webhook.secret:
         signature = _compute_signature(payload_bytes, webhook.secret)
-        headers["X-Event-Bus-Signature"] = f"sha256={signature}"
+        headers[SIGNATURE_HEADER] = f"sha256={signature}"
 
     client = _get_webhook_client()
     for attempt in range(WEBHOOK_MAX_RETRIES + 1):

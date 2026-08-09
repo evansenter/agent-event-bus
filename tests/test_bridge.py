@@ -17,7 +17,7 @@ from agent_event_bus.bridge import (
     resolve_target_session,
     verify_signature,
 )
-from agent_event_bus.server import _compute_signature
+from agent_event_bus.server import SIGNATURE_HEADER, _compute_signature
 
 
 def sign(body: bytes, secret: str) -> str:
@@ -121,7 +121,7 @@ class TestSignature:
         assert client.post("/hook", content=body).status_code == 401
 
         signed = client.post(
-            "/hook", content=body, headers={"X-Event-Bus-Signature": sign(body, "s3cret")}
+            "/hook", content=body, headers={SIGNATURE_HEADER: sign(body, "s3cret")}
         )
         assert signed.status_code == 200
         assert signed.json()["status"] == "delivered"

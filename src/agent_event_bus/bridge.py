@@ -64,6 +64,11 @@ from starlette.routing import Route
 
 from agent_event_bus.cli import DEFAULT_URL, call_tool
 
+# The header name is a wire contract with the bus - import it rather than
+# re-spelling it, the same coupling discipline as the tests building their
+# signatures from the bus's _compute_signature
+from agent_event_bus.server import SIGNATURE_HEADER
+
 logger = logging.getLogger("agent-event-bus-bridge")
 
 DEFAULT_BRIDGE_PORT = 8082
@@ -673,7 +678,9 @@ def create_bridge_app(
                 return JSONResponse({"error": "body too large"}, status_code=413)
             chunks.append(chunk)
         body = b"".join(chunks)
-        signature = request.headers.get("x-event-bus-signature")
+        # Starlette header lookup is case-insensitive, so the canonical-case
+        # constant works directly
+        signature = request.headers.get(SIGNATURE_HEADER)
         payload, status = await run_in_threadpool(process, body, signature)
         return JSONResponse(payload, status_code=status)
 
