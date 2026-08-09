@@ -687,6 +687,38 @@ class TestTmuxBackend:
                 injector.deliver("target-1", make_event())
         assert len(warnings()) == 3
 
+    def test_wake_failure_bound_is_per_session(self, tmp_path, caplog):
+        """The round-38 panes lesson applies here too: the bound must key
+        per (session, exception type). A second broken session must WARN
+        rather than be demoted behind the first's key, and a healthy
+        session's success must not re-arm a broken one into warn-per-DM."""
+        import logging
+
+        injector, _ = make_tmux_injector(
+            tmp_path, sessions=("target-1", "target-2", "target-3"), cooldown=0.0
+        )
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        def broken_panes(cmd, **kwargs):
+            if cmd[3] in {"%0", "%1"}:  # target-1, target-2 have stale panes
+                raise bridge.subprocess.CalledProcessError(1, cmd)
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", broken_panes):
+                injector.deliver("target-1", make_event())  # warns
+                injector.deliver("target-2", make_event())  # different session - warns too
+                assert len(warnings()) == 2
+                assert injector.deliver("target-3", make_event()) == "tmux"  # healthy
+                injector.deliver("target-1", make_event())  # still bounded - debug
+        assert len(warnings()) == 2
+
     def test_malformed_panes_json_degrades_to_spool(self, tmp_path):
         """panes.json is maintained by an external component - every failure
         shape must read as 'unmapped', never escape as a 500."""
@@ -1300,6 +1332,43 @@ class TestDaemonLifecycle:
                         time.sleep(0.01)
                     assert client.get("/health").json()["registered"] is True
         assert unregistered == [77]
+
+    def test_lifespan_is_reentrant(self, tmp_path):
+        """A second lifespan cycle on the same app must register again: the
+        first shutdown set() the stop event, and without clearing it on
+        startup the second cycle binds, serves /health, and never registers
+        - the silent shape the pair check exists to prevent, reached
+        through the embedding surface the docstring advertises."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        registrations = []
+        unregistered: list = []
+
+        def fake_register(cfg):
+            registrations.append(1)
+            return 40 + len(registrations)
+
+        state: dict = {}
+        stop = threading.Event()
+        with patch.object(bridge, "register_with_bus", fake_register):
+            with patch.object(
+                bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+            ):
+                app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+                with TestClient(app):
+                    pass
+                with TestClient(app):
+                    pass
+        assert len(registrations) == 2
+        assert unregistered == [41, 42]
+
+    def test_create_bridge_app_validates_hand_built_configs(self, tmp_path):
+        """Embedders skip argparse, so the invariants - including the
+        exposed-listener secret requirement - must travel with the config:
+        an off-box /hook with no authentication is refused at app
+        construction, not just at the CLI."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", hook_url="http://box.example:8082/hook")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
+            create_bridge_app(config)
 
     def test_half_wired_registration_pair_is_rejected(self, config):
         """Passing only one of registration_state/registration_stop would

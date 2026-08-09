@@ -218,11 +218,13 @@ class Injector:
         # NORMAL multi-machine steady state, where most DMs are unmapped)
         # would oscillate that into one WARNING per DM.
         self._warned_panes_keys: set[str] = set()
-        # Same idea for tmux wake failures, its own slot (the conditions
-        # are independent): a missing/broken tmux binary fails every wake
-        # with the same exception type forever, and per-DM WARNING for a
-        # stuck local condition is the volume shape bounded everywhere else
-        self._last_wake_fail_reason: str | None = None
+        # Same idea for tmux wake failures - and the same per-condition
+        # keying lesson as the panes guard: the condition is per (session,
+        # exception type), so a single slot would let a second broken
+        # session go silent behind the first's warning while a healthy
+        # session's success re-armed a broken one into warn-per-DM. The
+        # truly global case (no tmux at all) is the startup preflight's job.
+        self._warned_wake_fail_keys: set[str] = set()
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event - though it IS
@@ -244,10 +246,11 @@ class Injector:
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken: "tmux",
         "spool" (spool backend working as designed), "spool-cooldown",
-        "spool-unmapped" (tmux backend, no USABLE pane mapping: absent -
-        the NORMAL outcome for a session on another machine, since webhooks
-        have no machine scoping - or present but not a pane id, which
-        warns), or "spool-tmux-failed" (tmux backend, the send-keys
+        "spool-unmapped" (tmux backend, no usable pane mapping - normally
+        because the session lives on another machine, since webhooks have
+        no machine scoping, but also when panes.json is missing, unreadable,
+        malformed, or its entry is not a pane id; the misconfiguration
+        shapes warn, so check the log), or "spool-tmux-failed" (tmux backend, the send-keys
         attempt itself failed - the arm that means tmux on this box is
         broken). The action value is in-band for a direct caller of /hook
         only - the bus discards the response body - so operator-facing
@@ -352,37 +355,43 @@ class Injector:
         # rename could slip between our open and our flush and the line would
         # land in a file the drainer already read (and will delete)
         lock_file = self.config.wake_dir / f"{session_id}.lock"
+
+        def _append() -> None:
+            with lock_file.open("a") as lock_fd:
+                for _ in range(SPOOL_LOCK_ATTEMPTS):
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(SPOOL_LOCK_RETRY_SECONDS)
+                else:
+                    raise OSError(
+                        f"Could not lock spool for {session_id} within "
+                        f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
+                        "(stuck drainer?)"
+                    )
+                try:
+                    with spool_file.open("a") as f:
+                        f.write(json.dumps(event) + "\n")
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
         try:
-            lock_handle = lock_file.open("a")
+            _append()
         except FileNotFoundError:
             # The wake dir can vanish at runtime - hand-clearing spools is
             # the documented interim workflow while pruning is a follow-up -
             # and without recovery every later delivery 500s until restart
             # (bus retries exhausted, wakes lost, /health still green).
-            # Recreate once and retry, keeping mkdir/chmod off the happy
-            # path; the resolve() check above already ran, so this cannot
-            # widen the path-safety surface.
+            # Recreate once and retry the WHOLE critical section: the dir
+            # can also disappear between the lock open and the spool open,
+            # so wrapping only the first open would leave the same 500.
+            # mkdir/chmod stay off the happy path, and the resolve() check
+            # above already ran, so this cannot widen the path-safety
+            # surface.
             self.config.wake_dir.mkdir(parents=True, exist_ok=True)
             self.config.wake_dir.chmod(0o700)
-            lock_handle = lock_file.open("a")
-        with lock_handle as lock_fd:
-            for _ in range(SPOOL_LOCK_ATTEMPTS):
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    time.sleep(SPOOL_LOCK_RETRY_SECONDS)
-            else:
-                raise OSError(
-                    f"Could not lock spool for {session_id} within "
-                    f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
-                    "(stuck drainer?)"
-                )
-            try:
-                with spool_file.open("a") as f:
-                    f.write(json.dumps(event) + "\n")
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _append()
 
     def _tmux_pane(self, session_id: str) -> str | None:
         """Look up the session's tmux pane from <wake_dir>/panes.json.
@@ -488,22 +497,28 @@ class Injector:
                 timeout=TMUX_TIMEOUT,
             )
             logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
-            self._last_wake_fail_reason = None  # a working tmux re-arms
+            # A working wake re-arms THIS session's failure conditions only -
+            # clearing globally would oscillate a broken session's warning
+            # under interleaved healthy deliveries (the round-38 shape)
+            self._warned_wake_fail_keys = {
+                k for k in self._warned_wake_fail_keys if not k.startswith(f"{session_id}:")
+            }
             return True
         except (subprocess.SubprocessError, OSError) as e:
             # SubprocessError covers CalledProcessError/TimeoutExpired;
             # OSError covers a missing or non-executable tmux binary. An
             # exception escaping here would 500 the webhook and make the bus
             # retry an event that is already durably spooled (duplicate
-            # lines). Bounded like the panes guard - keyed on the exception
-            # TYPE, so a persistent condition (tmux gone) warns once and
-            # then debugs, while a different failure type warns fresh.
-            reason = type(e).__name__
+            # lines). Bounded like the panes guard - keyed per (session,
+            # exception type): a persistent condition warns once per session
+            # and then debugs, a different failure type warns fresh, and a
+            # second broken session is never silenced by the first's key.
+            key = f"{session_id}:{type(e).__name__}"
             message = f"tmux wake failed for {session_id[:8]}... ({e}); spooled only"
-            if reason == self._last_wake_fail_reason:
+            if key in self._warned_wake_fail_keys:
                 logger.debug(message)
             else:
-                self._last_wake_fail_reason = reason
+                self._warned_wake_fail_keys.add(key)
                 logger.warning(message)
             return False
 
@@ -535,6 +550,9 @@ def create_bridge_app(
             "registration_state and registration_stop come as a pair - "
             "pass both to enable bus registration, or neither"
         )
+    # Embedders build configs by hand - the invariants (including the
+    # exposed-listener secret requirement) must hold on this path too
+    validate_config(config)
     injector = Injector(config)
     registration_thread: threading.Thread | None = None
 
@@ -542,6 +560,14 @@ def create_bridge_app(
     async def lifespan(app):
         nonlocal registration_thread
         if registration_state is not None and registration_stop is not None:
+            # A re-entered lifespan must register again: the previous
+            # cycle's shutdown set() this event, and register_with_retry
+            # checks it before its first attempt - without the clear, a
+            # second cycle on the same app binds, serves /health, and never
+            # registers (the silent shape the pair check above closes for
+            # half-wired calls). main() constructs the event unset, so this
+            # is a no-op on the first cycle.
+            registration_stop.clear()
             registration_thread = threading.Thread(
                 target=register_with_retry,
                 args=(config, registration_state, registration_stop),
@@ -939,41 +965,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def config_from_args(args: argparse.Namespace) -> BridgeConfig:
-    """Build the runtime config from parsed args plus environment."""
-    # argparse enforces `choices` only for values given on the command line -
-    # an env-supplied default bypasses the check, and an unknown backend would
-    # otherwise silently mean "spool" (deliver only tests != "tmux")
-    if args.backend not in ("spool", "tmux"):
+def validate_config(config: BridgeConfig) -> None:
+    """Enforce the hard invariants on a BridgeConfig, wherever it came from.
+
+    config_from_args calls this on the CLI path, and create_bridge_app
+    calls it again for embedders (uvicorn --factory, an ASGI mount) that
+    build a BridgeConfig by hand and never pass through argparse - the
+    security posture (an exposed listener requires the HMAC secret) must
+    travel with the config, not with the entry point. Error messages name
+    flags and env vars because the CLI is the common path; the invariants
+    themselves are runtime ones. The advisory topology WARNINGS stay in
+    config_from_args - they are startup diagnostics, not invariants.
+    """
+    # argparse `choices` only guards command-line values, and an embedder
+    # skips argparse entirely - an unknown backend would silently mean
+    # "spool" (deliver only tests != "tmux")
+    if config.backend not in ("spool", "tmux"):
         raise SystemExit(
-            f"Invalid backend {args.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
+            f"Invalid backend {config.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
             "expected 'spool' or 'tmux'"
         )
-    # Preflight the binary: a tmux backend on a box without tmux would
-    # degrade every wake to spool-tmux-failed for the daemon's lifetime -
-    # one startup message beats discovering it per-DM. A tmux that breaks
-    # LATER is still handled (and bounded) by the wake-failure guard.
-    if args.backend == "tmux" and shutil.which("tmux") is None:
-        raise SystemExit(
-            "Backend is tmux but no tmux binary is on PATH "
-            "(check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
-        )
-    config = BridgeConfig(
-        bus_url=args.bus_url,
-        port=_to_number(args.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT"),
-        backend=args.backend,
-        # `or None`: an accidentally empty env var must not put registration
-        # (which would skip the secret, so unsigned payloads) and verification
-        # (which would demand signatures) on opposite sides - that 401s every
-        # delivery silently
-        secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
-        cooldown_seconds=_to_number(
-            args.cooldown, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
-        ),
-        wake_dir=args.wake_dir,
-        hook_url=args.hook_url,
-        bind=args.bind,
-    )
     # Range checks cover CLI and env alike: an out-of-range port would be a
     # uvicorn traceback naming neither, and a negative cooldown would
     # silently disable the cooldown (now - ts < -5 is never true)
@@ -1029,9 +1040,6 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
                 "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): "
                 "expected http(s)://host[:port]/path"
             )
-    # One derivation for the whole topology block below: every guard
-    # reasons about the same (hook URL, effective bind) pair, and nothing
-    # in between mutates config. `bind` is hoisted after --bind validation.
     hook = bridge_hook_url(config)
     # A loopback hook URL registered on a remote bus makes the bus POST to
     # itself: registration succeeds, /health is green, nothing is ever
@@ -1077,6 +1085,43 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             "authentication on this hop). Check --bind / AGENT_EVENT_BUS_BRIDGE_BIND "
             "and --hook-url."
         )
+
+
+def config_from_args(args: argparse.Namespace) -> BridgeConfig:
+    """Build the runtime config from parsed args plus environment."""
+    config = BridgeConfig(
+        bus_url=args.bus_url,
+        port=_to_number(args.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT"),
+        backend=args.backend,
+        # `or None`: an accidentally empty env var must not put registration
+        # (which would skip the secret, so unsigned payloads) and verification
+        # (which would demand signatures) on opposite sides - that 401s every
+        # delivery silently
+        secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
+        cooldown_seconds=_to_number(
+            args.cooldown, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
+        ),
+        wake_dir=args.wake_dir,
+        hook_url=args.hook_url,
+        bind=args.bind,
+    )
+    validate_config(config)
+    # Preflight the binary (CLI path only - embedders manage their own
+    # runtime env): a tmux backend on a box without tmux would degrade
+    # every wake to spool-tmux-failed for the daemon's lifetime - one
+    # startup message beats discovering it per-DM, and the check is
+    # PATH-sensitive, so it names the fix. A tmux that breaks LATER is
+    # still handled (and bounded) by the wake-failure guard.
+    if config.backend == "tmux" and shutil.which("tmux") is None:
+        raise SystemExit(
+            "Backend is tmux but no tmux binary is on PATH of THIS process "
+            "(a supervisor's minimal PATH can hide a tmux your shell sees; "
+            "check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
+        )
+    # One derivation for the warning block below - the refusals above
+    # already validated both URLs, so these cannot raise
+    hook = bridge_hook_url(config)
+    bind = bind_host(config)
     # The inverse mismatch is silent inertness, not exposure: a loopback
     # bind under a reachable hook URL means the bus's POSTs are refused at
     # the TCP level. Legitimate behind a same-box TLS terminator, so warn

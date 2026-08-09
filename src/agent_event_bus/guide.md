@@ -399,7 +399,12 @@ That lands with the supervision story.)
   fresh inode and mutual exclusion is silently gone.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
-  session-side must maintain; unmapped sessions just spool. A stale mapping
+  session-side must maintain; unmapped sessions just spool. Requires a tmux
+  binary on the daemon's PATH at startup - the bridge REFUSES TO START
+  otherwise, and the check is PATH-sensitive: a supervisor's minimal PATH
+  (launchd defaults to `/usr/bin:/bin:/usr/sbin:/sbin`) can hide a Homebrew
+  tmux your shell sees, so put tmux on the daemon's PATH, not just yours.
+  A tmux that breaks *later* degrades per-wake to spool instead. A stale mapping
   types the wake prompt into whatever now owns the pane (usually a shell
   after the session exits), so the maintainer of `panes.json` should prune
   entries when sessions end.
@@ -431,9 +436,10 @@ That lands with the supervision story.)
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
-  backend, no usable `panes.json` entry: absent - the *normal* outcome for
-  a session on another machine - or present but not a pane id, which
-  warns), or `spool-tmux-failed` (the `send-keys` attempt itself
+  backend, no usable pane mapping - *normally* because the session lives
+  on another machine, but also when `panes.json` is missing, unreadable,
+  malformed, or its entry is not a pane id; the misconfiguration shapes
+  warn, so check the log), or `spool-tmux-failed` (the `send-keys` attempt itself
   failed). Only the last one means tmux is broken on this host. The bus
   discards the response body (it logs just the status code, at debug), so
   `action` is visible only to a direct caller of `/hook` - the bridge's own
