@@ -529,7 +529,7 @@ That lands with the supervision story.)
   bound address.
 
   **Behind a reverse proxy**, list the `Host` it forwards with
-  `--allowed-host` (comma-separated, or `AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS`).
+  `--allowed-hosts` (comma-separated, or `AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS`).
   nginx's `proxy_pass` rewrites `Host` to the *upstream* address unless the
   operator adds `proxy_set_header Host $host`, and that rewritten value is in
   no derived entry: a non-loopback hook URL derives the wildcard bind
@@ -549,8 +549,10 @@ That lands with the supervision story.)
   confirm a bridge runs here. Probe it by a loopback literal, the hook
   URL's hostname, or the bound address *when `--bind` pins a specific one* -
   under a wildcard bind (the derived default for a non-loopback hook URL)
-  the bind is not in the allowlist, so probe by the hook URL hostname or a
-  loopback literal.
+  the bind is not in the allowlist, so probe by the hook URL hostname, a
+  loopback literal, or any value listed with `--allowed-hosts` - the same
+  allowlist covers both endpoints, so a monitoring probe arriving through
+  the same reverse proxy as the deliveries passes on the proxy's Host.
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux

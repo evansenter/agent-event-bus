@@ -929,7 +929,7 @@ def create_bridge_app(
             allowed_hook_hosts.add(str(bind_ip))
     except ValueError:
         pass  # "localhost" - already present; the resolver decides its family
-    # Operator-configured extras (--allowed-host): the ONLY way to accept a
+    # Operator-configured extras (--allowed-hosts): the ONLY way to accept a
     # reverse proxy's rewritten Host, which the derived wildcard bind above
     # never adds (and a name-rewriting proxy can't be covered by --bind at
     # all). Added VERBATIM: validate_config (called above, so this holds for
@@ -1256,7 +1256,7 @@ class _HostAllowlistMiddleware:
                 _log_rejection(
                     "host",
                     f"Host {raw_host!r} not in the allowlist {sorted(self.allowed)} - if a "
-                    "reverse proxy forwards here, add its forwarded Host via --allowed-host / "
+                    "reverse proxy forwards here, add its forwarded Host via --allowed-hosts / "
                     "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS",
                 )
                 response = JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
@@ -1544,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
         "0.0.0.0 otherwise; pin e.g. your tailnet address to narrow exposure)",
     )
     parser.add_argument(
-        "--allowed-host",
+        "--allowed-hosts",
         default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS") or "",
         help="Comma-separated extra Host values the /hook & /health allowlist "
         "accepts, beyond the loopback literals, the hook URL host, and a pinned "
@@ -1642,16 +1642,34 @@ def validate_config(config: BridgeConfig) -> None:
     for entry in config.allowed_hosts:
         if not isinstance(entry, str):
             raise BridgeConfigError(
-                f"Invalid allowed host {entry!r} (check --allowed-host / "
+                f"Invalid allowed host {entry!r} (check --allowed-hosts / "
                 "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS): expected a string"
             )
         stripped = entry.strip()
         if not stripped:
             continue  # blank entry (trailing comma, empty env var) - drop it
         try:  # bare IPv6, which the port-splitting path would mangle
-            canonical_hosts.append(str(ipaddress.ip_address(stripped)))
+            canonical = str(ipaddress.ip_address(stripped))
         except ValueError:
-            canonical_hosts.append(_host_from_header(stripped))
+            canonical = _host_from_header(stripped)
+        # Emptiness is tested on the CANONICAL value, not the stripped input:
+        # _host_from_header can PRODUCE "" from an entry that is not blank -
+        # ":8082" (no bracket, so the rsplit on the last colon leaves nothing
+        # before it) and "[]" / "[]:8082" (bracketed branch, nothing between
+        # the brackets). Checking only the input would let those through to
+        # the allowlist and reopen the Host-less bypass above by another door.
+        # A named refusal rather than the silent `continue`: a trailing comma
+        # is a formatting artifact, but ":8082" is an operator reaching for
+        # "any host on this port" - a wish this flag cannot grant, and one
+        # they need told rather than dropped.
+        if not canonical:
+            raise BridgeConfigError(
+                f"Invalid allowed host {entry!r} (check --allowed-hosts / "
+                "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS): no hostname in it. "
+                "Entries are Host values (name, IP literal, or either with a "
+                "port) - a port alone matches nothing."
+            )
+        canonical_hosts.append(canonical)
     config.allowed_hosts = tuple(canonical_hosts)
 
     # argparse `choices` only guards command-line values, and an embedder
@@ -1811,7 +1829,9 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         bind=args.bind,
         # Comma-separated -> tuple; blank entries dropped so a trailing comma
         # or an empty env var yields ().
-        allowed_hosts=tuple(h.strip() for h in args.allowed_host.split(",") if h.strip()),
+        # Split only; validate_config does the stripping, blank-dropping, and
+        # canonicalization, so the embedder path gets identical treatment.
+        allowed_hosts=tuple(args.allowed_hosts.split(",")),
     )
     # Translate the embedder-catchable error into the CLI's exit shape -
     # main() prints the message and exits without a traceback

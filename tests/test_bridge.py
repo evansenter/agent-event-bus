@@ -753,7 +753,7 @@ class TestHookFiltering:
         assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
 
     def test_allowed_host_admits_a_forwarding_proxy(self, tmp_path):
-        """The gap --allowed-host exists for: a non-loopback hook URL derives
+        """The gap --allowed-hosts exists for: a non-loopback hook URL derives
         bind 0.0.0.0, is_unspecified keeps the wildcard OUT of the allowlist,
         and nginx's proxy_pass default rewrites Host to its UPSTREAM address -
         so every forwarded dispatch 421s while /health stays green. --bind
@@ -817,6 +817,26 @@ class TestHookFiltering:
             # a per-character allowlist would admit these single letters
             assert client.get("/health", headers={"Host": "p"}).status_code == 421, allowed
 
+    def test_port_only_allowed_host_is_refused_not_silently_dropped(self, tmp_path):
+        """The same bypass by another door: these entries are NOT blank, so a
+        check on the raw input passes them through - but _host_from_header
+        PRODUCES the empty string from each (":8082" has nothing before the
+        last colon; "[]" has nothing between the brackets), which would then
+        match the middleware's raw_host default and disable the guard. The
+        emptiness test therefore runs on the CANONICAL value. Refused rather
+        than dropped: ":8082" is an operator reaching for "any host on this
+        port", which this flag cannot express."""
+        for entry in (":8082", "[]", "[]:8082"):
+            with pytest.raises(bridge.BridgeConfigError, match="no hostname"):
+                create_bridge_app(
+                    BridgeConfig(
+                        wake_dir=tmp_path / "wake",
+                        hook_url="http://bridge.example:8082/hook",
+                        secret="s3cret",
+                        allowed_hosts=(entry,),
+                    )
+                )
+
     def test_non_string_allowed_host_is_a_named_config_error(self, tmp_path):
         """Same posture as the other hand-built-config type checks: a named
         BridgeConfigError, not a bare AttributeError off .strip()."""
@@ -845,7 +865,7 @@ class TestHookFiltering:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, "the repeat must not re-warn inside the interval"
         assert "10.0.0.5:8082" in warnings[0].message
-        assert "--allowed-host" in warnings[0].message
+        assert "--allowed-hosts" in warnings[0].message
 
     def test_ipv6_bind_address_normalized_in_allowlist(self, tmp_path):
         """The bind address is stored NORMALIZED (str(ip_address)), so an
@@ -2739,7 +2759,9 @@ class TestBindHost:
         (in validate_config, so embedders get the same treatment): the port
         is stripped exactly as it is on the incoming Host, which is what
         makes a "10.0.0.5:8082" entry match a request under that authority."""
-        args = bridge.build_parser().parse_args(["--allowed-host", "proxy.example, 10.0.0.5:8082,"])
+        args = bridge.build_parser().parse_args(
+            ["--allowed-hosts", "proxy.example, 10.0.0.5:8082,"]
+        )
         assert bridge.config_from_args(args).allowed_hosts == ("proxy.example", "10.0.0.5")
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS", "edge.example")
         assert bridge.config_from_args(bridge.build_parser().parse_args([])).allowed_hosts == (
