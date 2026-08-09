@@ -66,8 +66,11 @@ from agent_event_bus.cli import DEFAULT_URL, call_tool
 
 # The header name is a wire contract with the bus - import it rather than
 # re-spelling it, the same coupling discipline as the tests building their
-# signatures from the bus's _compute_signature
-from agent_event_bus.server import SIGNATURE_HEADER
+# signatures from the bus's _compute_signature. From helpers, NOT server:
+# server.py opens/migrates the bus database and attaches its log handler at
+# import time, none of which this pure HTTP client of the bus may trigger
+# (see test_bridge_import_does_not_pull_in_the_bus_server).
+from agent_event_bus.helpers import SIGNATURE_HEADER
 
 logger = logging.getLogger("agent-event-bus-bridge")
 
@@ -128,6 +131,14 @@ class BridgeConfig:
     hook_url: str | None = None
     # Interface to bind; None derives it from the hook URL (see bind_host)
     bind: str | None = None
+
+
+class BridgeConfigError(ValueError):
+    """An invalid BridgeConfig. A ValueError subclass so EMBEDDERS can catch
+    it with a normal `except Exception` around app assembly - SystemExit is
+    a BaseException and would tear through that. config_from_args translates
+    it into SystemExit for the CLI path, which keeps main() printing the
+    message and exiting without a traceback."""
 
 
 def _now() -> float:
@@ -282,7 +293,7 @@ class Injector:
             # this would emit one INFO per foreign-machine DM - the exact
             # volume the unmapped arm's debug demotion exists to avoid - and
             # a mapped wake already logs "Woke ..." at INFO.
-            logger.info(f"Spooled event {event.get('event_id')} for {session_id[:8]}...")
+            logger.info(f"Spooled event {event.get('event_id')!r} for {session_id[:8]}...")
             return "spool"
 
         # Pane lookup BEFORE the cooldown machinery: on a multi-machine bus
@@ -360,21 +371,26 @@ class Injector:
         # rename could slip between our open and our flush and the line would
         # land in a file the drainer already read (and will delete)
         lock_file = self.config.wake_dir / f"{session_id}.lock"
+        # ONE deadline shared across the self-heal retry below: a per-call
+        # attempt counter would let contended-then-vanished-dir double the
+        # worst case past the sum-under-WEBHOOK_TIMEOUT invariant that
+        # TestBusTimingContract pins on the constants
+        deadline = _now() + SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS
 
         def _append() -> None:
             with lock_file.open("a") as lock_fd:
-                for _ in range(SPOOL_LOCK_ATTEMPTS):
+                while True:
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except BlockingIOError:
+                        if _now() >= deadline:
+                            raise OSError(
+                                f"Could not lock spool for {session_id} within "
+                                f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
+                                "(stuck drainer?)"
+                            ) from None
                         time.sleep(SPOOL_LOCK_RETRY_SECONDS)
-                else:
-                    raise OSError(
-                        f"Could not lock spool for {session_id} within "
-                        f"{SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS:.0f}s "
-                        "(stuck drainer?)"
-                    )
                 try:
                     with spool_file.open("a") as f:
                         f.write(json.dumps(event) + "\n")
@@ -511,10 +527,15 @@ class Injector:
             logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
             # A working wake re-arms THIS session's failure conditions only -
             # clearing globally would oscillate a broken session's warning
-            # under interleaved healthy deliveries (the round-38 shape)
-            self._warned_wake_fail_keys = {
-                k for k in self._warned_wake_fail_keys if not k.startswith(f"{session_id}:")
-            }
+            # under interleaved healthy deliveries (the round-38 shape).
+            # Under the lock: the comprehension iterates the set, and a
+            # concurrent delivery's add would otherwise raise RuntimeError
+            # out of the one method whose exceptions must never 500 the
+            # webhook. The tmux subprocess stays outside the lock.
+            with self._lock:
+                self._warned_wake_fail_keys = {
+                    k for k in self._warned_wake_fail_keys if not k.startswith(f"{session_id}:")
+                }
             return True
         except (subprocess.SubprocessError, OSError) as e:
             # SubprocessError covers CalledProcessError/TimeoutExpired;
@@ -527,11 +548,16 @@ class Injector:
             # second broken session is never silenced by the first's key.
             key = f"{session_id}:{type(e).__name__}"
             message = f"tmux wake failed for {session_id[:8]}... ({e}); spooled only"
-            if key in self._warned_wake_fail_keys:
-                logger.debug(message)
-            else:
-                self._warned_wake_fail_keys.add(key)
+            # Same lock as the success-arm comprehension: an unsynchronized
+            # add would race its iteration. Logging stays outside the hold.
+            with self._lock:
+                first_sighting = key not in self._warned_wake_fail_keys
+                if first_sighting:
+                    self._warned_wake_fail_keys.add(key)
+            if first_sighting:
                 logger.warning(message)
+            else:
+                logger.debug(message)
             return False
 
 
@@ -567,6 +593,12 @@ def create_bridge_app(
     validate_config(config)
     injector = Injector(config)
     registration_thread: threading.Thread | None = None
+    # Version-skew line bound (a closure cell: the arm lives in process(),
+    # not on the injector). The condition - a bus predating derived levels -
+    # is persistent and per-deployment, so it gets the same first-sighting
+    # treatment as every other stuck-condition line; re-armed by the first
+    # delivery that DOES carry a level, which is what an upgraded bus sends.
+    skew_state = {"warned": False}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -643,23 +675,32 @@ def create_bridge_app(
         # The bus always sends the derived signal_level; only actionable
         # events (DMs, help_needed, blockers, CI failures) justify a wake
         level = event.get("signal_level")
+        if level is not None:
+            skew_state["warned"] = False  # the bus sends levels - re-arm the skew line
         if level != "actionable":
             if level is None:
                 # A bus predating derived levels (#129) sends none at all -
                 # every delivery would land here forever, so make the
-                # version skew visible instead of filtering silently
-                logger.info(
-                    f"Event {event.get('event_id')} carries no signal_level "
+                # version skew visible instead of filtering silently -
+                # bounded: INFO on the first sighting, debug repeats (the
+                # volume is the DM rate against a persistent condition)
+                message = (
+                    f"Event {event.get('event_id')!r} carries no signal_level "
                     "(bus predates derived levels?); filtering it"
                 )
+                if skew_state["warned"]:
+                    logger.debug(message)
+                else:
+                    skew_state["warned"] = True
+                    logger.info(message)
             else:
-                logger.debug(f"Ignoring event {event.get('event_id')}: level {level!r}")
+                logger.debug(f"Ignoring event {event.get('event_id')!r}: level {level!r}")
             return {"status": "ignored", "reason": "below actionable"}, 200
 
         target = resolve_target_session(event)
         if target is None:
             logger.debug(
-                f"Ignoring event {event.get('event_id')}: "
+                f"Ignoring event {event.get('event_id')!r}: "
                 f"channel {event.get('channel')!r} has no target session"
             )
             return {"status": "ignored", "reason": "no target session"}, 200
@@ -923,7 +964,7 @@ def _to_number(value, cast, flag: str, env: str):
     try:
         return cast(value)
     except (TypeError, ValueError):
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Invalid value {value!r} (check {flag} / {env}): expected a number"
         ) from None
 
@@ -986,16 +1027,28 @@ def validate_config(config: BridgeConfig) -> None:
     calls it again for embedders (uvicorn --factory, an ASGI mount) that
     build a BridgeConfig by hand and never pass through argparse - the
     security posture (an exposed listener requires the HMAC secret) must
-    travel with the config, not with the entry point. Error messages name
-    flags and env vars because the CLI is the common path; the invariants
-    themselves are runtime ones. The advisory topology WARNINGS stay in
+    travel with the config, not with the entry point. Raises BridgeConfigError (a
+    ValueError - embedder-catchable, unlike SystemExit); config_from_args
+    translates it for the CLI. Error messages name flags and env vars
+    because the CLI is the common path; the invariants are runtime ones. The advisory topology WARNINGS stay in
     config_from_args - they are startup diagnostics, not invariants.
     """
+    # Normalize BEFORE checking: the CLI hands strings through argparse
+    # defaults, and a hand-built config may carry raw env values - a wrong
+    # type must become the named config error these checks exist to give,
+    # not a bare TypeError out of a comparison or an AttributeError off a
+    # str that was annotated Path
+    config.port = _to_number(config.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT")
+    config.cooldown_seconds = _to_number(
+        config.cooldown_seconds, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
+    )
+    config.wake_dir = Path(config.wake_dir)
+
     # argparse `choices` only guards command-line values, and an embedder
     # skips argparse entirely - an unknown backend would silently mean
     # "spool" (deliver only tests != "tmux")
     if config.backend not in ("spool", "tmux"):
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Invalid backend {config.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
             "expected 'spool' or 'tmux'"
         )
@@ -1003,14 +1056,14 @@ def validate_config(config: BridgeConfig) -> None:
     # uvicorn traceback naming neither, and a negative cooldown would
     # silently disable the cooldown (now - ts < -5 is never true)
     if not (1 <= config.port <= 65535):
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Invalid port {config.port} (check --port / AGENT_EVENT_BUS_BRIDGE_PORT): "
             "expected 1-65535"
         )
     # isfinite too: nan makes every prune comparison False (cooldown never
     # engages), inf makes it always True (one wake ever, then silence)
     if not math.isfinite(config.cooldown_seconds) or config.cooldown_seconds < 0:
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Invalid cooldown {config.cooldown_seconds} "
             "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): "
             "must be finite and >= 0"
@@ -1018,7 +1071,7 @@ def validate_config(config: BridgeConfig) -> None:
     # A daemon's cwd is whatever its supervisor hands it - a relative wake
     # dir would silently relocate the durable path (and its chmod)
     if not config.wake_dir.is_absolute():
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Invalid wake dir {config.wake_dir} "
             "(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): must be an absolute path"
         )
@@ -1032,9 +1085,11 @@ def validate_config(config: BridgeConfig) -> None:
     try:
         parsed_bus = urllib.parse.urlsplit(config.bus_url)
     except ValueError as e:
-        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: {e}") from None
+        raise BridgeConfigError(f"Invalid bus URL {config.bus_url!r}: {e}") from None
     if parsed_bus.scheme not in ("http", "https") or not parsed_bus.hostname:
-        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http(s)://host[:port]/path")
+        raise BridgeConfigError(
+            f"Invalid bus URL {config.bus_url!r}: expected http(s)://host[:port]/path"
+        )
     # Same check for the hook URL - it is what BOTH topology guards below
     # read: a scheme-less value parses to hostname None, reads as loopback,
     # skips the guards, and registers a URL the bus can never POST to
@@ -1042,14 +1097,14 @@ def validate_config(config: BridgeConfig) -> None:
         try:
             parsed_hook = urllib.parse.urlsplit(config.hook_url)
         except ValueError as e:
-            raise SystemExit(
+            raise BridgeConfigError(
                 f"Invalid hook URL {config.hook_url!r} "
                 f"(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): {e}"
             ) from None
         # Require a hostname too: "http:///hook" parses to hostname None,
         # which reads as loopback and would skip every topology guard
         if parsed_hook.scheme not in ("http", "https") or not parsed_hook.hostname:
-            raise SystemExit(
+            raise BridgeConfigError(
                 f"Invalid hook URL {config.hook_url!r} "
                 "(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): "
                 "expected http(s)://host[:port]/path"
@@ -1061,7 +1116,7 @@ def validate_config(config: BridgeConfig) -> None:
     # startup dedupe could remove a live webhook belonging to the bus host.
     # Refuse the combination instead of failing silently.
     if not _is_loopback(config.bus_url) and _is_loopback(hook):
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Bus at {config.bus_url} is remote but the advertised hook URL "
             f"{hook} is loopback - the bus would POST to itself. "
             "Set --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL to an address the bus "
@@ -1077,7 +1132,7 @@ def validate_config(config: BridgeConfig) -> None:
             ipaddress.ip_address(config.bind)
         except ValueError:
             if config.bind not in LOOPBACK_HOSTS:
-                raise SystemExit(
+                raise BridgeConfigError(
                     f"Invalid bind address {config.bind!r} "
                     "(check --bind / AGENT_EVENT_BUS_BRIDGE_BIND): expected an IP address"
                 ) from None
@@ -1092,7 +1147,7 @@ def validate_config(config: BridgeConfig) -> None:
     # and the bridge must not invert that.
     exposed = not _is_host_loopback(bind) or not _is_loopback(hook)
     if exposed and not config.secret:
-        raise SystemExit(
+        raise BridgeConfigError(
             f"Listener would bind {bind} with hook URL "
             f"{hook} - reachable off-box, so set "
             "AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
@@ -1105,21 +1160,24 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     """Build the runtime config from parsed args plus environment."""
     config = BridgeConfig(
         bus_url=args.bus_url,
-        port=_to_number(args.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT"),
+        port=args.port,  # raw; validate_config coerces and range-checks
         backend=args.backend,
         # `or None`: an accidentally empty env var must not put registration
         # (which would skip the secret, so unsigned payloads) and verification
         # (which would demand signatures) on opposite sides - that 401s every
         # delivery silently
         secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
-        cooldown_seconds=_to_number(
-            args.cooldown, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
-        ),
+        cooldown_seconds=args.cooldown,  # raw; validate_config coerces
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
         bind=args.bind,
     )
-    validate_config(config)
+    # Translate the embedder-catchable error into the CLI's exit shape -
+    # main() prints the message and exits without a traceback
+    try:
+        validate_config(config)
+    except BridgeConfigError as e:
+        raise SystemExit(str(e)) from None
     # Preflight the binary (CLI path only - embedders manage their own
     # runtime env): a tmux backend on a box without tmux would degrade
     # every wake to spool-tmux-failed for the daemon's lifetime - one

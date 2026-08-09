@@ -227,6 +227,27 @@ class TestBusTimingContract:
         assert spool_deadline + bridge.TMUX_TIMEOUT < WEBHOOK_TIMEOUT
 
 
+class TestImportHygiene:
+    def test_bridge_import_does_not_pull_in_the_bus_server(self):
+        """server.py is not side-effect-free at module scope: it opens,
+        creates, and MIGRATES the bus database (SQLiteStorage()), attaches
+        the bus's file log handler, and builds the FastMCP app. The bridge
+        is a pure HTTP client of the bus and must never import it - on a
+        client-mode machine that would fabricate a phantom bus DB, and on
+        the bus host it would run migrations against the irreplaceable live
+        DB from a second process. conftest neutralizes all of that under
+        pytest, so this is checked in a clean subprocess."""
+        import subprocess as sp
+        import sys
+
+        code = (
+            "import sys; import agent_event_bus.bridge; "
+            "sys.exit(1 if 'agent_event_bus.server' in sys.modules else 0)"
+        )
+        result = sp.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
 class TestHookFiltering:
     def test_session_dm_signal_level_contract(self):
         """The bridge filters on the literal 'actionable' - pin that the bus
@@ -276,10 +297,24 @@ class TestHookFiltering:
         the spool breadcrumb."""
         import logging
 
-        with caplog.at_level(logging.INFO, logger="agent-event-bus-bridge"):
+        def infos():
+            return [
+                r
+                for r in caplog.records
+                if r.levelno == logging.INFO and "no signal_level" in r.message
+            ]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
             resp = client.post("/hook", content=json.dumps(make_event(signal_level=None)).encode())
-        assert resp.json() == {"status": "ignored", "reason": "below actionable"}
-        assert any("no signal_level" in r.message for r in caplog.records)
+            assert resp.json() == {"status": "ignored", "reason": "below actionable"}
+            # Persistent condition, DM-rate volume: repeats demote to debug
+            client.post("/hook", content=json.dumps(make_event(signal_level=None)).encode())
+            assert len(infos()) == 1
+            # A delivery that DOES carry a level (an upgraded bus) re-arms,
+            # so a later downgrade surfaces again instead of staying dark
+            client.post("/hook", content=json.dumps(make_event(signal_level="info")).encode())
+            client.post("/hook", content=json.dumps(make_event(signal_level=None)).encode())
+        assert len(infos()) == 2
         assert not (config.wake_dir / "target-1.jsonl").exists()
 
     def test_untargeted_actionable_ignored(self, client):
@@ -1375,8 +1410,22 @@ class TestDaemonLifecycle:
         an off-box /hook with no authentication is refused at app
         construction, not just at the CLI."""
         config = BridgeConfig(wake_dir=tmp_path / "wake", hook_url="http://box.example:8082/hook")
-        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
+        # BridgeConfigError, not SystemExit: an embedder's `except Exception`
+        # around app assembly must be able to catch it
+        with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
             create_bridge_app(config)
+
+    def test_hand_built_config_types_are_coerced_or_named(self, tmp_path):
+        """An embedder passing raw env strings must get the named config
+        error, not a bare TypeError out of a comparison - validate_config
+        normalizes before checking, so string numbers simply work."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port="8082", cooldown_seconds="30")
+        create_bridge_app(config)  # coerced, valid
+        assert config.port == 8082
+        assert config.cooldown_seconds == 30.0
+        bad = BridgeConfig(wake_dir=tmp_path / "wake", port="eighty")
+        with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_BRIDGE_PORT"):
+            create_bridge_app(bad)
 
     def test_half_wired_registration_pair_is_rejected(self, config):
         """Passing only one of registration_state/registration_stop would

@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from agent_event_bus.helpers import (
+    SIGNATURE_HEADER,
     _dev_notify,
     extract_repo_from_cwd,
     is_client_alive,
@@ -81,8 +82,10 @@ WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
 # One name, three readers: _dispatch_webhook sets it, the bridge reads it,
 # and the bridge tests build theirs from this constant - a rename that
 # touched only some of them would 401 every delivery silently (the bus
-# retries twice, then drops), with every mocked test still green.
-SIGNATURE_HEADER = "X-Event-Bus-Signature"
+# retries twice, then drops), with every mocked test still green. Defined
+# in helpers.py (import-clean) so the bridge can read it without pulling
+# in this module's import-time side effects; re-exported here as the
+# canonical bus-side name.
 
 # Known signal levels (RFC #121 / #129). Validation is soft: unknown values
 # are stored as-is with a warning, never rejected.
