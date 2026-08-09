@@ -117,6 +117,13 @@ REGISTRATION_JOIN_TIMEOUT = 35.0
 # be checked, so bound what an unauthenticated peer can make us buffer
 MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
+# panes.json is a small {session_id: pane_id} map maintained by an external
+# component, read on the delivery path for every tmux-backend DM. Bound the
+# read so a runaway or malicious file can't pull unbounded bytes into memory
+# per DM (a real mapping is orders of magnitude smaller); a truncated read
+# is almost certainly invalid JSON and lands on the unparseable arm.
+MAX_PANES_BYTES = 262_144  # 256 KiB
+
 # Bound the wait for the per-session spool flock. The drain contract keeps
 # the drainer's hold down to a couple of renames, so seconds of contention
 # means a stuck drainer (SIGSTOP, network mount) - and an unbounded block
@@ -446,13 +453,14 @@ class Injector:
         Serialized by the per-session flock below - against other threads in
         this process and against the drain hook alike.
 
-        A serialization failure (RecursionError out of json.dumps on a
-        pathologically nested payload - the same recursion sibling the
-        json.loads arms catch, one screen up in process()) is re-raised as
-        _UnserializablePayloadError BEFORE any file is created or lock taken, and
-        process() maps THAT to the named 400 every other wire-input path
-        returns. Every OTHER raise here is retry-meaningful: nothing is
-        durably stored, so the bus retry is real (unlike a post-spool error).
+        A serialization failure (a RecursionError on a pathologically nested
+        payload, or the ValueError json.dumps(allow_nan=False) raises on an
+        inf/nan that json.loads' parse_float admitted - e.g. 1e400) is
+        re-raised as _UnserializablePayloadError BEFORE any file is created or
+        lock taken, and process() maps THAT to the named 400 every other
+        wire-input path returns. Every OTHER raise here is retry-meaningful:
+        nothing is durably stored, so the bus retry is real (unlike a
+        post-spool error).
         """
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
         # The id is charset-clean by here (resolve_target_session validated
@@ -605,16 +613,20 @@ class Injector:
             #    worker forever inside a deliver() that already committed its
             #    spool line - each tmux-backend delivery parks one and /hook
             #    starves once they are all consumed. This path has no
-            #    TMUX_TIMEOUT/deadline of its own. On a FIFO the read returns
-            #    EOF (empty -> unparseable) or EAGAIN (OSError -> unreadable);
-            #    on a regular file O_NONBLOCK is a no-op.
+            #    TMUX_TIMEOUT/deadline of its own. On a no-writer FIFO the read
+            #    returns EOF (empty -> unparseable); a writer-attached FIFO
+            #    with nothing buffered surfaces as a TypeError from the text
+            #    layer (raw read returns None), caught below; on a regular file
+            #    O_NONBLOCK is a no-op.
             #  - encoding="utf-8", NOT the locale codec: a supervisor hands the
             #    daemon no LC_ALL/LANG, glibc resolves C -> ASCII, and a
             #    healthy file with any byte >0x7f would wrongly hit the
             #    unparseable arm. The writer contract (guide) says UTF-8.
+            #  - read(MAX_PANES_BYTES): bound the per-DM buffer against a
+            #    runaway file; a truncated read is invalid JSON -> unparseable.
             fd = os.open(panes_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, encoding="utf-8") as f:
-                panes = json.loads(f.read())
+                panes = json.loads(f.read(MAX_PANES_BYTES))
         except FileNotFoundError:
             # A missing file IS this session's absent read: clear the
             # file-level keys AND this session's entry key, matching the
@@ -625,16 +637,16 @@ class Injector:
             self._disarm_file_keys()
             self._warned_panes_keys.discard(f"bad-pane-value:{session_id}")
             return None
-        except (ValueError, RecursionError) as e:
-            # Parse failures (JSONDecodeError, UnicodeDecodeError from a
-            # torn write) - typically transient, self-healing on the
-            # writer's next write. RecursionError is the non-ValueError
-            # sibling, same as process()'s json.loads arm: deep nesting
-            # blows the interpreter limit before any JSONDecodeError
-            # exists, and an escape here 500s a delivery whose spool line
-            # is already committed. Separate reason from the OSError arm: a
-            # torn write escalating into a permanently unreadable file must
-            # WARN again, not be demoted as a repeat of the same condition.
+        except (ValueError, RecursionError, TypeError) as e:
+            # Parse failures - the read produced something json.loads can't
+            # take. ValueError: JSONDecodeError, or UnicodeDecodeError from a
+            # torn write. RecursionError: deep nesting blows the interpreter
+            # limit before any JSONDecodeError. TypeError: a writer-attached
+            # FIFO with nothing buffered makes the text layer's read return
+            # None (raw EAGAIN surfaces as None, not an OSError). All
+            # typically transient/self-healing; separate reason from the
+            # OSError arm so a torn write escalating into a permanently
+            # unreadable file WARNs again rather than demoting.
             self._warn_panes_once(
                 "unparseable", f"Unparseable panes.json ({e}); treating as unmapped"
             )
@@ -645,6 +657,19 @@ class Injector:
             # the guard, so this class carries its own reason key
             self._warn_panes_once(
                 "unreadable", f"Unreadable panes.json ({e}); treating as unmapped"
+            )
+            return None
+        except Exception as e:
+            # Never-500 backstop by SHAPE, not enumeration: this method's
+            # contract is that no failure reading an externally-maintained,
+            # hostile-adjacent file escapes to 500 an already-spooled
+            # delivery (which the bus would retry, duplicating lines). The
+            # specific arms above stay for reason selection; this catches
+            # anything they miss so the invariant can't be broken again by a
+            # new exception shape (it has been widened three times). Logged
+            # in full on first sighting so a genuine bug is not masked.
+            self._warn_panes_once(
+                "unexpected", f"Unexpected error reading panes.json ({e!r}); treating as unmapped"
             )
             return None
         # A successful json.loads proves the READ and PARSE conditions
@@ -700,11 +725,12 @@ class Injector:
         self._warned_panes_keys.discard(entry_key)  # healthy entry re-arms it
         return pane
 
-    _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object"})
+    _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object", "unexpected"})
     # The subset a successful read+parse clears regardless of the shape it
     # yields; not-an-object is left out because it tracks the shape, cleared
-    # only when the shape is actually a dict.
-    _PANES_READ_KEYS = frozenset({"unparseable", "unreadable"})
+    # only when the shape is actually a dict. "unexpected" (the never-500
+    # catch-all) is a read/parse-stage condition, so a healthy read re-arms it.
+    _PANES_READ_KEYS = frozenset({"unparseable", "unreadable", "unexpected"})
 
     def _disarm_file_keys(self) -> None:
         """The normal missing-file state clears ALL file-level conditions -

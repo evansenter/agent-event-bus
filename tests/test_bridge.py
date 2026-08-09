@@ -1272,14 +1272,43 @@ class TestTmuxBackend:
         mock_run.assert_not_called()
 
     def test_fifo_panes_json_does_not_hang(self, tmp_path):
-        """A planted FIFO must not park the delivery worker forever (this
-        path has no TMUX_TIMEOUT). O_NONBLOCK makes the read return promptly;
-        the delivery degrades to spool instead of hanging."""
+        """A planted FIFO with NO writer must not park the delivery worker
+        forever (this path has no TMUX_TIMEOUT). O_NONBLOCK makes the read
+        return EOF promptly; the delivery degrades to spool, not a hang."""
         injector, config = make_tmux_injector(tmp_path)
         (config.wake_dir / "panes.json").unlink()
         os.mkfifo(config.wake_dir / "panes.json")  # no writer -> would block
         with patch.object(bridge.subprocess, "run") as mock_run:
-            # Returns (does not hang); the empty/blocking read degrades
+            assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+        mock_run.assert_not_called()
+
+    def test_fifo_panes_json_with_writer_degrades_not_500(self, tmp_path):
+        """A FIFO with a writer attached and nothing buffered makes the text
+        read return None -> TypeError, which is NOT an OSError. It must still
+        degrade to spool (the never-500 contract), not escape _tmux_pane -
+        an escape would 500 an already-spooled delivery and the bus would
+        retry it, duplicating lines."""
+        injector, config = make_tmux_injector(tmp_path)
+        fifo = config.wake_dir / "panes.json"
+        fifo.unlink()
+        os.mkfifo(fifo)
+        writer = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)  # hold a writer, write nothing
+        try:
+            with patch.object(bridge.subprocess, "run") as mock_run:
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+            mock_run.assert_not_called()
+        finally:
+            os.close(writer)
+
+    def test_oversized_panes_json_degrades_to_spool(self, tmp_path, monkeypatch):
+        """The read is bounded (MAX_PANES_BYTES), so a runaway file can't pull
+        unbounded bytes into memory per DM; the truncated read is invalid
+        JSON and degrades to spool."""
+        monkeypatch.setattr(bridge, "MAX_PANES_BYTES", 64)
+        injector, config = make_tmux_injector(tmp_path)
+        big = {"target-1": "%0", "_pad": "x" * 500}  # valid, but past the cap
+        (config.wake_dir / "panes.json").write_text(json.dumps(big), encoding="utf-8")
+        with patch.object(bridge.subprocess, "run") as mock_run:
             assert injector.deliver("target-1", make_event()) == "spool-unmapped"
         mock_run.assert_not_called()
 
@@ -2769,6 +2798,24 @@ class TestBindHost:
         with pytest.raises(SystemExit, match="not a directory"):
             bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "wake"))
         assert not list(victim.iterdir())  # nothing written through the link
+
+    def test_flock_recreates_vanished_lock_dir_privately(self, tmp_path, monkeypatch):
+        """If the hook-lock dir vanishes between _ensure_private_lock_dir and
+        _flock_or_exit's mkdir, the re-create must be 0o700 - else the NEXT
+        start's verify would refuse our OWN dir as group/world-accessible.
+        Drive that exact sequence and assert the re-created dir still passes
+        the verify (fails if mode=0o700 is dropped, under any umask)."""
+        import shutil
+
+        d = tmp_path / "lockdir"
+        monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", d)
+        bridge._ensure_private_lock_dir(d)
+        shutil.rmtree(d)  # simulate the vanish between verify and mkdir
+        fd = bridge._flock_or_exit(d / "hook.x.lock", "conflict")
+        try:
+            bridge._ensure_private_lock_dir(d)  # must NOT raise on our re-created dir
+        finally:
+            os.close(fd)
 
     def test_lock_dir_group_accessible_is_refused(self, tmp_path, monkeypatch):
         """A pre-planted lock dir we own but that is group/world-accessible
