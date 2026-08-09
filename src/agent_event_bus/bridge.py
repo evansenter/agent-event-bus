@@ -177,6 +177,13 @@ class BridgeConfig:
     # the CLI gives a wide --bind. The CLI path never needs it: there the
     # bridge owns the bind, so the derived check is already real.
     assume_exposed: bool = False
+    # Extra Host values the /hook and /health allowlist accepts, beyond the
+    # loopback literals, the hook URL hostname, and a pinned --bind. A
+    # forwarding proxy commonly rewrites Host to its upstream address (the
+    # nginx default `proxy_set_header Host $proxy_host`) or a name, which
+    # nothing else adds under the derived wildcard bind - so a reverse-proxy
+    # deployment must list that value here or every dispatch is 421'd.
+    allowed_hosts: tuple[str, ...] = ()
 
 
 class BridgeConfigError(ValueError):
@@ -262,6 +269,27 @@ SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # therefore share the window - acceptable for v1.)
 _UNSAFE_WARN_INTERVAL_SECONDS = 60.0
 _unsafe_warn_state = {"last": -math.inf}
+
+# Every ACCEPTED event has its disposition logged somewhere (the skew line,
+# the filter arms, the cooldown/unmapped debug lines, the spool breadcrumb),
+# but a REJECTED request (bad signature, wrong media type, oversized,
+# unparseable, unserializable, foreign Host) returned only a status the bus
+# discards - so a secret mismatch, a media-type change, or a Host-rewriting
+# proxy behind a 421 was diagnosable only by reproducing it with curl.
+# _log_rejection closes that asymmetry. Rate-limited PER REASON by wall
+# clock: the values (Host, signature) are attacker/proxy-controlled and
+# would otherwise spam. Process-wide like _unsafe_warn_state, same v1
+# caveat about mounted apps sharing the window.
+_reject_warn_state: dict[str, float] = {}
+
+
+def _log_rejection(reason: str, detail: str) -> None:
+    now = _now()
+    if now - _reject_warn_state.get(reason, -math.inf) >= _UNSAFE_WARN_INTERVAL_SECONDS:
+        _reject_warn_state[reason] = now
+        logger.warning(f"Rejected request ({reason}): {detail}")
+    else:
+        logger.debug(f"Rejected request ({reason}): {detail}")
 
 
 def resolve_target_session(event: dict) -> str | None:
@@ -899,6 +927,13 @@ def create_bridge_app(
             allowed_hook_hosts.add(str(bind_ip))
     except ValueError:
         pass  # "localhost" - already present; the resolver decides its family
+    # Operator-configured extras (--allowed-host): the ONLY way to accept a
+    # reverse proxy's rewritten Host, which the derived wildcard bind above
+    # never adds (and a name-rewriting proxy can't be covered by --bind at
+    # all). Canonicalized through _host_from_header so a "10.0.0.5:8082" or
+    # bracketed-IPv6 entry matches the incoming Host the same way.
+    for extra in config.allowed_hosts:
+        allowed_hook_hosts.add(_host_from_header(extra))
     # Version-skew line bound (a closure cell: the arm lives in process(),
     # not on the injector). The condition - a bus predating derived levels -
     # is persistent and per-deployment, so it gets the same first-sighting
@@ -995,8 +1030,11 @@ def create_bridge_app(
         # sibling case OUTSIDE ValueError: ~500k nested brackets fit well
         # under MAX_BODY_BYTES and blow the interpreter limit before any
         # JSONDecodeError can be raised. The bus retries any >=400
-        # identically, so a 400 buys a clean named error in both logs
-        # instead of a traceback per attempt - not fewer retries.
+        # identically, so a 400 is not fewer retries - it is a clean named
+        # status instead of a traceback per attempt. The named reason
+        # reaches THIS daemon's log via _log_rejection at the hook_endpoint
+        # boundary; the bus discards the response body, so its log carries
+        # only the status code.
         except (ValueError, RecursionError):
             return {"error": "invalid JSON"}, 400
         if not isinstance(event, dict):
@@ -1053,7 +1091,13 @@ def create_bridge_app(
             # this 400 structurally cannot fire after a spool line has
             # landed (which would make the bus retry and duplicate it) - a
             # RecursionError from deliver's later tmux steps stays a 500.
-            return {"error": "invalid JSON"}, 400
+            # A DISTINCT string from the parse-failure 400 above: the body
+            # parsed fine, it just cannot re-serialize to a standard-JSON
+            # spool line (deep nesting, or an inf/nan allow_nan=False
+            # rejects) - a different producer and fix than "not JSON". The
+            # response body is a direct-caller-only surface, so this is the
+            # only place the distinction can surface.
+            return {"error": "payload not serializable to a spool line"}, 400
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
     async def hook_endpoint(request: Request) -> JSONResponse:
@@ -1073,6 +1117,7 @@ def create_bridge_app(
         # about strictness for its own sake.
         content_type = request.headers.get("content-type", "")
         if content_type.split(";", 1)[0].strip().lower() != WEBHOOK_CONTENT_TYPE:
+            _log_rejection("content-type", f"Content-Type {content_type!r} (need JSON)")
             return JSONResponse(
                 {"error": f"Content-Type must be {WEBHOOK_CONTENT_TYPE}"}, status_code=415
             )
@@ -1086,6 +1131,7 @@ def create_bridge_app(
         # isdecimal() matches what int() actually accepts.
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdecimal() and int(content_length) > MAX_BODY_BYTES:
+            _log_rejection("too-large", f"Content-Length {content_length} > {MAX_BODY_BYTES}")
             return JSONResponse({"error": "body too large"}, status_code=413)
         # Stream with a running count, not request.body(): body() concatenates
         # every chunk unconditionally, so a chunked POST (no content-length to
@@ -1102,15 +1148,24 @@ def create_bridge_app(
             async for chunk in request.stream():
                 received += len(chunk)
                 if received > MAX_BODY_BYTES:
+                    _log_rejection("too-large", f"streamed body exceeded {MAX_BODY_BYTES}")
                     return JSONResponse({"error": "body too large"}, status_code=413)
                 chunks.append(chunk)
         except ClientDisconnect:
+            _log_rejection("disconnect", "client aborted mid-body")
             return JSONResponse({"error": "client disconnected mid-body"}, status_code=400)
         body = b"".join(chunks)
         # Starlette header lookup is case-insensitive, so the canonical-case
         # constant works directly
         signature = request.headers.get(SIGNATURE_HEADER)
         payload, status = await run_in_threadpool(process, body, signature)
+        # The bus discards the response body, so a reject is otherwise a bare
+        # status in the uvicorn access line with no diagnosis - every ACCEPTED
+        # event's disposition is logged, so log the rejects too (rate-limited
+        # per reason). 401/400 come from process(); 415/413/disconnect above
+        # and 421 in the middleware log at their own sites.
+        if status >= 400:
+            _log_rejection(payload.get("error", "reject"), f"status {status}")
         return JSONResponse(payload, status_code=status)
 
     async def health(request: Request) -> JSONResponse:
@@ -1190,6 +1245,16 @@ class _HostAllowlistMiddleware:
                     raw_host = value.decode("latin-1")
                     break
             if _host_from_header(raw_host) not in self.allowed:
+                # A rebound tab's Host is attacker-chosen, but so is a
+                # reverse proxy's rewritten Host - which is a legitimate
+                # deployment 421'd silently under the derived wildcard bind.
+                # Name the rejected Host and the fix so it's recoverable.
+                _log_rejection(
+                    "host",
+                    f"Host {raw_host!r} not in the allowlist {sorted(self.allowed)} - if a "
+                    "reverse proxy forwards here, add its forwarded Host via --allowed-host / "
+                    "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS",
+                )
                 response = JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
                 await response(scope, receive, send)
                 return
@@ -1474,6 +1539,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interface to bind (default: 127.0.0.1 for a loopback hook URL, "
         "0.0.0.0 otherwise; pin e.g. your tailnet address to narrow exposure)",
     )
+    parser.add_argument(
+        "--allowed-host",
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS") or "",
+        help="Comma-separated extra Host values the /hook & /health allowlist "
+        "accepts, beyond the loopback literals, the hook URL host, and a pinned "
+        "--bind. Needed when a reverse proxy rewrites Host to its upstream "
+        "address or a name (else every dispatch is 421'd)",
+    )
     return parser
 
 
@@ -1696,6 +1769,9 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
         bind=args.bind,
+        # Comma-separated -> tuple; blank entries dropped so a trailing comma
+        # or an empty env var yields ().
+        allowed_hosts=tuple(h.strip() for h in args.allowed_host.split(",") if h.strip()),
     )
     # Translate the embedder-catchable error into the CLI's exit shape -
     # main() prints the message and exits without a traceback

@@ -527,6 +527,17 @@ That lands with the supervision story.)
   it. When poking the endpoint with `curl`, send the JSON content type and
   address the bridge by a loopback literal, the hook URL's hostname, or the
   bound address.
+
+  **Behind a reverse proxy**, list the `Host` it forwards with
+  `--allowed-host` (comma-separated, or `AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS`).
+  nginx's `proxy_pass` rewrites `Host` to the *upstream* address unless the
+  operator adds `proxy_set_header Host $host`, and that rewritten value is in
+  no derived entry: a non-loopback hook URL derives the wildcard bind
+  `0.0.0.0`, which is deliberately not allowlisted, and pinning `--bind`
+  instead would drop the wildcard (and cannot cover a proxy rewriting to a
+  *name* at all). Without it every forwarded dispatch 421s while `/health`
+  still reports `registered: true`. The bridge log names the rejected `Host`
+  and this flag on the first rejection.
 - `GET /health` reports `registered`: whether the *startup* registration
   succeeded. The row is not re-verified afterwards, so unregistering the
   webhook by hand (or restoring the bus DB from a backup) leaves

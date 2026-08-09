@@ -51,6 +51,7 @@ BRIDGE_ENV = (
     "AGENT_EVENT_BUS_BRIDGE_SECRET",
     "AGENT_EVENT_BUS_BRIDGE_HOOK_URL",
     "AGENT_EVENT_BUS_BRIDGE_BIND",
+    "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS",
     "AGENT_EVENT_BUS_WAKE_DIR",
     # Not AGENT_EVENT_BUS_*-prefixed, but main() honours it as THE debug
     # switch and CLAUDE.md tells developers to export it - exactly the
@@ -79,6 +80,19 @@ def reset_unsafe_warn_state():
     bridge._unsafe_warn_state["last"] = -float("inf")
     yield
     bridge._unsafe_warn_state["last"] = -float("inf")
+
+
+@pytest.fixture(autouse=True)
+def reset_reject_warn_state():
+    """_log_rejection rate-limits per reason in process-wide module state
+    (there is no per-request object to hang it on - the middleware 421 fires
+    before any endpoint runs). A test that drives one reject reason leaves a
+    real monotonic reading behind, so a later test asserting that reason's
+    WARNING would pass or fail on 60s of wall clock and run ordering. Clear
+    it around every test."""
+    bridge._reject_warn_state.clear()
+    yield
+    bridge._reject_warn_state.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -549,7 +563,10 @@ class TestHookFiltering:
         ):
             resp = client.post("/hook", content=json.dumps(make_event()).encode())
         assert resp.status_code == 400
-        assert resp.json() == {"error": "invalid JSON"}
+        # A DISTINCT string from the parse-failure 400: the body was valid
+        # JSON, it just cannot re-serialize to a standard-JSON spool line -
+        # a different producer and fix than "not JSON".
+        assert resp.json() == {"error": "payload not serializable to a spool line"}
 
     def test_spool_serialization_failure_creates_no_file_or_lock(self, config):
         """_spool serializes BEFORE it opens the file or takes the flock, so
@@ -734,6 +751,44 @@ class TestHookFiltering:
         client = TestClient(create_bridge_app(config))
         assert client.get("/health", headers={"Host": "100.100.1.2"}).status_code == 200
         assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+
+    def test_allowed_host_admits_a_forwarding_proxy(self, tmp_path):
+        """The gap --allowed-host exists for: a non-loopback hook URL derives
+        bind 0.0.0.0, is_unspecified keeps the wildcard OUT of the allowlist,
+        and nginx's proxy_pass default rewrites Host to its UPSTREAM address -
+        so every forwarded dispatch 421s while /health stays green. --bind
+        cannot cover it (pinning drops the wildcard, and a name-rewriting
+        proxy has no address to pin). An operator-listed Host is admitted;
+        an unlisted one is still rejected."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.example:8082/hook",  # non-loopback -> bind 0.0.0.0
+            allowed_hosts=("10.0.0.5:8082",),
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config), headers=JSON_CT)
+        body = json.dumps(make_event()).encode()
+        signed = {"Host": "10.0.0.5:8082", SIGNATURE_HEADER: sign(body, "s3cret")}
+        assert client.post("/hook", content=body, headers=signed).status_code == 200
+        # The allowlist is still a guard, not a bypass
+        assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+
+    def test_rejected_host_names_itself_and_the_fix(self, config, caplog):
+        """A 421 was the one reject with NO diagnostic anywhere on this side:
+        the bus discards the response body and logs its own status on a
+        different host in every non-loopback topology. Diagnosing it needs
+        the rejected Host, so the warning carries it plus the flag that
+        admits it. Rate-limited per reason, so the repeat drops to debug."""
+        import logging
+
+        client = TestClient(create_bridge_app(config))
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            assert client.get("/health", headers={"Host": "10.0.0.5:8082"}).status_code == 421
+            assert client.get("/health", headers={"Host": "10.0.0.6:8082"}).status_code == 421
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the repeat must not re-warn inside the interval"
+        assert "10.0.0.5:8082" in warnings[0].message
+        assert "--allowed-host" in warnings[0].message
 
     def test_ipv6_bind_address_normalized_in_allowlist(self, tmp_path):
         """The bind address is stored NORMALIZED (str(ip_address)), so an
@@ -2619,6 +2674,17 @@ class TestBindHost:
                     bridge.build_parser().parse_args(["--bind", bind, "--hook-url", hook])
                 )
             assert not any("different loopback" in r.message for r in caplog.records), (bind, hook)
+
+    def test_allowed_hosts_from_flag_and_env(self, monkeypatch):
+        """Comma-separated on both surfaces, blanks dropped so a trailing
+        comma or an empty env var yields () rather than an "" entry that
+        would match a Host-less request."""
+        args = bridge.build_parser().parse_args(["--allowed-host", "proxy.example, 10.0.0.5:8082,"])
+        assert bridge.config_from_args(args).allowed_hosts == ("proxy.example", "10.0.0.5:8082")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS", "edge.example")
+        assert bridge.config_from_args(bridge.build_parser().parse_args([])).allowed_hosts == (
+            "edge.example",
+        )
 
     def test_invalid_bind_is_refused(self):
         args = bridge.build_parser().parse_args(["--bind", "localhost:8082"])
