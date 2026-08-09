@@ -143,30 +143,34 @@ class TestPathSafety:
         ):
             assert resolve_target_session(make_event(channel=channel)) is None
 
-    def test_unsafe_id_warning_is_bounded_per_channel(self, caplog, monkeypatch):
-        """The rejection arm is publisher-drivable, so a repeated garbage
-        channel must not write one WARNING per event: first sighting warns,
-        repeats are debug, and the dedup set clears at its cap so warnings
-        resume instead of the set growing without bound."""
+    def test_unsafe_id_warning_is_rate_limited(self, caplog, monkeypatch):
+        """The rejection arm is publisher-drivable and the channel string is
+        publisher-CHOSEN, so a bound keyed on the value (the old dedup set)
+        still let a publisher who varies the id force one WARNING per event.
+        The bound must be content-independent: one warning per interval,
+        repeats at debug, and a persistent condition re-warns next interval
+        instead of going dark forever."""
         import logging
 
-        monkeypatch.setattr(bridge, "_warned_unsafe_channels", set())
-        monkeypatch.setattr(bridge, "_WARNED_UNSAFE_CHANNELS_CAP", 2)
+        monkeypatch.setitem(bridge._unsafe_warn_state, "last", -float("inf"))
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(bridge.time, "monotonic", lambda: clock["now"])
 
         def warnings():
             return [r for r in caplog.records if r.levelno == logging.WARNING]
 
         with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
-            assert resolve_target_session(make_event(channel="session:a/b")) is None
-            assert resolve_target_session(make_event(channel="session:a/b")) is None
-            assert len(warnings()) == 1  # the repeat was debug, not warning
-            assert "session:a/b" in warnings()[0].message
-            # Two more distinct channels reach the cap and clear the set...
-            assert resolve_target_session(make_event(channel="session:c/d")) is None
-            assert resolve_target_session(make_event(channel="session:e/f")) is None
-            # ...so the first channel warns again instead of staying dark
-            assert resolve_target_session(make_event(channel="session:a/b")) is None
-        assert len(warnings()) == 4
+            # Varying strings within one interval: one warning, rest debug -
+            # the shape the per-channel set could not bound
+            assert resolve_target_session(make_event(channel="session:x/1")) is None
+            assert resolve_target_session(make_event(channel="session:x/2")) is None
+            assert resolve_target_session(make_event(channel="session:x/3")) is None
+            assert len(warnings()) == 1
+            assert "session:x/1" in warnings()[0].message
+            # Past the interval the arm warns again
+            clock["now"] += bridge._UNSAFE_WARN_INTERVAL_SECONDS
+            assert resolve_target_session(make_event(channel="session:x/4")) is None
+        assert len(warnings()) == 2
 
     def test_traversal_channel_is_ignored_and_writes_nothing(self, client, config, tmp_path):
         evil = make_event(channel="session:../../escape")
@@ -1003,6 +1007,38 @@ class TestDaemonLifecycle:
                 # Context exit runs lifespan shutdown while slow_register sleeps
         # The join observed the in-flight commit, so the unregister got it
         assert unregistered == [43]
+
+    def test_health_reports_unregistered_while_registration_pending(self, tmp_path):
+        """The registered:false arm - the state a supervisor readiness probe
+        gates on while register_with_retry backs off against a down bus -
+        was the one /health shape without a test. Pins that the field means
+        COMMITTED, not merely configured."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        release = threading.Event()
+
+        def blocked_register(cfg):
+            release.wait(timeout=10)
+            return 77
+
+        state: dict = {}
+        stop = threading.Event()
+        unregistered: list = []
+        with patch.object(bridge, "register_with_bus", blocked_register):
+            with patch.object(
+                bridge, "unregister_from_bus", lambda cfg, wid: unregistered.append(wid)
+            ):
+                app = create_bridge_app(config, registration_state=state, registration_stop=stop)
+                with TestClient(app) as client:
+                    # Registration is in flight, deterministically not yet
+                    # committed (blocked on `release`)
+                    assert client.get("/health").json()["registered"] is False
+                    release.set()
+                    for _ in range(500):
+                        if client.get("/health").json()["registered"]:
+                            break
+                        time.sleep(0.01)
+                    assert client.get("/health").json()["registered"] is True
+        assert unregistered == [77]
 
     def test_app_without_registration_has_inert_lifespan(self, config):
         with TestClient(create_bridge_app(config)) as client:

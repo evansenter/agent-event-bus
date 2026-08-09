@@ -151,14 +151,15 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # The unsafe-id rejection below is publisher-drivable (the bus warns on
-# malformed channels but never rejects them), so a per-event WARNING would
-# let any publisher choose how much the bridge writes to its log. Warn on
-# the first sighting of each distinct channel string, debug the rest.
-# Cleared at a cap rather than LRU-evicted: past that many distinct garbage
-# channels, one repeat warning per channel is the lesser noise. Unlocked -
+# malformed channels but never rejects them), and the channel string is
+# publisher-CHOSEN - so a bound keyed on the value (a dedup set) still lets
+# a publisher who varies the id force one warning per event. Bound by time
+# instead: at most one WARNING per interval regardless of content, repeats
+# at debug (DEV_MODE surfaces every offending string). A persistent
+# condition re-warns each interval instead of going dark forever. Unlocked -
 # a rare race just duplicates a warning.
-_warned_unsafe_channels: set[str] = set()
-_WARNED_UNSAFE_CHANNELS_CAP = 64
+_UNSAFE_WARN_INTERVAL_SECONDS = 60.0
+_unsafe_warn_state = {"last": -math.inf}
 
 
 def resolve_target_session(event: dict) -> str | None:
@@ -177,13 +178,12 @@ def resolve_target_session(event: dict) -> str | None:
         return None
     target = channel.split(":", 1)[1]
     if not SESSION_ID_PATTERN.fullmatch(target):
-        if channel in _warned_unsafe_channels:
-            logger.debug(f"Ignoring event with unsafe session id in channel {channel!r}")
-        else:
-            if len(_warned_unsafe_channels) >= _WARNED_UNSAFE_CHANNELS_CAP:
-                _warned_unsafe_channels.clear()
-            _warned_unsafe_channels.add(channel)
+        now = time.monotonic()
+        if now - _unsafe_warn_state["last"] >= _UNSAFE_WARN_INTERVAL_SECONDS:
+            _unsafe_warn_state["last"] = now
             logger.warning(f"Ignoring event with unsafe session id in channel {channel!r}")
+        else:
+            logger.debug(f"Ignoring event with unsafe session id in channel {channel!r}")
         return None
     return target
 
