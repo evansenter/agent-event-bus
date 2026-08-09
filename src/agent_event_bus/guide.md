@@ -460,14 +460,22 @@ That lands with the supervision story.)
   can make the bridge hold). The bus does not cap event payloads, so a DM
   larger than that is refused (413, retried twice, then dropped) and stays
   pull-only: it reaches the session by polling, never as a wake.
-- `POST /hook` requires `Content-Type: application/json` (415 otherwise) -
-  what the bus's dispatch always sends. This is a security boundary, not
-  pedantry: without it, a web page open in the operator's browser could
-  POST to the loopback listener preflight-free via `fetch(mode:"no-cors")`
-  with a CORS-safelisted content type, writing attacker-authored spool
-  lines with no secret configured. Requiring the bus's media type forces a
-  preflight the bridge never answers. Remember the header when poking the
-  endpoint with `curl`.
+- `POST /hook` carries two browser guards, because "loopback needs no
+  secret" is only true if a page in the operator's browser cannot reach
+  the handler. (1) It requires `Content-Type: application/json` (415
+  otherwise) - what the bus's dispatch always sends. A *cross-origin* page
+  can POST preflight-free via `fetch(mode:"no-cors")` only with a
+  CORS-safelisted content type (text/plain et al); requiring the bus's
+  media type forces a preflight the bridge never answers. (2) It requires
+  a recognized `Host` (421 otherwise): loopback literals plus the hook
+  URL's hostname. This closes DNS rebinding, where the attacker page is
+  *same-origin* (served from `evil.example:<port>`, A record then flipped
+  to 127.0.0.1) so CORS never applies - but the browser fills `Host` from
+  the page's URL, so a rebound request necessarily carries the attacker's
+  hostname. Neither guard authenticates the *sender* - that is the
+  secret's job, and off-box topologies still require it. When poking the
+  endpoint with `curl`, send the JSON content type and address the bridge
+  by a loopback literal or the hook URL's hostname.
 - `GET /health` reports `registered`: whether the *startup* registration
   succeeded. The row is not re-verified afterwards, so unregistering the
   webhook by hand (or restoring the bus DB from a backup) leaves

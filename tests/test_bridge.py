@@ -97,16 +97,22 @@ def config(tmp_path):
     return BridgeConfig(wake_dir=tmp_path / "wake", cooldown_seconds=30.0)
 
 
-# The bus's httpx dispatch always sends this (server.py _dispatch_webhook);
-# the endpoint requires it so browser fetch() cannot reach the handler
-# preflight-free - a client-level default keeps every test speaking the
-# bus's wire shape without per-call noise
-JSON_CT = {"Content-Type": "application/json"}
+# The bus's httpx dispatch always sends this media type (single-sourced in
+# helpers.py); the endpoint requires it so browser fetch() cannot reach the
+# handler preflight-free - a client-level default keeps every test speaking
+# the bus's wire shape without per-call noise. Built from the real
+# constant, contract-test style.
+JSON_CT = {"Content-Type": bridge.WEBHOOK_CONTENT_TYPE}
+
+# The endpoint also allowlists Host (the DNS-rebinding guard), so tests
+# must arrive under a loopback literal the way real local callers do -
+# TestClient's default base_url would send "Host: testserver"
+LOOPBACK_BASE = "http://127.0.0.1"
 
 
 @pytest.fixture
 def client(config):
-    return TestClient(create_bridge_app(config), headers=JSON_CT)
+    return TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE, headers=JSON_CT)
 
 
 class TestSignature:
@@ -128,7 +134,7 @@ class TestSignature:
 
     def test_hook_rejects_unsigned_when_secret_configured(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", secret="s3cret")
-        client = TestClient(create_bridge_app(config), headers=JSON_CT)
+        client = TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE, headers=JSON_CT)
         body = json.dumps(make_event()).encode()
 
         assert client.post("/hook", content=body).status_code == 401
@@ -313,6 +319,52 @@ class TestHookFiltering:
         assert payload["session_id"] == "sender-1"
         assert bridge.resolve_target_session(payload) == "target-1"
 
+    def test_bus_dispatch_sends_the_media_type_the_hook_requires(self):
+        """Round 54 made Content-Type a hard delivery precondition, which
+        promotes it to a cross-module wire contract - and the client
+        fixture supplies the header itself, so without this pin the bus
+        could drop or change it and every bridge test would stay green
+        while every real delivery 415d with /health still registered:true.
+        Captured off the REAL dispatch path, not asserted from a local
+        literal (the constant is single-sourced in helpers.py, but
+        single-sourcing can't catch the header being dropped entirely)."""
+        import asyncio
+        from datetime import datetime
+
+        from agent_event_bus import server
+        from agent_event_bus.storage import Event as BusEvent
+        from agent_event_bus.storage import Webhook
+
+        captured: dict = {}
+
+        class FakeResponse:
+            status_code = 200
+
+        class FakeClient:
+            async def post(self, url, content=None, headers=None):
+                captured.update(headers or {})
+                return FakeResponse()
+
+        dm = BusEvent(
+            id=1,
+            event_type="note",
+            payload="hi",
+            session_id="sender-1",
+            timestamp=datetime(2026, 8, 8),
+            channel="session:target-1",
+        )
+        webhook = Webhook(
+            id=1,
+            url="http://127.0.0.1:8082/hook",
+            channel_filter=None,
+            event_types=None,
+            created_at=datetime(2026, 8, 8),
+        )
+        with patch.object(server, "_get_webhook_client", FakeClient):
+            assert asyncio.run(server._dispatch_webhook(webhook, dm)) is True
+        media = captured["Content-Type"].split(";", 1)[0].strip().lower()
+        assert media == bridge.WEBHOOK_CONTENT_TYPE == "application/json"
+
     def test_trailing_slash_hook_is_404_not_redirect(self, client):
         """redirect_slashes must stay off: the bus's httpx client doesn't
         follow redirects and counts any status under 400 as delivered, so a
@@ -390,7 +442,9 @@ class TestHookFiltering:
         happened. Requiring application/json (what the bus's httpx
         dispatch actually sends) forces a preflight the bridge never
         answers, so the browser never sends the POST at all."""
-        client = TestClient(create_bridge_app(config))  # no default headers
+        # Loopback base (passes the Host guard) but no default headers -
+        # this test exercises the Content-Type half in isolation
+        client = TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE)
         body = json.dumps(make_event()).encode()
         # The exact shape a page can emit without a preflight: fetch()
         # string-body default, form enctype, and no header at all
@@ -406,6 +460,46 @@ class TestHookFiltering:
         )
         assert ok.status_code == 200
         assert ok.json()["status"] == "delivered"
+
+    def test_dns_rebinding_host_is_rejected(self, config):
+        """The Content-Type guard rests on the attacker page being
+        cross-origin; DNS rebinding removes that premise (page served from
+        evil.example:<our port>, A record then flipped to 127.0.0.1 - the
+        POST is same-origin, so CORS never applies and application/json is
+        sent verbatim). What rebinding cannot forge is Host: the browser
+        fills it from the page's URL, so a rebound request necessarily
+        carries the attacker's hostname. The allowlist is loopback
+        literals plus the hook URL's hostname - the names legitimate
+        callers actually arrive under."""
+        client = TestClient(create_bridge_app(config), headers=JSON_CT)  # Host: testserver
+        body = json.dumps(make_event()).encode()
+        # The rebound shape: right media type, wrong Host
+        for host in ("evil.example:8082", "evil.example", "testserver"):
+            resp = client.post("/hook", content=body, headers={"Host": host})
+            assert resp.status_code == 421, host
+        assert not (config.wake_dir / "target-1.jsonl").exists()
+        # Every name a legitimate local caller can arrive under - including
+        # the bracketed-IPv6 forms TrustedHostMiddleware would mangle
+        for host in ("127.0.0.1:8082", "localhost:8082", "localhost", "[::1]:8082", "[::1]"):
+            resp = client.post("/hook", content=body, headers={"Host": host})
+            assert resp.status_code == 200, host
+
+    def test_hook_url_hostname_is_an_allowed_host(self, tmp_path):
+        """A remote-hook topology's bus POSTs with Host = the hook URL's
+        hostname (httpx fills it from the URL the bridge registered) - the
+        allowlist must admit exactly that name or every real delivery
+        would 421 while /health stays green."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.tailnet.example:8082/hook",
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config), headers=JSON_CT)
+        body = json.dumps(make_event()).encode()
+        signed = {"Host": "bridge.tailnet.example:8082", SIGNATURE_HEADER: sign(body, "s3cret")}
+        resp = client.post("/hook", content=body, headers=signed)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "delivered"
 
     def test_non_object_json_rejected(self, client):
         """Valid JSON that isn't an object must be a 400, not an

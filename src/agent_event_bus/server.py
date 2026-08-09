@@ -43,6 +43,7 @@ from agent_event_bus.helpers import (
     SIGNATURE_HEADER as SIGNATURE_HEADER,
 )
 from agent_event_bus.helpers import (
+    WEBHOOK_CONTENT_TYPE,
     _dev_notify,
     extract_repo_from_cwd,
     is_client_alive,
@@ -843,7 +844,9 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
     """Send event to a single webhook. Returns True on success."""
     payload_bytes = json.dumps(_webhook_payload(event)).encode()
 
-    headers = {"Content-Type": "application/json"}
+    # Single-sourced with the bridge's hook-endpoint requirement (its
+    # anti-browser guard 415s any other media type) - see helpers.py
+    headers = {"Content-Type": WEBHOOK_CONTENT_TYPE}
     if webhook.secret:
         signature = _compute_signature(payload_bytes, webhook.secret)
         headers[SIGNATURE_HEADER] = f"sha256={signature}"

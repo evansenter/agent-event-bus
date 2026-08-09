@@ -70,7 +70,7 @@ from agent_event_bus.cli import DEFAULT_URL, call_tool
 # server.py opens/migrates the bus database and attaches its log handler at
 # import time, none of which this pure HTTP client of the bus may trigger
 # (see test_bridge_import_does_not_pull_in_the_bus_server).
-from agent_event_bus.helpers import SIGNATURE_HEADER
+from agent_event_bus.helpers import SIGNATURE_HEADER, WEBHOOK_CONTENT_TYPE
 
 logger = logging.getLogger("agent-event-bus-bridge")
 
@@ -482,10 +482,14 @@ class Injector:
             self._disarm_file_keys()
             self._warned_panes_keys.discard(f"bad-pane-value:{session_id}")
             return None
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             # Parse failures (JSONDecodeError, UnicodeDecodeError from a
             # torn write) - typically transient, self-healing on the
-            # writer's next write. Separate reason from the OSError arm: a
+            # writer's next write. RecursionError is the non-ValueError
+            # sibling, same as process()'s json.loads arm: deep nesting
+            # blows the interpreter limit before any JSONDecodeError
+            # exists, and an escape here 500s a delivery whose spool line
+            # is already committed. Separate reason from the OSError arm: a
             # torn write escalating into a permanently unreadable file must
             # WARN again, not be demoted as a repeat of the same condition.
             self._warn_panes_once(
@@ -661,6 +665,15 @@ def create_bridge_app(
     # exposed-listener secret requirement) must hold on this path too
     validate_config(config)
     injector = Injector(config)
+    # The /hook Host allowlist (see hook_endpoint): loopback literals plus
+    # the hook URL's hostname - exactly the names a legitimate caller can
+    # arrive under (the bus fills Host from the URL it was told to POST to;
+    # local tools use a loopback literal). urlsplit().hostname already
+    # lowercases and strips IPv6 brackets.
+    hook_host = urllib.parse.urlsplit(bridge_hook_url(config)).hostname
+    allowed_hook_hosts = {"127.0.0.1", "localhost", "::1"}
+    if hook_host:
+        allowed_hook_hosts.add(hook_host)
     registration_thread: threading.Thread | None = None
     # Version-skew line bound (a closure cell: the arm lives in process(),
     # not on the injector). The condition - a bus predating derived levels -
@@ -781,22 +794,42 @@ def create_bridge_app(
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
     async def hook_endpoint(request: Request) -> JSONResponse:
-        # The check that keeps the loopback-needs-no-secret posture true
-        # against BROWSERS: fetch(mode:"no-cors") from any web page the
-        # operator has open can POST to 127.0.0.1 as long as its
-        # Content-Type stays CORS-safelisted (a string body defaults to
-        # text/plain) - no preflight is sent, the opaque response doesn't
-        # matter, the write would already have happened: attacker-authored
-        # spool lines from a background tab. Requiring the bus's actual
-        # media type forces a preflight the bridge never answers, so the
-        # browser never sends the POST at all; the bus (httpx,
-        # "Content-Type: application/json") is unaffected. Parameters are
-        # tolerated ("application/json; charset=utf-8") - the guard is
+        # Host allowlist - the half of the browser guard the Content-Type
+        # check below cannot carry: DNS rebinding makes the attacker page
+        # SAME-origin (served from evil.example:<our port>, then the A
+        # record flips to 127.0.0.1), and a same-origin POST is outside
+        # CORS entirely - no preflight, arbitrary headers, the JSON media
+        # type sent verbatim. What rebinding cannot forge is the Host
+        # header: the browser fills it from the page's URL, so a rebound
+        # request necessarily carries the attacker's hostname - never a
+        # loopback literal, never the hook URL host the bus was told to
+        # POST to. Hand-rolled rather than TrustedHostMiddleware: its
+        # host.split(":")[0] mangles bracketed IPv6 ("[::1]:8082" -> "["),
+        # and --bind ::1 is a supported shape. 421 Misdirected Request.
+        raw_host = request.headers.get("host", "")
+        if raw_host.startswith("["):  # bracketed IPv6, with or without port
+            host = raw_host.split("]", 1)[0].lstrip("[").lower()
+        else:
+            host = raw_host.rsplit(":", 1)[0].lower()
+        if host not in allowed_hook_hosts:
+            return JSONResponse({"error": f"unexpected Host {raw_host!r}"}, status_code=421)
+        # The other half, for CROSS-origin pages: fetch(mode:"no-cors")
+        # from any web page the operator has open can POST to 127.0.0.1 as
+        # long as its Content-Type stays CORS-safelisted (a string body
+        # defaults to text/plain) - no preflight is sent, the opaque
+        # response doesn't matter, the write would already have happened:
+        # attacker-authored spool lines from a background tab. Requiring
+        # the bus's actual media type (single-sourced in helpers.py)
+        # forces a preflight the bridge never answers, so the browser
+        # never sends the POST at all; the bus is unaffected. Parameters
+        # are tolerated ("application/json; charset=utf-8") - the guard is
         # about which media types a browser can send preflight-free, not
         # about strictness for its own sake.
         content_type = request.headers.get("content-type", "")
-        if content_type.split(";", 1)[0].strip().lower() != "application/json":
-            return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
+        if content_type.split(";", 1)[0].strip().lower() != WEBHOOK_CONTENT_TYPE:
+            return JSONResponse(
+                {"error": f"Content-Type must be {WEBHOOK_CONTENT_TYPE}"}, status_code=415
+            )
         # Precheck the honest case cheaply; the streamed count below covers
         # a missing or lying content-length (e.g. chunked encoding)
         content_length = request.headers.get("content-length")

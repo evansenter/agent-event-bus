@@ -22,6 +22,14 @@ NOTIFY_TIMEOUT = 5.0  # seconds
 # able to import the name without any of that. helpers.py is import-clean.
 SIGNATURE_HEADER = "X-Event-Bus-Signature"
 
+# The webhook media type - the same three-reader coupling as the header
+# above (the server's _dispatch_webhook sends it, the bridge's hook
+# endpoint REQUIRES it as its anti-browser guard, the bridge tests build
+# theirs from it). A rename touching only some readers would 415 every
+# delivery silently, so it is single-sourced here for the same
+# import-cleanliness reason.
+WEBHOOK_CONTENT_TYPE = "application/json"
+
 
 def _sanitize_name(name: str) -> str:
     """Sanitize a name by replacing problematic characters."""
