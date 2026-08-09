@@ -94,11 +94,12 @@ def restore_bridge_logger_level():
 
 @pytest.fixture(autouse=True)
 def isolate_lock_dir(monkeypatch, tmp_path):
-    """The hook-URL singleton lock lives in a FIXED dir (DEFAULT_LOCK_DIR)
-    independent of --wake-dir, so tests driving _acquire_singleton_locks or
-    main() would otherwise write into the developer's real
-    ~/.claude/.../bridge-locks and collide on the shared default-hook-URL
-    lock. Point it at a per-test tmp dir."""
+    """The hook-URL singleton lock lives in a FIXED dir (DEFAULT_LOCK_DIR:
+    $XDG_RUNTIME_DIR, else tempfile.gettempdir(), plus /agent-event-bus-
+    bridge-<uid>) independent of --wake-dir, so tests driving
+    _acquire_singleton_locks or main() would otherwise write into the
+    developer's real runtime/temp lock dir and collide on the shared
+    default-hook-URL lock. Point it at a per-test tmp dir."""
     monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", tmp_path / "bridge-locks")
 
 

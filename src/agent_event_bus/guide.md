@@ -362,7 +362,13 @@ That lands with the supervision story.)
   non-standard `NaN`/`Infinity` literals at the door, so every spooled line
   parses in `jq`, `JSON.parse`, and Go's `encoding/json`. Read it as UTF-8,
   not the drain hook's locale codec. Drain contract:
-  1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
+  1. Take an exclusive `flock` on `<sid>.lock`, creating it if absent
+     (`O_CREAT`, mode `0o600` to match the bridge and the create-mode rule
+     above). The bridge only creates `<sid>.lock` inside the first append
+     for that session, so a hook firing for a session with no spool yet -
+     the common case - opens a lock that does not exist; a drainer that
+     treats ENOENT as "nothing to drain" would skip locking on the very run
+     a spool appears concurrently. The bridge holds the same
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
      without the lock a just-appended line could land in a file the drainer
@@ -530,7 +536,10 @@ That lands with the supervision story.)
   otherwise) - a supervisor probing `http://127.0.0.1:<port>/health` sends
   a loopback `Host` and passes, but a rebound browser tab cannot even
   confirm a bridge runs here. Probe it by a loopback literal, the hook
-  URL's hostname, or the bound address, same as `/hook`.
+  URL's hostname, or the bound address *when `--bind` pins a specific one* -
+  under a wildcard bind (the derived default for a non-loopback hook URL)
+  the bind is not in the allowlist, so probe by the hook URL hostname or a
+  loopback literal.
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
@@ -577,7 +586,17 @@ non-loopback bind anyone who can reach the port can read it. Keep `--port` and t
 unless a proxy genuinely forwards between them (a mismatch is logged). Note webhooks have no machine scoping - every bridge receives
 every `session:` DM; tmux wakes only work for sessions on the bridge's own
 machine, and spool files for foreign sessions accumulate until the pruning
-follow-up lands. Machine-scoped delivery is a v2 item.
+follow-up lands. That accumulation is unbounded in the adversarial case:
+`deliver` spools before any existence check and the id is only
+charset-validated, never checked against `list_sessions`, so any publisher
+on the bus can create a `<id>.jsonl`+`<id>.lock` pair for every distinct
+never-registered id it invents - two inodes and up to ~1 MiB each, at its
+publish rate. On a loopback-only bus that is the operator's own trust
+boundary; on the recommended tailnet topology it is any session on the
+shared bus. Pruning must bound this, not just the benign foreign-session
+case; the real fix is the `list_sessions`-based scoping tracked for v2,
+which drops unknown ids before they reach the filesystem. Machine-scoped
+delivery is a v2 item.
 
 Supervision is deliberately out of scope for the v1 prototype: there is no
 `make install-bridge`, launchd plist, or systemd unit yet - run the bridge in
