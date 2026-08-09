@@ -813,8 +813,14 @@ def _compute_signature(payload: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
-async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
-    """Send event to a single webhook. Returns True on success."""
+def _webhook_payload(event: Event) -> dict:
+    """The JSON body every webhook receives for an event - a wire contract
+    with external consumers, split out so it is directly assertable. The
+    bridge resolves its wake target from `channel`, filters on
+    `signal_level`, and dedupes spool lines on `event_id`
+    (tests/test_bridge.py pins those keys against THIS function), so
+    removing or renaming a key is a breaking change; additions are
+    additive - consumers read the keys they know."""
     payload = {
         "event_id": event.id,
         "event_type": event.event_type,
@@ -830,7 +836,12 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
         for key in ("title", "tags"):
             if key in event.meta:
                 payload[key] = event.meta[key]
-    payload_bytes = json.dumps(payload).encode()
+    return payload
+
+
+async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
+    """Send event to a single webhook. Returns True on success."""
+    payload_bytes = json.dumps(_webhook_payload(event)).encode()
 
     headers = {"Content-Type": "application/json"}
     if webhook.secret:

@@ -257,6 +257,9 @@ class Injector:
         # session's success re-armed a broken one into warn-per-DM. The
         # truly global case (no tmux at all) is the startup preflight's job.
         self._warned_wake_fail_keys: set[str] = set()
+        # First-sighting bound for the spool backend's happy-path INFO -
+        # see the log site in deliver() for why repeats demote to debug
+        self._spool_breadcrumb_logged = False
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event - though it IS
@@ -306,14 +309,22 @@ class Injector:
         self._spool(session_id, event)
 
         if self.config.backend != "tmux":
-            # The one default-level breadcrumb on the happy path: without it
-            # the spool backend's terminal shows the registration line and
-            # then permanent silence, indistinguishable from a bus that
-            # stopped dispatching. Spool backend ONLY: in the tmux backend
-            # this would emit one INFO per foreign-machine DM - the exact
-            # volume the unmapped arm's debug demotion exists to avoid - and
-            # a mapped wake already logs "Woke ..." at INFO.
-            logger.info(f"Spooled event {event.get('event_id')!r} for {session_id[:8]}...")
+            # The happy-path breadcrumb: without it the spool backend's
+            # terminal shows the registration line and then permanent
+            # silence, indistinguishable from a bus that stopped
+            # dispatching. FIRST delivery only: the volume driver is
+            # webhooks having no machine scoping (every bridge receives
+            # every session: DM, most for sessions this host will never
+            # wake), so per-DM INFO here is the same unbounded noise the
+            # unmapped arm's debug demotion avoids - one line proves the
+            # whole chain works, repeats land at debug under DEV_MODE.
+            # Unlocked: a rare race just duplicates the INFO.
+            message = f"Spooled event {event.get('event_id')!r} for {session_id[:8]}..."
+            if self._spool_breadcrumb_logged:
+                logger.debug(message)
+            else:
+                self._spool_breadcrumb_logged = True
+                logger.info(f"{message} (first delivery; further spools log at debug)")
             return "spool"
 
         # Pane lookup BEFORE the cooldown machinery: on a multi-machine bus
@@ -1230,7 +1241,8 @@ def validate_config(config: BridgeConfig) -> None:
         raise BridgeConfigError(
             f"Listener would bind {bind} with hook URL "
             f"{hook} - reachable off-box, so set "
-            "AGENT_EVENT_BUS_BRIDGE_SECRET (the HMAC signature is the only "
+            "AGENT_EVENT_BUS_BRIDGE_SECRET or secret= on the config - the env "
+            "var is only read on the CLI path (the HMAC signature is the only "
             "authentication on this hop). Check --bind / AGENT_EVENT_BUS_BRIDGE_BIND "
             "and --hook-url."
         )

@@ -24,6 +24,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Log files | `agent-event-bus.log`, `agent-event-bus.err` |
 | LaunchAgent | `com.evansenter.agent-event-bus.plist` |
 | systemd service | `agent-event-bus.service` |
+| Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` - transient, safe to hand-clear; the DB protection below does NOT extend to it) |
 
 **Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_WAKE_DIR`)
 
@@ -66,7 +67,7 @@ make restart    # Lightweight service restart (no dependency sync)
 ./scripts/dev.sh  # Dev mode (foreground, auto-reload)
 ```
 
-**When to restart**: Code changes to `server.py`, `storage.py`, `helpers.py` require `make install-server` (or `make restart`). `guide.md` is read fresh each request. Dev mode auto-reloads.
+**When to restart**: Code changes to `server.py`, `storage.py`, `helpers.py` require `make install-server` (or `make restart`). `guide.md` is read fresh each request. Dev mode auto-reloads. The bridge is a separate process with no install target - after `bridge.py` changes, restart whatever runs `uv run agent-event-bus-bridge`.
 
 ## Testing
 

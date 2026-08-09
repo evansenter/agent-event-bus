@@ -342,7 +342,15 @@ That lands with the supervision story.)
   bridge and session crashes - but the append is not fsync'ed, so a
   host-level crash (kernel panic, power loss) inside the writeback window
   can lose a wake the bus already counted delivered; fsync-on-append is an
-  accepted follow-up. Drain contract:
+  accepted follow-up. Each line is the bus's webhook payload passed through
+  verbatim: `event_id`, `event_type`, `payload`, `session_id` (the
+  **sender**, not the wake target - the target is the file's name, also in
+  the `session:<id>` channel), `timestamp`, `channel`, `correlation_id`,
+  `signal_level`, plus `title`/`tags` only when the publisher set them.
+  `signal_level` is always `actionable` on a spooled line by construction
+  (the bridge filters before spooling), so a hook need not re-check it -
+  and pass-through means bus-side payload additions appear additively:
+  read the keys you know, ignore the rest. Drain contract:
   1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -

@@ -276,6 +276,36 @@ class TestHookFiltering:
         )
         assert _get_signal_level(dm) == "actionable"
 
+    def test_bus_webhook_payload_key_contract(self):
+        """The wake pipeline reads exactly three keys off the bus's POST -
+        channel (the ONLY thing resolve_target_session reads), signal_level
+        (the actionable filter), event_id (the drain hook's dedupe key) -
+        and every hook test here builds its own body via make_event(), so
+        without this pin the bus could drop or rename a key and the whole
+        suite would stay green while every real delivery resolved no
+        target. Same shape as the _get_signal_level pin above: assert
+        against the bus's real payload builder, then close the loop by
+        resolving a target from its actual output."""
+        from datetime import datetime
+
+        from agent_event_bus.server import _webhook_payload
+        from agent_event_bus.storage import Event as BusEvent
+
+        dm = BusEvent(
+            id=7,
+            event_type="note",
+            payload="hi",
+            session_id="sender-1",
+            timestamp=datetime(2026, 8, 8),
+            channel="session:target-1",
+        )
+        payload = _webhook_payload(dm)
+        assert payload["event_id"] == 7
+        assert payload["signal_level"] == "actionable"
+        # sender attribution, distinct from the wake target
+        assert payload["session_id"] == "sender-1"
+        assert bridge.resolve_target_session(payload) == "target-1"
+
     def test_trailing_slash_hook_is_404_not_redirect(self, client):
         """redirect_slashes must stay off: the bus's httpx client doesn't
         follow redirects and counts any status under 400 as delivered, so a
@@ -379,6 +409,22 @@ class TestHookFiltering:
         # backend's terminal must show more than the registration line, so
         # pin the INFO line carrying the event id like the warnings around it
         assert any("Spooled event 1" in r.message for r in caplog.records)
+
+    def test_spool_breadcrumb_demotes_after_first_delivery(self, config, caplog):
+        """The INFO breadcrumb proves the chain works ONCE - webhooks have
+        no machine scoping, so on a multi-machine bus the default backend
+        would otherwise log one INFO per foreign-machine DM, the exact
+        volume the tmux unmapped arm was demoted to debug to avoid.
+        Repeats must still be visible under DEV_MODE, not skipped."""
+        import logging
+
+        injector = Injector(config)
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            injector.deliver("target-1", make_event())
+            injector.deliver("target-1", make_event(event_id=2))
+            injector.deliver("other-session", make_event(event_id=3))
+        spooled = [r for r in caplog.records if "Spooled event" in r.message]
+        assert [r.levelno for r in spooled] == [logging.INFO, logging.DEBUG, logging.DEBUG]
 
     def test_spool_and_lock_files_created_0o600(self, config):
         """Spool lines carry full publisher-authored payloads, and the wake
