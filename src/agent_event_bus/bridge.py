@@ -411,7 +411,14 @@ class Injector:
         try:
             panes = json.loads(panes_file.read_text())
         except FileNotFoundError:
-            self._disarm_file_keys()  # normal unmapped state re-arms
+            # A missing file IS this session's absent read: clear the
+            # file-level keys AND this session's entry key, matching the
+            # absent-key arm below (a full delete-and-recreate clean-state
+            # cycle must re-arm the bad-entry warning - it is the
+            # repair-didn't-take signal). Still only THIS session's key, so
+            # no cross-session re-arm.
+            self._disarm_file_keys()
+            self._warned_panes_keys.discard(f"bad-pane-value:{session_id}")
             return None
         except ValueError as e:
             # Parse failures (JSONDecodeError, UnicodeDecodeError from a

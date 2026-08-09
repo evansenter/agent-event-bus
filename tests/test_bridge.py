@@ -823,7 +823,15 @@ class TestTmuxBackend:
             injector.deliver("target-1", make_event())
             panes.write_text(json.dumps({"target-1": None}))
             injector.deliver("target-1", make_event())
-        assert len(warnings()) == 2
+            assert len(warnings()) == 2
+            # A missing FILE is this session's absent read too: a full
+            # clean-state cycle (delete, recreate with a bad entry) must
+            # re-arm the warning - the repair-didn't-take signal
+            panes.unlink()
+            injector.deliver("target-1", make_event())
+            panes.write_text(json.dumps({"target-1": 0}))
+            injector.deliver("target-1", make_event())
+        assert len(warnings()) == 3
         assert "not a pane id" in warnings()[0].message
 
     def test_bad_pane_value_bound_survives_interleaved_sessions(self, tmp_path, caplog):
