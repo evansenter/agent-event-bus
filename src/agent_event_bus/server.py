@@ -3,6 +3,7 @@
 Provides tools for cross-session Claude Code communication:
 - register_session: Announce session presence
 - list_sessions: See active sessions
+- list_channels: See channels with subscriber counts
 - publish_event: Broadcast events (auto-refreshes heartbeat)
 - get_events: Poll for new events (auto-refreshes heartbeat)
 - unregister_session: Clean up on exit
@@ -114,6 +115,11 @@ EVENT_TYPE_SIGNAL_LEVELS = {
     "ci_failed": "actionable",
     "error_broadcast": "actionable",
 }
+
+
+def _preview(text: str) -> str:
+    """Truncate a payload for a notification or log preview."""
+    return text[:MAX_PAYLOAD_PREVIEW] + "..." if len(text) > MAX_PAYLOAD_PREVIEW else text
 
 
 def _get_signal_level(event: Event) -> str:
@@ -242,14 +248,11 @@ def _notify_dm_recipient(
         # If sender not found, keep "anonymous" - don't log (normal during tests/cleanup)
 
     # Send notification to alert the human
-    payload_preview = (
-        payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
-    )
     try:
         project_name = target_session.get_project_name()
         send_notification(
             title=f"📨 {target_session.name} • {project_name}",
-            message=f"From: {sender_name}\n{payload_preview}",
+            message=f"From: {sender_name}\n{_preview(payload)}",
         )
     except Exception as e:
         # Notification failure is non-critical, but log for debugging
@@ -470,10 +473,7 @@ def _publish_event_impl(
     # Dispatch to matching webhooks (async, non-blocking)
     _schedule_webhook_dispatch(event)
 
-    truncated = (
-        payload[:MAX_PAYLOAD_PREVIEW] + "..." if len(payload) > MAX_PAYLOAD_PREVIEW else payload
-    )
-    _dev_notify("publish_event", f"{event_type} [{channel}] {truncated}")
+    _dev_notify("publish_event", f"{event_type} [{channel}] {_preview(payload)}")
 
     result = {
         "event_id": event.id,
@@ -527,35 +527,40 @@ async def publish_event(
     )
 
 
-def _get_implicit_channels(session_id: str | None) -> list[str] | None:
-    """Get the channels a session is implicitly subscribed to.
+def _event_wire_dict(event: Event, *, id_key: str) -> dict:
+    """The one wire shape for an event, keyed by `id_key` for the event id.
 
-    Returns None to disable filtering - all sessions see all events (broadcast model).
-    Channel metadata is preserved on events for informational purposes.
+    Two consumers serialize the same event: get_events (as "id") and webhook
+    deliveries (as "event_id"). They differed only in that key, so they share
+    a builder - a field added for one is now automatically visible to the
+    other, and neither can silently drift from the other's `signal_level`.
+
+    Both spellings are wire contracts. The bridge resolves its wake target
+    from `channel`, filters on `signal_level`, and dedupes spool lines on
+    `event_id` (tests/test_bridge.py pins those keys), and the CLI reads the
+    get_events keys - so removing or renaming a key is a breaking change.
+    Additions are additive: consumers read the keys they know.
     """
-    # Broadcast model: everyone sees everything
-    # Explicit channel filtering via get_events(channel=X) still works if needed
-    return None
+    d = {
+        id_key: event.id,
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "session_id": event.session_id,
+        "timestamp": event.timestamp.isoformat(),
+        "channel": event.channel,
+        "correlation_id": event.correlation_id,
+        "signal_level": _get_signal_level(event),
+    }
+    if event.meta:
+        for key in ("title", "tags"):
+            if key in event.meta:
+                d[key] = event.meta[key]
+    return d
 
 
 def _event_to_dict(e: Event) -> dict:
-    """Convert an Event to its wire representation."""
-    d = {
-        "id": e.id,
-        "event_type": e.event_type,
-        "payload": e.payload,
-        "session_id": e.session_id,
-        "timestamp": e.timestamp.isoformat(),
-        "channel": e.channel,
-        "correlation_id": e.correlation_id,
-        "signal_level": _get_signal_level(e),
-    }
-    if e.meta:
-        if "title" in e.meta:
-            d["title"] = e.meta["title"]
-        if "tags" in e.meta:
-            d["tags"] = e.meta["tags"]
-    return d
+    """An event as get_events returns it (event id under "id")."""
+    return _event_wire_dict(e, id_key="id")
 
 
 def _get_events_impl(
@@ -608,13 +613,10 @@ def _get_events_impl(
 
     storage.cleanup_stale_sessions()
 
-    # Determine channel filtering:
-    # - If explicit channel provided, filter to that channel
-    # - Otherwise, return all events (broadcast model)
-    if channel:
-        channels = [channel]
-    else:
-        channels = _get_implicit_channels(session_id)
+    # Broadcast model: with no explicit channel filter, every session sees
+    # every event. Channel is metadata on the event, not a subscription, so
+    # there is nothing implicit to derive from session_id.
+    channels = [channel] if channel else None
 
     raw_events, next_cursor, has_more = storage.get_events(
         cursor=cursor,
@@ -815,29 +817,12 @@ def _compute_signature(payload: bytes, secret: str) -> str:
 
 
 def _webhook_payload(event: Event) -> dict:
-    """The JSON body every webhook receives for an event - a wire contract
-    with external consumers, split out so it is directly assertable. The
-    bridge resolves its wake target from `channel`, filters on
-    `signal_level`, and dedupes spool lines on `event_id`
-    (tests/test_bridge.py pins those keys against THIS function), so
-    removing or renaming a key is a breaking change; additions are
-    additive - consumers read the keys they know."""
-    payload = {
-        "event_id": event.id,
-        "event_type": event.event_type,
-        "payload": event.payload,
-        "session_id": event.session_id,
-        "timestamp": event.timestamp.isoformat(),
-        "channel": event.channel,
-        "correlation_id": event.correlation_id,
-        # Derived level, matching what get_events reports for the same event
-        "signal_level": _get_signal_level(event),
-    }
-    if event.meta:
-        for key in ("title", "tags"):
-            if key in event.meta:
-                payload[key] = event.meta[key]
-    return payload
+    """The JSON body every webhook receives (event id under "event_id").
+
+    Kept as a named function - separate from _event_to_dict - because
+    tests/test_bridge.py pins the delivery contract against THIS name.
+    """
+    return _event_wire_dict(event, id_key="event_id")
 
 
 async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:

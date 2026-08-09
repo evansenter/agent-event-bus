@@ -689,40 +689,27 @@ class SQLiteStorage:
                 except ValueError:
                     since_id = 0  # Malformed cursor, reset to start
 
-            # Build WHERE clause based on cursor
-            if since_id == 0:
-                where_clause = ""
-                params_base: tuple = ()
-            else:
-                where_clause = "WHERE id > ?"
-                params_base = (since_id,)
+            # Build the WHERE clause from whichever filters are present.
+            # Every condition is parameterized; the only interpolated text is
+            # the placeholder run for the IN clauses, whose length comes from
+            # the caller's list, never its contents.
+            conditions: list[str] = []
+            params_base: list = []
 
+            if since_id:
+                conditions.append("id > ?")
+                params_base.append(since_id)
             if channels:
-                placeholders = ",".join("?" * len(channels))
-                channel_filter = f"channel IN ({placeholders})"
-                if where_clause:
-                    where_clause += f" AND {channel_filter}"
-                else:
-                    where_clause = f"WHERE {channel_filter}"
-                params_base = (*params_base, *channels)
-
-            if event_types and len(event_types) > 0:
-                placeholders = ",".join("?" * len(event_types))
-                type_filter = f"event_type IN ({placeholders})"
-                if where_clause:
-                    where_clause += f" AND {type_filter}"
-                else:
-                    where_clause = f"WHERE {type_filter}"
-                params_base = (*params_base, *event_types)
-
+                conditions.append(f"channel IN ({','.join('?' * len(channels))})")
+                params_base.extend(channels)
+            if event_types:
+                conditions.append(f"event_type IN ({','.join('?' * len(event_types))})")
+                params_base.extend(event_types)
             if correlation_id:
-                corr_filter = "correlation_id = ?"
-                if where_clause:
-                    where_clause += f" AND {corr_filter}"
-                else:
-                    where_clause = f"WHERE {corr_filter}"
-                params_base = (*params_base, correlation_id)
+                conditions.append("correlation_id = ?")
+                params_base.append(correlation_id)
 
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             params = (*params_base, limit)
 
             query = f"""

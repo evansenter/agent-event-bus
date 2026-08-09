@@ -3,7 +3,7 @@
 import sqlite3
 from datetime import datetime, timedelta
 
-from agent_event_bus.storage import SESSION_TIMEOUT, Session, SQLiteStorage
+from agent_event_bus.storage import SCHEMA_VERSION, SESSION_TIMEOUT, Session, SQLiteStorage
 
 
 class TestSessionOperations:
@@ -693,6 +693,123 @@ class TestDatabaseInitialization:
         assert version == SCHEMA_VERSION, (
             f"Schema version should be {SCHEMA_VERSION}, got {version}"
         )
+
+
+def _schema_snapshot(db_path) -> dict:
+    """Columns (name → declared type) per table, plus index names per table.
+
+    Column ORDER is deliberately not compared: ALTER TABLE appends, so a
+    migrated database legitimately orders columns differently from a fresh
+    CREATE TABLE. Everything that affects queries is compared.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        snapshot = {}
+        for table in tables:
+            columns = {
+                row[1]: row[2].upper() for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? "
+                    "AND name NOT LIKE 'sqlite_%'",
+                    (table,),
+                )
+            }
+            snapshot[table] = {"columns": columns, "indexes": indexes}
+        return snapshot
+    finally:
+        conn.close()
+
+
+class TestSchemaParity:
+    """A fresh install and a migrated database must end up with ONE schema.
+
+    _init_db creates the current schema for fresh installs while the
+    @migration registry upgrades existing databases incrementally - two
+    independent definitions of the same thing, and _init_db's docstring can
+    only assert they agree. This test is the mechanism behind that assertion:
+    add a column to one path and forget the other, and it fails here rather
+    than as a "no such column" on someone's live bus.
+    """
+
+    def _build_v1_db(self, db_path):
+        """A pre-display_id, pre-webhooks database, as v1 actually shipped."""
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                machine TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                registered_at TIMESTAMP NOT NULL,
+                last_heartbeat TIMESTAMP NOT NULL,
+                client_id TEXT,
+                last_cursor TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'all'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_migrated_v1_matches_fresh_install(self, tmp_path):
+        fresh_path = tmp_path / "fresh.db"
+        SQLiteStorage(db_path=str(fresh_path))
+
+        migrated_path = tmp_path / "migrated.db"
+        self._build_v1_db(migrated_path)
+        SQLiteStorage(db_path=str(migrated_path))
+
+        fresh = _schema_snapshot(fresh_path)
+        migrated = _schema_snapshot(migrated_path)
+
+        assert migrated.keys() == fresh.keys(), (
+            f"Table sets diverged: fresh={sorted(fresh)}, migrated={sorted(migrated)}"
+        )
+        for table in fresh:
+            assert migrated[table]["columns"] == fresh[table]["columns"], (
+                f"Columns diverged on '{table}'. A schema change landed in one of "
+                f"_init_db / the @migration registry but not the other."
+            )
+            assert migrated[table]["indexes"] == fresh[table]["indexes"], (
+                f"Indexes diverged on '{table}'."
+            )
+
+    def test_reopening_is_idempotent(self, tmp_path):
+        """Re-opening an up-to-date database must not re-run or re-alter anything."""
+        db_path = tmp_path / "reopen.db"
+        SQLiteStorage(db_path=str(db_path))
+        first = _schema_snapshot(db_path)
+
+        storage = SQLiteStorage(db_path=str(db_path))
+        assert _schema_snapshot(db_path) == first
+
+        # And exactly one version row survives (earlier versions accumulated rows)
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT version FROM schema_version").fetchall()
+        conn.close()
+        assert rows == [(SCHEMA_VERSION,)]
+        assert storage.session_count() == 0
 
 
 class TestSoftDelete:

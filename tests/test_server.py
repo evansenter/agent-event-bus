@@ -571,28 +571,37 @@ class TestUnregisterSession:
         assert "session_unregistered" in event_types
 
 
-class TestGetImplicitChannels:
-    """Tests for _get_implicit_channels helper."""
+class TestBroadcastModel:
+    """A registered session sees events from every channel, not just its own.
 
-    def test_no_session_id(self):
-        """Test with no session ID."""
-        assert server._get_implicit_channels(None) is None
+    Replaces the old tests for the _get_implicit_channels helper, which only
+    ever returned None. Asserting the observable behavior instead pins the
+    design decision itself (channels are metadata, not subscriptions) rather
+    than one constant-valued helper.
+    """
 
-    def test_nonexistent_session(self):
-        """Test with nonexistent session."""
-        assert server._get_implicit_channels("nonexistent") is None
-
-    def test_broadcast_model_returns_none(self):
-        """Test that broadcast model returns None (no filtering)."""
-        reg = register_session(
-            name="test",
-            machine="my-machine",
-            cwd="/home/user/myrepo",
-        )
+    def test_session_sees_events_from_other_channels(self):
+        reg = register_session(name="test", machine="my-machine", cwd="/home/user/myrepo")
         session_id = reg["session_id"]
+        cursor = reg["cursor"]
 
-        # Broadcast model: always returns None (no filtering)
-        assert server._get_implicit_channels(session_id) is None
+        publish_event(event_type="e", payload="broadcast", channel="all")
+        publish_event(event_type="e", payload="other repo", channel="repo:not-mine")
+        publish_event(event_type="e", payload="someone else's DM", channel="session:stranger")
+
+        result = get_events(cursor=cursor, session_id=session_id, order="asc")
+        payloads = [e["payload"] for e in result["events"]]
+        assert payloads == ["broadcast", "other repo", "someone else's DM"]
+
+    def test_explicit_channel_still_narrows(self):
+        reg = register_session(name="test", machine="my-machine", cwd="/home/user/myrepo")
+        cursor = reg["cursor"]
+
+        publish_event(event_type="e", payload="broadcast", channel="all")
+        publish_event(event_type="e", payload="mine", channel="repo:myrepo")
+
+        result = get_events(cursor=cursor, channel="repo:myrepo", order="asc")
+        assert [e["payload"] for e in result["events"]] == ["mine"]
 
 
 class TestAutoHeartbeat:
