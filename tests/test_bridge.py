@@ -481,6 +481,46 @@ class TestHookFiltering:
         assert start["status"] == 200  # fell through the precheck, delivered
         assert (config.wake_dir / "target-1.jsonl").exists()
 
+    def test_client_disconnect_mid_body_is_a_named_400(self, config):
+        """A peer that aborts mid-body makes request.stream() raise
+        ClientDisconnect (uvicorn delivers http.disconnect); uncaught it
+        500s with a traceback. Every other wire failure returns a named
+        4xx, so this one must too. Driven at the ASGI layer - httpx can't
+        model a half-sent body cleanly."""
+        import asyncio
+
+        app = create_bridge_app(config)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "path": "/hook",
+            "raw_path": b"/hook",
+            "query_string": b"",
+            "headers": [(b"host", b"127.0.0.1:8082"), (b"content-type", b"application/json")],
+        }
+
+        async def drive():
+            sent = []
+            messages = [
+                {"type": "http.request", "body": b'{"partial":', "more_body": True},
+                {"type": "http.disconnect"},
+            ]
+
+            async def receive():
+                return messages.pop(0)
+
+            async def send(message):
+                sent.append(message)
+
+            await app(scope, receive, send)
+            return sent
+
+        sent = asyncio.run(drive())
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert start["status"] == 400
+        assert not (config.wake_dir / "target-1.jsonl").exists()
+
     def test_unserializable_payload_is_a_named_400_not_500(self, config):
         """json.dumps in _spool has the same recursion sibling the
         json.loads arm catches, one screen up - and it runs a few frames
@@ -491,18 +531,23 @@ class TestHookFiltering:
         forcing the encoder failure rather than tuning a fragile
         cross-version depth band."""
         client = TestClient(create_bridge_app(config), base_url=LOOPBACK_BASE, headers=JSON_CT)
-        with patch.object(bridge.Injector, "deliver", side_effect=RecursionError):
+        # _spool re-raises the encoder failure as the dedicated type; process
+        # maps ONLY that (never a post-spool RecursionError) to the 400
+        with patch.object(
+            bridge.Injector, "deliver", side_effect=bridge._UnserializablePayloadError
+        ):
             resp = client.post("/hook", content=json.dumps(make_event()).encode())
         assert resp.status_code == 400
         assert resp.json() == {"error": "invalid JSON"}
 
     def test_spool_serialization_failure_creates_no_file_or_lock(self, config):
-        """_spool serializes BEFORE it opens the file or takes the flock,
-        so a RecursionError out of json.dumps leaves nothing behind - the
-        spool line and lock file must not exist, and no lock is held."""
+        """_spool serializes BEFORE it opens the file or takes the flock, so
+        a json.dumps recursion failure - re-raised as _UnserializablePayloadError
+        so process() maps only the pre-durable case to a 400 - leaves
+        nothing behind: no spool line, no lock file, no held lock."""
         injector = Injector(config)
         with patch.object(bridge.json, "dumps", side_effect=RecursionError):
-            with pytest.raises(RecursionError):
+            with pytest.raises(bridge._UnserializablePayloadError):
                 injector.deliver("target-1", make_event())
         assert not (config.wake_dir / "target-1.jsonl").exists()
         assert not (config.wake_dir / "target-1.lock").exists()
@@ -521,6 +566,19 @@ class TestHookFiltering:
         # The open of the symlinked lock raises ELOOP; deliver does not
         # swallow it (only the /hook path maps spool failures to a status)
         with pytest.raises(OSError):
+            injector.deliver("target-1", make_event())
+        assert not outside.exists()  # never followed through the link
+
+    def test_symlinked_spool_file_is_refused_with_a_clear_message(self, config, tmp_path):
+        """The <sid>.jsonl sibling of the lock symlink takes a different
+        branch: spool_file.resolve() follows the link first, so the
+        containment check fires before O_NOFOLLOW ever runs. The refusal
+        must name the symlink (the id is charset-clean, so the cause is a
+        planted link, not a hostile id) and never follow it."""
+        injector = Injector(config)  # creates + chmods the wake dir
+        outside = tmp_path / "outside-spool"
+        (config.wake_dir / "target-1.jsonl").symlink_to(outside)
+        with pytest.raises(ValueError, match="symlink"):
             injector.deliver("target-1", make_event())
         assert not outside.exists()  # never followed through the link
 
@@ -1104,6 +1162,39 @@ class TestTmuxBackend:
             # The non-ASCII decoy parses and the real pane id is used
             assert injector.deliver("target-1", make_event()) == "tmux"
         assert seen["encoding"] == "utf-8"
+
+    def test_valid_nondict_read_clears_stale_read_keys(self, tmp_path, caplog):
+        """A valid-JSON-but-non-dict read (a list) proves the read AND parse
+        conditions cleared even though the shape is wrong, so it must disarm
+        unparseable/unreadable while it arms not-an-object - otherwise a
+        genuinely-new later read/parse failure demotes to debug behind a
+        stale key, silent at the default level."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            # 1. Unreadable (a directory) -> arms 'unreadable', warns
+            panes.mkdir()
+            injector.deliver("target-1", make_event())
+            assert len(warnings()) == 1
+            # 2. A valid JSON list -> not-an-object arm; the valid parse must
+            # clear the stale 'unreadable' key even though it returns early
+            panes.rmdir()
+            panes.write_text(json.dumps(["not", "a", "dict"]))
+            injector.deliver("target-1", make_event())
+            assert len(warnings()) == 2  # not-an-object, a fresh condition
+            # 3. Unreadable again -> genuinely new; must WARN, not debug
+            # behind a key step 2 should have cleared
+            panes.unlink()
+            panes.mkdir()
+            injector.deliver("target-1", make_event())
+            assert len(warnings()) == 3
 
     def test_persistent_panes_failure_warns_once(self, tmp_path, caplog):
         """A stuck-broken panes.json must not emit one WARNING per DM - and
@@ -1857,6 +1948,18 @@ class TestDaemonLifecycle:
         non_path = BridgeConfig(wake_dir=123)
         with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_WAKE_DIR"):
             create_bridge_app(non_path)
+        # The three string inputs: a non-str bus_url/hook_url raises a bare
+        # AttributeError out of urlsplit; a non-str bind (int) validates as a
+        # bogus 0.0.0.x and fails only later in uvicorn.run - both must be
+        # the named config error instead
+        for kwargs, env in (
+            ({"bus_url": 123}, "AGENT_EVENT_BUS_URL"),
+            ({"hook_url": tmp_path}, "AGENT_EVENT_BUS_BRIDGE_HOOK_URL"),
+            ({"bind": 123, "secret": "s"}, "AGENT_EVENT_BUS_BRIDGE_BIND"),
+        ):
+            bad_str = BridgeConfig(wake_dir=tmp_path / "wake", **kwargs)
+            with pytest.raises(bridge.BridgeConfigError, match=env):
+                create_bridge_app(bad_str)
 
     def test_half_wired_registration_pair_is_rejected(self, config):
         """Passing only one of registration_state/registration_stop would
@@ -2266,6 +2369,39 @@ class TestBindHost:
     def test_loopback_bind_is_accepted_without_secret(self):
         config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "127.0.0.1"]))
         assert bridge.bind_host(config) == "127.0.0.1"
+
+    def test_pinned_bind_differing_loopback_literal_warns(self, caplog):
+        """The missing quadrant member: a PINNED --bind on one loopback
+        literal under a hook URL naming a DIFFERENT same-family loopback
+        literal. Both loopback (quadrant checks quiet), same family (family
+        checks quiet), exposed False (no secret) - yet the bus POSTs where
+        nothing listens. A derived bind can't hit this; a pinned one can."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(
+                bridge.build_parser().parse_args(
+                    ["--bind", "127.0.0.1", "--hook-url", "http://127.0.1.1:8082/hook"]
+                )
+            )
+        assert any("127.0.0.1" in r.message and "127.0.1.1" in r.message for r in caplog.records)
+
+    def test_matching_loopback_literal_is_quiet(self, caplog):
+        """The same loopback literal on both sides is the normal pinned
+        case - no warning. localhost is exempt too (no single literal to
+        compare), which the differing-literal check must not trip on."""
+        import logging
+
+        for bind, hook in (
+            ("127.0.0.1", "http://127.0.0.1:8082/hook"),
+            ("127.0.0.1", "http://localhost:8082/hook"),
+        ):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+                bridge.config_from_args(
+                    bridge.build_parser().parse_args(["--bind", bind, "--hook-url", hook])
+                )
+            assert not any("different loopback" in r.message for r in caplog.records), (bind, hook)
 
     def test_invalid_bind_is_refused(self):
         args = bridge.build_parser().parse_args(["--bind", "localhost:8082"])

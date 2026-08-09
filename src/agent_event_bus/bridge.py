@@ -58,7 +58,7 @@ from pathlib import Path
 import anyio.to_thread
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
@@ -155,6 +155,16 @@ class BridgeConfigError(ValueError):
     a BaseException and would tear through that. config_from_args translates
     it into SystemExit for the CLI path, which keeps main() printing the
     message and exiting without a traceback."""
+
+
+class _UnserializablePayloadError(Exception):
+    """json.dumps hit the recursion limit encoding a pathologically nested
+    payload. Raised out of _spool BEFORE any file is created or lock taken,
+    so process() can map it to a named 400 with a STRUCTURAL guarantee that
+    nothing durable happened - rather than catching a bare RecursionError
+    around all of deliver(), which also runs the tmux steps AFTER the spool
+    line is committed (a 400 there would make the bus retry an event whose
+    line already landed, duplicating it)."""
 
 
 def _now() -> float:
@@ -399,13 +409,26 @@ class Injector:
 
         A serialization failure (RecursionError out of json.dumps on a
         pathologically nested payload - the same recursion sibling the
-        json.loads arms catch, one screen up in process()) is raised BEFORE
-        any file is created or lock taken, and process() maps it to the
-        named 400 every other wire-input path returns. Every OTHER raise
-        here is retry-meaningful: nothing is durably stored, so the bus
-        retry is real (unlike a post-spool error).
+        json.loads arms catch, one screen up in process()) is re-raised as
+        _UnserializablePayloadError BEFORE any file is created or lock taken, and
+        process() maps THAT to the named 400 every other wire-input path
+        returns. Every OTHER raise here is retry-meaningful: nothing is
+        durably stored, so the bus retry is real (unlike a post-spool error).
         """
         spool_file = self.config.wake_dir / f"{session_id}.jsonl"
+        # The id is charset-clean by here (resolve_target_session validated
+        # it), so a containment failure means a SYMLINK was planted in the
+        # wake dir, not a hostile id: name that so an operator runs `ls -l`
+        # on the wake dir instead of hunting a publisher. O_NOFOLLOW on the
+        # open below is the kernel-enforced backstop that catches the same
+        # thing at open time (ELOOP); this is the readable message, and it
+        # never follows the link. A hard raise, not a degrade: a symlink in
+        # the wake dir is local tampering that will not self-heal.
+        if spool_file.is_symlink():
+            raise ValueError(
+                f"Spool file {spool_file} is a symlink (-> {os.readlink(spool_file)!r}); "
+                "refusing to follow it - remove it from the wake dir"
+            )
         # Defense in depth behind resolve_target_session's charset check: a
         # traversal or absolute component in a wire-supplied id must never
         # produce a write outside the wake dir
@@ -415,8 +438,13 @@ class Injector:
         # on a payload nested just under the parse limit (loads and dumps
         # spend their recursion budgets independently, and this call sits a
         # few frames deeper than the loads that admitted the body), and a
-        # failure must create no file and take no lock. process() catches it.
-        line = json.dumps(event) + "\n"
+        # failure must create no file and take no lock. Re-raised as a
+        # dedicated type so process() maps ONLY the pre-durable failure to a
+        # 400 - never a post-spool error from deliver's later tmux steps.
+        try:
+            line = json.dumps(event) + "\n"
+        except RecursionError as e:
+            raise _UnserializablePayloadError from e
         # flock a sibling lock file around the append: flock contends per
         # open file description, so it serializes writers in this process and
         # the drain hook (another process) alike - without it, the drainer's
@@ -555,12 +583,24 @@ class Injector:
                 "unreadable", f"Unreadable panes.json ({e}); treating as unmapped"
             )
             return None
+        # A successful json.loads proves the READ and PARSE conditions
+        # cleared, whatever the shape below is - so clear those two keys
+        # NOW, before the shape check. Otherwise a valid-but-non-dict file
+        # (a JSON list) returns via the not-an-object arm with unparseable /
+        # unreadable still armed from an earlier condition, and a
+        # genuinely-new later parse or read failure demotes to debug -
+        # exactly the outcome the re-arm design exists to prevent. Only the
+        # read/parse keys, NOT not-an-object: that is a SHAPE condition, so
+        # clearing it here would defeat its own warn-once (it would re-warn
+        # every read of a persistently non-dict file).
+        self._warned_panes_keys -= self._PANES_READ_KEYS
         if not isinstance(panes, dict):
             self._warn_panes_once(
                 "not-an-object", "panes.json is not an object; treating as unmapped"
             )
             return None
-        self._disarm_file_keys()  # the FILE parsed - file-level conditions cleared
+        # Shape is a dict too - the last file-level condition clears
+        self._warned_panes_keys.discard("not-an-object")
         # Membership, not .get(): a JSON null value and an absent key both
         # come back None from .get(), and null is the LIKELIEST bad value in
         # practice (panes[sid] = os.environ.get("TMUX_PANE") emits exactly
@@ -597,11 +637,17 @@ class Injector:
         return pane
 
     _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object"})
+    # The subset a successful read+parse clears regardless of the shape it
+    # yields; not-an-object is left out because it tracks the shape, cleared
+    # only when the shape is actually a dict.
+    _PANES_READ_KEYS = frozenset({"unparseable", "unreadable"})
 
     def _disarm_file_keys(self) -> None:
-        """A healthy file read (or the normal missing-file state) clears the
-        file-level conditions - and ONLY those; per-entry keys are cleared
-        by their own session's healthy or absent reads."""
+        """The normal missing-file state clears ALL file-level conditions -
+        a delete-and-recreate is a full clean-state cycle. (A healthy read
+        clears the read/parse keys inline, and not-an-object only when the
+        shape is a dict.) Per-entry keys are cleared by their own session's
+        healthy or absent reads."""
         self._warned_panes_keys -= self._PANES_FILE_KEYS
 
     def _warn_panes_once(self, key: str, message: str) -> None:
@@ -701,6 +747,17 @@ def create_bridge_app(
     (None) bind as loopback. When the host is not loopback-only, set
     assume_exposed=True on the config (opts into the CLI's hard refusal)
     or just set the secret.
+
+    The host also owns the port and any mount prefix, and both are derived
+    from config.port into bridge_hook_url(config) - which is BOTH the URL
+    the lifespan registers on the bus AND the Host allowlist /hook and
+    /health enforce. So set hook_url whenever the hosting server's address,
+    port, or mount path differs from the derived http://127.0.0.1:<port>/hook
+    default: otherwise the bus registers and POSTs to a URL the outer app
+    404s (or nothing listens on), the Host guard rejects the real caller,
+    and /health reports registered:true forever - none of the port/path/
+    quadrant warnings fire, because those live in config_from_args, off the
+    embedding path.
     """
     # A half-wired pair would bind and serve /health but never register,
     # with nothing logged and registered:false forever - the silent failure
@@ -843,15 +900,18 @@ def create_bridge_app(
 
         try:
             action = injector.deliver(target, event)
-        except RecursionError:
+        except _UnserializablePayloadError:
             # json.dumps in _spool has the same non-ValueError recursion
             # sibling the json.loads arm above catches - and it runs a few
             # frames deeper, so a payload nested just under the parse limit
-            # is admitted here and then fails to encode. Deterministic
-            # (all three bus retries would raise identically), so answer
-            # with the named 400 every wire-input path gives, not three
-            # tracebacks. _spool serializes before it locks, so nothing is
-            # stored and no lock is held when this fires.
+            # is admitted here and then fails to encode. Deterministic (all
+            # three bus retries would raise identically), so answer with the
+            # named 400 every wire-input path gives, not three tracebacks.
+            # Catching the DEDICATED type, not a bare RecursionError around
+            # deliver: _spool raises it before it opens/locks anything, so
+            # this 400 structurally cannot fire after a spool line has
+            # landed (which would make the bus retry and duplicate it) - a
+            # RecursionError from deliver's later tmux steps stays a 500.
             return {"error": "invalid JSON"}, 400
         return {"status": "delivered", "action": action, "session_id": target}, 200
 
@@ -916,14 +976,22 @@ def create_bridge_app(
         # Stream with a running count, not request.body(): body() concatenates
         # every chunk unconditionally, so a chunked POST (no content-length to
         # precheck) could make the daemon buffer arbitrarily many bytes before
-        # a post-read check ever ran - the bound must hold WHILE reading
+        # a post-read check ever ran - the bound must hold WHILE reading.
+        # ClientDisconnect (the peer aborts mid-body - uvicorn delivers
+        # http.disconnect) is the one wire-driven path that would otherwise
+        # escape as an unnamed 500 traceback; every sibling failure returns a
+        # named 4xx so the log carries a diagnosis, not a stack. Nothing is
+        # written and no lock is taken, so a 400 is honest.
         chunks: list[bytes] = []
         received = 0
-        async for chunk in request.stream():
-            received += len(chunk)
-            if received > MAX_BODY_BYTES:
-                return JSONResponse({"error": "body too large"}, status_code=413)
-            chunks.append(chunk)
+        try:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > MAX_BODY_BYTES:
+                    return JSONResponse({"error": "body too large"}, status_code=413)
+                chunks.append(chunk)
+        except ClientDisconnect:
+            return JSONResponse({"error": "client disconnected mid-body"}, status_code=400)
         body = b"".join(chunks)
         # Starlette header lookup is case-insensitive, so the canonical-case
         # constant works directly
@@ -1287,6 +1355,19 @@ def validate_config(config: BridgeConfig) -> None:
             f"Invalid wake dir {config.wake_dir!r} "
             "(check --wake-dir / AGENT_EVENT_BUS_WAKE_DIR): expected a filesystem path"
         ) from None
+    # The three string inputs get no numeric coercion, so a hand-built
+    # config carrying a non-str slips through until it raises a bare
+    # AttributeError out of urlsplit (bus_url, hook_url) - or, for bind,
+    # validates as a bogus address (ipaddress.ip_address(123) is 0.0.0.123)
+    # and fails only later inside uvicorn.run. Name them here like every
+    # other config error. Embedder-only: argparse hands strings.
+    for value, label in (
+        (config.bus_url, "--bus-url / AGENT_EVENT_BUS_URL"),
+        (config.hook_url, "--hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL"),
+        (config.bind, "--bind / AGENT_EVENT_BUS_BRIDGE_BIND"),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise BridgeConfigError(f"Invalid value {value!r} (check {label}): expected a string")
 
     # argparse `choices` only guards command-line values, and an embedder
     # skips argparse entirely - an unknown backend would silently mean
@@ -1531,6 +1612,34 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
             f"{hook} advertises loopback - the bus can't reach it; "
             "set --hook-url to an address on the bound interface"
         )
+    # The missing member of the quadrant family: two DIFFERENT loopback
+    # literals of the SAME family. A PINNED --bind 127.0.0.1 under a
+    # 127.0.1.1 hook URL (a 127.0.0.2 alias, ...) is all-loopback so the
+    # checks above stay quiet, same-family so the family checks below stay
+    # quiet, and exposed is False so no secret is demanded - yet the bus
+    # POSTs to an address nothing listens on (ECONNREFUSED every dispatch).
+    # A DERIVED bind can't reach this (bind_host binds the hook's own
+    # literal); only a pinned --bind contradicting the hook can. localhost
+    # is exempt on either side (no single literal to compare); the
+    # cross-family case is left to the family checks below to avoid a
+    # double warning. Warn-don't-refuse like the rest of the family.
+    if _is_host_loopback(bind) and _is_loopback(hook):
+        try:
+            bind_lit = ipaddress.ip_address(bind)
+            hook_lit = ipaddress.ip_address(hook_split.hostname)
+        except ValueError:
+            bind_lit = hook_lit = None  # "localhost" on a side - no literal
+        if (
+            bind_lit is not None
+            and hook_lit is not None
+            and bind_lit.version == hook_lit.version
+            and bind_lit != hook_lit
+        ):
+            logger.warning(
+                f"Listener binds loopback {bind} but the hook URL advertises a "
+                f"different loopback address {hook_split.hostname} - the bus "
+                "can't reach it; align --bind and --hook-url"
+            )
     # Address-family mismatch: 0.0.0.0 binds IPv4 only, so an IPv6 hook
     # literal (a Tailscale IPv6 address, say) is refused at TCP while every
     # quadrant warning above stays quiet - both sides can be non-loopback
