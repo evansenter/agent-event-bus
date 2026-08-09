@@ -477,10 +477,12 @@ That lands with the supervision story.)
   the bus keeps dispatching to the dead address forever. Because that sweep
   can't tell a stale row from a *live peer's*, the CLI takes two flock'd
   singletons at startup (both released on exit): one keyed on the **hook
-  URL** (in a machine- and uid-scoped lock dir under `$XDG_RUNTIME_DIR` or
-  `/tmp`, HOME-independent so a second instance registering the same URL
-  refuses *regardless of wake dir or `$HOME`* - the URL is what the sweep
-  contends on), and one on the **wake dir** (`bridge.singleton.lock` there -
+  URL** (in a machine- and uid-scoped lock dir under `$XDG_RUNTIME_DIR`, else
+  the system temp dir - `$TMPDIR`, or `/tmp` when unset; the dir is
+  create-and-verified private, not adopted - HOME-independent so a second
+  instance registering the same URL refuses *regardless of wake dir or
+  `$HOME`* - the URL is what the sweep contends on), and one on the **wake
+  dir** (`bridge.singleton.lock` there -
   two bridges would otherwise interleave the same spool files). To run two
   bridges at once they need BOTH a distinct hook URL (a different `--port`
   *and* `--hook-url`) and a distinct `--wake-dir`; changing only

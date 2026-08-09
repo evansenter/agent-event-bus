@@ -715,6 +715,21 @@ class TestHookFiltering:
         assert client.get("/health", headers={"Host": "100.100.1.2"}).status_code == 200
         assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
 
+    def test_ipv6_bind_address_normalized_in_allowlist(self, tmp_path):
+        """The bind address is stored NORMALIZED (str(ip_address)), so an
+        uppercase or expanded IPv6 --bind still matches the lowercase,
+        compressed Host a probe sends - the tailnet case the bind-address
+        allowlisting exists for (a raw-string compare would 421 it)."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            bind="FD7A:115C:A1E0::1",  # uppercase; a probe sends lowercase
+            hook_url="http://host.tailnet.example:8082/hook",
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config))
+        for host in ("[fd7a:115c:a1e0::1]:8082", "[fd7a:115c:a1e0::1]"):
+            assert client.get("/health", headers={"Host": host}).status_code == 200, host
+
     def test_oversized_body_rejected(self, client):
         """The body must be read before the HMAC can be checked, so bound
         what an unauthenticated peer can make the bridge buffer."""
@@ -2684,6 +2699,31 @@ class TestBindHost:
         fresh = BridgeConfig(wake_dir=tmp_path / "w2", hook_url=clash_url, secret="s")
         for fd in bridge._acquire_singleton_locks(fresh):
             os.close(fd)
+
+    def test_lock_dir_symlink_is_refused(self, tmp_path, monkeypatch):
+        """The hook-lock dir sits at a guessable path under a possibly-shared
+        temp dir, so it is create-and-verified, not adopted: a symlink
+        planted there fails closed with a named SystemExit (lstat, not stat),
+        never chmod'd or written through."""
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        link = tmp_path / "planted-lockdir"
+        link.symlink_to(victim)
+        monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", link)
+        with pytest.raises(SystemExit, match="not a directory"):
+            bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "wake"))
+        assert not list(victim.iterdir())  # nothing written through the link
+
+    def test_lock_dir_group_accessible_is_refused(self, tmp_path, monkeypatch):
+        """A pre-planted lock dir we own but that is group/world-accessible
+        must be refused, not silently used - the same posture as the wake
+        dir's 0o700."""
+        loose = tmp_path / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o777)  # mkdir mode is umask-masked; force it wide
+        monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", loose)
+        with pytest.raises(SystemExit, match="group/world-accessible"):
+            bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "wake"))
 
     def test_main_refuses_and_never_sweeps_when_singleton_held(self, monkeypatch, tmp_path):
         """Pins the acquisition AND its ordering: with the lock already held,

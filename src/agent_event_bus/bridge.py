@@ -44,6 +44,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -85,11 +86,13 @@ DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wa
 # same URL - a Path.home()-based path only contends within one HOME, so the
 # same uid under two HOMEs (a systemd unit vs a login shell) would both
 # acquire and both sweep. XDG_RUNTIME_DIR (per-user tmpfs) when set, else the
-# system temp dir; the uid-named subdir makes it HOME-independent and keeps a
-# shared /tmp safe (we own it, 0o700). Cross-USER on one loopback bus (a
-# different uid reaching the same bus, which the loopback-trusting auth
-# allows) stays out of scope for v1 - a different uid gets a different dir -
-# and is called out in the guide.
+# system temp dir (tempfile.gettempdir() - $TMPDIR/$TEMP/$TMP, else /tmp;
+# macOS resolves this to a per-user /var/folders/.../T). The uid-named subdir
+# makes it HOME-independent; on a box that falls back to a SHARED temp dir the
+# dir is create-and-VERIFIED before use (_ensure_private_lock_dir), not
+# adopted. Cross-USER on one loopback bus (a different uid reaching the same
+# bus, which the loopback-trusting auth allows) stays out of scope for v1 - a
+# different uid gets a different dir - and is called out in the guide.
 DEFAULT_LOCK_DIR = (
     Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
     / f"agent-event-bus-bridge-{os.getuid()}"
@@ -811,10 +814,15 @@ def create_bridge_app(
         allowed_hook_hosts.add(hook_host)
     bind = bind_host(config)
     try:
+        bind_ip = ipaddress.ip_address(bind)
         # Skip the wildcards (0.0.0.0 / ::): nobody probes an unspecified
-        # address, and "localhost" is already covered above.
-        if not ipaddress.ip_address(bind).is_unspecified:
-            allowed_hook_hosts.add(bind)
+        # address, and "localhost" is already covered above. Store the
+        # NORMALIZED form - str(ip_address) renders IPv6 lowercase and
+        # compressed, exactly what _host_from_header yields - so an uppercase
+        # or expanded --bind (FE80::1, 0:0:0:0:0:0:0:1) still matches the
+        # Host a probe sends. IPv4 is unaffected.
+        if not bind_ip.is_unspecified:
+            allowed_hook_hosts.add(str(bind_ip))
     except ValueError:
         pass  # "localhost" - already present; the resolver decides its family
     # Version-skew line bound (a closure cell: the arm lives in process(),
@@ -1763,16 +1771,65 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     return config
 
 
+def _ensure_private_lock_dir(path: Path) -> None:
+    """Create `path` as a private (0o700) directory this process owns, or
+    SystemExit with a named message - create-and-VERIFY, not adopt. The
+    hook-lock dir sits at a uid-derived, guessable name under
+    tempfile.gettempdir(); on a box without XDG_RUNTIME_DIR that resolves to
+    a SHARED temp dir (containers, cron, launchd, su/sudo, any login without
+    pam_systemd), where a local user can pre-plant it. mkdir(exist_ok)+chmod
+    would then either EPERM into a bare traceback (foreign-owned) or
+    silently narrow-and-write-through (a symlink). This is the
+    directory-level counterpart of the O_NOFOLLOW that already guards the
+    lock FILE. lstat (not stat) so a symlink fails closed. Only the hook-lock
+    dir is routed here; the wake dir is Injector.__init__'s job."""
+    try:
+        os.mkdir(path, 0o700)
+        return  # we just created it - unambiguously ours
+    except FileExistsError:
+        pass
+    except OSError as e:
+        # read-only/full temp dir, a missing XDG_RUNTIME_DIR parent, ... -
+        # a named message, not the bare traceback every other config-time
+        # failure in this module avoids
+        raise SystemExit(
+            f"Cannot create bridge lock dir {path} ({e}); set XDG_RUNTIME_DIR "
+            "to a writable per-user directory."
+        ) from None
+    info = os.lstat(path)  # lstat: a symlink must NOT be followed here
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(
+            f"Bridge lock path {path} is not a directory (a symlink or file is "
+            "planted there); refusing to use it. Remove it, or set XDG_RUNTIME_DIR."
+        )
+    if info.st_uid != os.getuid():
+        raise SystemExit(
+            f"Bridge lock dir {path} is owned by uid {info.st_uid}, not this "
+            f"process ({os.getuid()}); refusing to use it. Remove it, or set "
+            "XDG_RUNTIME_DIR to a per-user directory."
+        )
+    if info.st_mode & 0o077:
+        raise SystemExit(
+            f"Bridge lock dir {path} is group/world-accessible "
+            f"(mode {oct(info.st_mode & 0o777)}); refusing to use it. "
+            "chmod 700 it, or set XDG_RUNTIME_DIR."
+        )
+
+
 def _flock_or_exit(lock_path: Path, conflict_message: str) -> int:
     """Take an exclusive, non-blocking advisory flock on lock_path, or
     SystemExit(conflict_message) if another holder has it. Returns the held
     fd - the caller keeps it for the process's lifetime (the lock releases
-    when the fd closes). O_NOFOLLOW so a symlink planted at the path is not
-    followed; the parent dir is created 0o700 first (both lock homes hold no
-    payload, but private is the right default)."""
+    when the fd closes). O_NOFOLLOW so a symlink planted at the FILE is not
+    followed (the hook-lock DIR is verified by _ensure_private_lock_dir; the
+    wake dir is Injector's). A failed open becomes a named SystemExit rather
+    than the bare traceback every other failure here avoids (e.g. EACCES on
+    a foreign lock file, ELOOP on a symlinked one)."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.parent.chmod(0o700)
-    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise SystemExit(f"Cannot open bridge lock {lock_path} ({e})") from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1805,6 +1862,7 @@ def _acquire_singleton_locks(config: BridgeConfig) -> list[int]:
     <session_id>.lock spool file (the id charset forbids ".")."""
     hook = bridge_hook_url(config)
     digest = hashlib.sha256(hook.encode()).hexdigest()[:16]
+    _ensure_private_lock_dir(DEFAULT_LOCK_DIR)  # create-and-verify, not adopt
     hook_lock = DEFAULT_LOCK_DIR / f"hook.{digest}.lock"
     wake_lock = config.wake_dir / "bridge.singleton.lock"
     specs = [
