@@ -421,7 +421,18 @@ class Injector:
             # shared path, and the documented manual workflows invite a
             # later chmod on it. Create-time only; the append path pays
             # nothing once the file exists.
-            return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a")
+            # encoding="utf-8" explicitly: fdopen(..., "a") otherwise picks
+            # the locale codec (ASCII under a C-locale daemon), and the
+            # spool line is a UTF-8-JSON cross-process contract the drain
+            # hook reads. Safe today only because json.dumps defaults to
+            # ensure_ascii=True; pinning it here keeps a later
+            # ensure_ascii=False from raising UnicodeEncodeError mid-append
+            # under the held flock, 500ing an already-committed delivery.
+            return os.fdopen(
+                os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+                "a",
+                encoding="utf-8",
+            )
 
         def _append() -> None:
             with _open_append_0600(lock_file) as lock_fd:
@@ -471,7 +482,14 @@ class Injector:
         """
         panes_file = self.config.wake_dir / "panes.json"
         try:
-            panes = json.loads(panes_file.read_text())
+            # encoding="utf-8" explicitly, NOT the locale codec read_text()
+            # defaults to: a supervisor hands the daemon no LC_ALL/LANG,
+            # glibc resolves the C locale, and the default codec becomes
+            # ASCII - a healthy panes.json with any byte >0x7f would then
+            # raise UnicodeDecodeError and wrongly route into the
+            # unparseable arm, leaving every session on the box permanently
+            # spool-unmapped. The writer contract (guide) says UTF-8.
+            panes = json.loads(panes_file.read_text(encoding="utf-8"))
         except FileNotFoundError:
             # A missing file IS this session's absent read: clear the
             # file-level keys AND this session's entry key, matching the
@@ -831,9 +849,15 @@ def create_bridge_app(
                 {"error": f"Content-Type must be {WEBHOOK_CONTENT_TYPE}"}, status_code=415
             )
         # Precheck the honest case cheaply; the streamed count below covers
-        # a missing or lying content-length (e.g. chunked encoding)
+        # a missing or lying content-length (e.g. chunked encoding).
+        # isdecimal(), NOT isdigit(): isdigit() is True for compatibility
+        # digits int() rejects (U+00B2 superscript two, which is exactly
+        # latin-1 byte 0xB2 - and Starlette decodes headers as latin-1), so
+        # an isdigit()+int() pair would 500 on a header value that h11
+        # rejects for the CLI but a mounting app might pass through.
+        # isdecimal() matches what int() actually accepts.
         content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        if content_length and content_length.isdecimal() and int(content_length) > MAX_BODY_BYTES:
             return JSONResponse({"error": "body too large"}, status_code=413)
         # Stream with a running count, not request.body(): body() concatenates
         # every chunk unconditionally, so a chunked POST (no content-length to

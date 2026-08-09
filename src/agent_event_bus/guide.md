@@ -350,7 +350,9 @@ That lands with the supervision story.)
   `signal_level` is always `actionable` on a spooled line by construction
   (the bridge filters before spooling), so a hook need not re-check it -
   and pass-through means bus-side payload additions appear additively:
-  read the keys you know, ignore the rest. Drain contract:
+  read the keys you know, ignore the rest. Each line is UTF-8 JSON
+  (`json.dumps`, one object per line); read it as UTF-8, not the drain
+  hook's locale codec. Drain contract:
   1. Take an exclusive `flock` on `<sid>.lock`. The bridge holds the same
      flock around every append, so the rename below can't slip between the
      bridge's open and its flush (an fd follows the inode, not the name -
@@ -426,7 +428,10 @@ That lands with the supervision story.)
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
   session-side must maintain; unmapped sessions just spool. The writer's
   contract matters as much as the drainer's: write atomically (temp file in
-  the same directory + `os.replace`) and serialize the read-modify-write
+  the same directory + `os.replace`), write UTF-8 (the bridge reads it as
+  UTF-8, not its locale codec - a supervisor-launched daemon often runs
+  under the C locale, where a bytewise-different codec would misread any
+  non-ASCII), and serialize the read-modify-write
   under an flock on a sibling `panes.lock` - concurrent SessionStart hooks
   otherwise silently lose entries (the loser reads as absent, the
   documented *normal* outcome, so nothing errors on either side), and a

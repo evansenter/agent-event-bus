@@ -433,6 +433,54 @@ class TestHookFiltering:
         # bus retries behind it.
         assert client.post("/hook", content=b"[" * 300_000).status_code == 400
 
+    def test_isdigit_but_not_int_content_length_does_not_500(self, config):
+        """The precheck guards int() with a digit test - and it must be
+        isdecimal(), not isdigit(): U+00B2 (superscript two) is isdigit()
+        True but int() ValueError, and it is exactly latin-1 byte 0xB2,
+        the encoding Starlette decodes headers in. h11 rejects it for the
+        CLI, so this drives the ASGI app directly the way a mounting app
+        (the advertised embedding surface) that passed the header through
+        would - it must fall to the streamed count, not 500."""
+        import asyncio
+
+        app = create_bridge_app(config)
+        body = json.dumps(make_event()).encode()
+        # Raw ASGI headers are bytes; Starlette decodes them latin-1, so
+        # b"\xb2" surfaces as "\xb2" - isdigit() True, int() ValueError
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "path": "/hook",
+            "raw_path": b"/hook",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"127.0.0.1:8082"),
+                (b"content-type", b"application/json"),
+                (b"content-length", b"\xb2"),
+            ],
+        }
+
+        async def drive():
+            sent = []
+            chunks = [
+                {"type": "http.request", "body": body, "more_body": False},
+            ]
+
+            async def receive():
+                return chunks.pop(0)
+
+            async def send(message):
+                sent.append(message)
+
+            await app(scope, receive, send)
+            return sent
+
+        sent = asyncio.run(drive())
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert start["status"] == 200  # fell through the precheck, delivered
+        assert (config.wake_dir / "target-1.jsonl").exists()
+
     def test_browser_shaped_post_is_rejected(self, config):
         """The loopback-needs-no-secret posture holds only if a browser
         cannot reach the handler: fetch(mode:"no-cors") from any web page
@@ -976,6 +1024,33 @@ class TestTmuxBackend:
             with patch.object(bridge.subprocess, "run") as mock_run:
                 assert injector.deliver("target-1", make_event()) == "spool-unmapped"
             mock_run.assert_not_called()
+
+    def test_panes_json_is_read_as_utf8_not_locale_codec(self, tmp_path, monkeypatch):
+        """read_text() with no encoding uses the locale codec, which a
+        supervisor-launched daemon (launchd/systemd hand no LANG) resolves
+        to ASCII - a HEALTHY panes.json with any byte >0x7f would then
+        UnicodeDecodeError and wrongly route into the 'unparseable' arm,
+        leaving every session on the box permanently spool-unmapped. The
+        C-locale failure can't be reproduced under this suite's UTF-8
+        locale, so pin the contract directly: the read must ask for utf-8.
+        A non-ASCII decoy value round-trips to prove the parse is real."""
+        injector, config = make_tmux_injector(tmp_path)
+        (config.wake_dir / "panes.json").write_text(
+            json.dumps({"target-1": "%0", "_note": "café"}), encoding="utf-8"
+        )
+        seen = {}
+        real_read_text = bridge.Path.read_text
+
+        def capture(self, *args, **kwargs):
+            if self.name == "panes.json":
+                seen["encoding"] = kwargs.get("encoding")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(bridge.Path, "read_text", capture)
+        with patch.object(bridge.subprocess, "run", tmux_ok):
+            # The non-ASCII decoy parses and the real pane id is used
+            assert injector.deliver("target-1", make_event()) == "tmux"
+        assert seen["encoding"] == "utf-8"
 
     def test_persistent_panes_failure_warns_once(self, tmp_path, caplog):
         """A stuck-broken panes.json must not emit one WARNING per DM - and
