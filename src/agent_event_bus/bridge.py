@@ -43,6 +43,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -213,6 +214,11 @@ class Injector:
         # torn write varies its parse position per read), for the warn-once
         # guard below
         self._last_panes_warn_reason: str | None = None
+        # Same idea for tmux wake failures, its own slot (the conditions
+        # are independent): a missing/broken tmux binary fails every wake
+        # with the same exception type forever, and per-DM WARNING for a
+        # stuck local condition is the volume shape bounded everywhere else
+        self._last_wake_fail_reason: str | None = None
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event. The dir is
@@ -338,7 +344,20 @@ class Injector:
         # rename could slip between our open and our flush and the line would
         # land in a file the drainer already read (and will delete)
         lock_file = self.config.wake_dir / f"{session_id}.lock"
-        with lock_file.open("a") as lock_fd:
+        try:
+            lock_handle = lock_file.open("a")
+        except FileNotFoundError:
+            # The wake dir can vanish at runtime - hand-clearing spools is
+            # the documented interim workflow while pruning is a follow-up -
+            # and without recovery every later delivery 500s until restart
+            # (bus retries exhausted, wakes lost, /health still green).
+            # Recreate once and retry, keeping mkdir/chmod off the happy
+            # path; the resolve() check above already ran, so this cannot
+            # widen the path-safety surface.
+            self.config.wake_dir.mkdir(parents=True, exist_ok=True)
+            self.config.wake_dir.chmod(0o700)
+            lock_handle = lock_file.open("a")
+        with lock_handle as lock_fd:
             for _ in range(SPOOL_LOCK_ATTEMPTS):
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -449,13 +468,23 @@ class Injector:
                 timeout=TMUX_TIMEOUT,
             )
             logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
+            self._last_wake_fail_reason = None  # a working tmux re-arms
             return True
         except (subprocess.SubprocessError, OSError) as e:
             # SubprocessError covers CalledProcessError/TimeoutExpired;
             # OSError covers a missing or non-executable tmux binary. An
             # exception escaping here would 500 the webhook and make the bus
-            # retry an event that is already durably spooled (duplicate lines)
-            logger.warning(f"tmux wake failed for {session_id[:8]}... ({e}); spooled only")
+            # retry an event that is already durably spooled (duplicate
+            # lines). Bounded like the panes guard - keyed on the exception
+            # TYPE, so a persistent condition (tmux gone) warns once and
+            # then debugs, while a different failure type warns fresh.
+            reason = type(e).__name__
+            message = f"tmux wake failed for {session_id[:8]}... ({e}); spooled only"
+            if reason == self._last_wake_fail_reason:
+                logger.debug(message)
+            else:
+                self._last_wake_fail_reason = reason
+                logger.warning(message)
             return False
 
 
@@ -899,6 +928,15 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         raise SystemExit(
             f"Invalid backend {args.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
             "expected 'spool' or 'tmux'"
+        )
+    # Preflight the binary: a tmux backend on a box without tmux would
+    # degrade every wake to spool-tmux-failed for the daemon's lifetime -
+    # one startup message beats discovering it per-DM. A tmux that breaks
+    # LATER is still handled (and bounded) by the wake-failure guard.
+    if args.backend == "tmux" and shutil.which("tmux") is None:
+        raise SystemExit(
+            "Backend is tmux but no tmux binary is on PATH "
+            "(check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
         )
     config = BridgeConfig(
         bus_url=args.bus_url,

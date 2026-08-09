@@ -554,6 +554,20 @@ class TestInjectorCooldown:
         assert not blocked.is_alive()
         assert a_result == ["spool"]  # a completes once its lock frees
 
+    def test_wake_dir_removed_at_runtime_self_heals(self, config):
+        """Hand-clearing the wake dir is the documented interim workflow
+        while pruning is a follow-up - a delivery after an rm -rf must
+        recreate it (privately) and spool, not 500 on every event until
+        someone restarts the bridge."""
+        import shutil
+
+        injector = Injector(config)
+        injector.deliver("target-1", make_event())
+        shutil.rmtree(config.wake_dir)
+        assert injector.deliver("target-1", make_event()) == "spool"
+        assert (config.wake_dir / "target-1.jsonl").exists()
+        assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
+
     def test_wake_dir_is_private(self, config):
         Injector(config).deliver("target-1", make_event())
         assert (config.wake_dir.stat().st_mode & 0o777) == 0o700
@@ -639,6 +653,39 @@ class TestTmuxBackend:
 
         with patch.object(bridge.subprocess, "run", tmux_perm):
             assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
+
+    def test_persistent_tmux_failure_warns_once(self, tmp_path, caplog):
+        """A missing or broken tmux binary fails every wake with the same
+        exception type forever - the last unbounded per-DM WARNING for a
+        stuck local condition. First sighting warns, same-type repeats are
+        debug, a different failure type warns fresh, and a successful wake
+        re-arms the guard."""
+        import logging
+
+        injector, _ = make_tmux_injector(tmp_path, cooldown=0.0)
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(
+                bridge.subprocess, "run", side_effect=PermissionError("tmux not executable")
+            ):
+                injector.deliver("target-1", make_event())
+                injector.deliver("target-1", make_event())
+            assert len(warnings()) == 1  # same-type repeat was debug
+            with patch.object(
+                bridge.subprocess,
+                "run",
+                side_effect=bridge.subprocess.CalledProcessError(1, ["tmux"]),
+            ):
+                injector.deliver("target-1", make_event())  # new type - warns
+            assert len(warnings()) == 2
+            with patch.object(bridge.subprocess, "run", tmux_ok):
+                assert injector.deliver("target-1", make_event()) == "tmux"  # re-arms
+            with patch.object(bridge.subprocess, "run", side_effect=PermissionError("again")):
+                injector.deliver("target-1", make_event())
+        assert len(warnings()) == 3
 
     def test_malformed_panes_json_degrades_to_spool(self, tmp_path):
         """panes.json is maintained by an external component - every failure
@@ -1254,8 +1301,20 @@ class TestEnvValidation:
 
     def test_env_backend_tmux_is_accepted(self, monkeypatch):
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmux")
+        # The preflight consults the real PATH; this test is about env
+        # parsing, not about tmux being installed on the test box
+        monkeypatch.setattr(bridge.shutil, "which", lambda _: "/usr/bin/tmux")
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert config.backend == "tmux"
+
+    def test_tmux_backend_without_binary_is_refused(self, monkeypatch):
+        """A tmux backend on a box without tmux would degrade every wake to
+        spool-tmux-failed for the daemon's lifetime - one named startup
+        error beats discovering it per-DM."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmux")
+        monkeypatch.setattr(bridge.shutil, "which", lambda _: None)
+        with pytest.raises(SystemExit, match="tmux binary"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
 
     def test_empty_backend_and_bus_url_env_fall_back_to_defaults(self, monkeypatch):
         """The last two env vars without the `or DEFAULT` normalization: an
