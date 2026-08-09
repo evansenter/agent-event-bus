@@ -399,7 +399,15 @@ That lands with the supervision story.)
   fresh inode and mutual exclusion is silently gone.
 - **tmux**: additionally runs `tmux send-keys` into the session's pane, using
   the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
-  session-side must maintain; unmapped sessions just spool. Requires a tmux
+  session-side must maintain; unmapped sessions just spool. The writer's
+  contract matters as much as the drainer's: write atomically (temp file in
+  the same directory + `os.replace`) and serialize the read-modify-write
+  under an flock on a sibling `panes.lock` - concurrent SessionStart hooks
+  otherwise silently lose entries (the loser reads as absent, the
+  documented *normal* outcome, so nothing errors on either side), and a
+  non-atomic in-place write produces the torn read the bridge degrades on.
+  A broken writer never surfaces as an error - only as wakes that quietly
+  never happen. Requires a tmux
   binary on the daemon's PATH at startup - the bridge REFUSES TO START
   otherwise, and the check is PATH-sensitive: a supervisor's minimal PATH
   (launchd defaults to `/usr/bin:/bin:/usr/sbin:/sbin`) can hide a Homebrew
