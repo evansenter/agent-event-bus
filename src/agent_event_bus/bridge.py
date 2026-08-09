@@ -233,7 +233,7 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
 # a hostile publisher, not a legitimate own registration. Loosening the
 # pattern is not the fix (the id still becomes a filename); validating
 # client_id bus-side at registration is, and belongs in its own change.
-# Same dead end round 26 documented for display_id, reached from the
+# Same dead end already documented for display_id, reached from the
 # client_id side.
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -711,7 +711,7 @@ class Injector:
             logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
             # A working wake re-arms THIS session's failure conditions only -
             # clearing globally would oscillate a broken session's warning
-            # under interleaved healthy deliveries (the round-38 shape).
+            # under interleaved healthy deliveries.
             # Under the lock: the comprehension iterates the set, and a
             # concurrent delivery's add would otherwise raise RuntimeError
             # out of the one method whose exceptions must never 500 the
@@ -811,7 +811,15 @@ def create_bridge_app(
     hook_host = urllib.parse.urlsplit(bridge_hook_url(config)).hostname
     allowed_hook_hosts = {"127.0.0.1", "localhost", "::1"}
     if hook_host:
-        allowed_hook_hosts.add(hook_host)
+        # Normalize an IPv6 literal the same way the bind address is below:
+        # urlsplit lowercases and de-brackets but does NOT compress, so an
+        # expanded hook-URL literal ([FD7A:...:0:0:0:0:1]) would otherwise
+        # miss the compressed Host a probe sends. A hostname compares
+        # verbatim (urlsplit already lowercased it).
+        try:
+            allowed_hook_hosts.add(str(ipaddress.ip_address(hook_host)))
+        except ValueError:
+            allowed_hook_hosts.add(hook_host)
     bind = bind_host(config)
     try:
         bind_ip = ipaddress.ip_address(bind)
@@ -1086,7 +1094,7 @@ class _HostAllowlistMiddleware:
     never applies and the request reaches us - but the browser fills Host
     from the page's URL, so a rebound request never carries a loopback
     literal or the hook URL host the bus was told to POST to. Enforcing this
-    inside the endpoints (the round-57 shape) left GET /hook -> 405 and
+    inside the endpoints (per-route) left GET /hook -> 405 and
     /anything -> 404 answerable BEFORE the endpoint ran, and 405-vs-404 still
     confirms a bridge is here - the exact existence signal extending the
     guard to /health was meant to deny. As middleware it runs before the
@@ -1153,8 +1161,8 @@ def bind_host(config: BridgeConfig) -> str:
     loopback hook URL (the local bus is the sole caller), else all
     interfaces. validate_config requires the HMAC secret whenever the
     effective bind OR the hook URL is non-loopback - on every path, not
-    just the CLI (the refusal moved there in round 41 so it travels with a
-    hand-built config onto the embedding paths)."""
+    just the CLI (the refusal lives here so it travels with a hand-built
+    config onto the embedding paths, not only through argparse)."""
     if config.bind:
         return config.bind
     hook_host = urllib.parse.urlsplit(bridge_hook_url(config)).hostname

@@ -730,6 +730,20 @@ class TestHookFiltering:
         for host in ("[fd7a:115c:a1e0::1]:8082", "[fd7a:115c:a1e0::1]"):
             assert client.get("/health", headers={"Host": host}).status_code == 200, host
 
+    def test_ipv6_hook_host_normalized_in_allowlist(self, tmp_path):
+        """Same normalization on the hook side: an EXPANDED IPv6 hook-URL
+        literal must still match the compressed Host a probe (or curl to the
+        hook hostname) sends - urlsplit lowercases but does not compress."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://[FD7A:115C:A1E0:0:0:0:0:1]:8082/hook",  # expanded
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config))
+        assert (
+            client.get("/health", headers={"Host": "[fd7a:115c:a1e0::1]:8082"}).status_code == 200
+        )
+
     def test_oversized_body_rejected(self, client):
         """The body must be read before the HMAC can be checked, so bound
         what an unauthenticated peer can make the bridge buffer."""
@@ -1156,7 +1170,7 @@ class TestTmuxBackend:
         assert len(warnings()) == 3
 
     def test_wake_failure_bound_is_per_session(self, tmp_path, caplog):
-        """The round-38 panes lesson applies here too: the bound must key
+        """The panes-guard lesson applies here too: the bound must key
         per (session, exception type). A second broken session must WARN
         rather than be demoted behind the first's key, and a healthy
         session's success must not re-arm a broken one into warn-per-DM."""
@@ -1412,7 +1426,7 @@ class TestTmuxBackend:
         assert len(warnings()) == 1  # neither absent nor healthy reads re-armed it
 
     def test_warn_key_caps_bound_both_sets(self, tmp_path, caplog, monkeypatch):
-        """The round-47 retention caps are load-bearing: without a pin a
+        """The warn-key retention caps are load-bearing: without a pin a
         refactor could delete the clear, flip the comparison, or clear the
         WRONG set (the two sit a screen apart under different locking).
         Cap at 2, drive three distinct conditions per set, assert the bound
@@ -2217,7 +2231,7 @@ class TestHookUrlTopology:
         URL verbatim, so on the embedding path it would register cleanly
         and then fail every dispatch bus-side (httpx.InvalidURL) with
         /health green: the silent-inertness shape the scheme refusal
-        closed in round 7. The refusal must live in validate_config so
+        already closes. The refusal must live in validate_config so
         embedders get the same named error as the CLI."""
         config = BridgeConfig(
             wake_dir=tmp_path / "wake",
@@ -2426,7 +2440,7 @@ class TestBindHost:
     def test_non_loopback_bind_without_secret_is_refused(self, monkeypatch):
         """--bind decides exposure before the hook URL does: a wide bind
         with the default local bus must not open an unsigned /hook off-box
-        (the round-6 refusal, reachable through the round-7 flag)."""
+        (the exposure refusal, reachable through the --bind flag)."""
         for bind in ("0.0.0.0", "100.100.1.2"):
             args = bridge.build_parser().parse_args(["--bind", bind])
             with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
@@ -2724,6 +2738,29 @@ class TestBindHost:
         monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", loose)
         with pytest.raises(SystemExit, match="group/world-accessible"):
             bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "wake"))
+
+    def test_uncreatable_lock_dir_is_a_named_exit(self, tmp_path, monkeypatch):
+        """The create arm of _ensure_private_lock_dir: an os.mkdir that
+        cannot succeed (here a parent that is a regular file -> NotADirectory)
+        must surface as the named 'set XDG_RUNTIME_DIR' message, not a bare
+        traceback at the operator's first contact with the daemon."""
+        (tmp_path / "afile").write_text("x")
+        monkeypatch.setattr(bridge, "DEFAULT_LOCK_DIR", tmp_path / "afile" / "locks")
+        with pytest.raises(SystemExit, match="Cannot create bridge lock dir"):
+            bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "wake"))
+
+    def test_symlinked_singleton_lock_is_a_named_exit(self, tmp_path):
+        """The os.open arm of _flock_or_exit: a symlinked singleton lock FILE
+        must fail O_NOFOLLOW (ELOOP) into the named 'Cannot open bridge lock'
+        message, and the link target must never be created through it. Driven
+        on the wake-dir lock, reachable without touching DEFAULT_LOCK_DIR."""
+        wake = tmp_path / "wake"
+        wake.mkdir()
+        victim = tmp_path / "victim"
+        (wake / "bridge.singleton.lock").symlink_to(victim)
+        with pytest.raises(SystemExit, match="Cannot open bridge lock"):
+            bridge._acquire_singleton_locks(BridgeConfig(wake_dir=wake))
+        assert not victim.exists()  # O_NOFOLLOW: never created through the link
 
     def test_main_refuses_and_never_sweeps_when_singleton_held(self, monkeypatch, tmp_path):
         """Pins the acquisition AND its ordering: with the lock already held,
