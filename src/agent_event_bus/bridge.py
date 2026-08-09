@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -78,9 +79,21 @@ logger = logging.getLogger("agent-event-bus-bridge")
 DEFAULT_BRIDGE_PORT = 8082
 DEFAULT_COOLDOWN_SECONDS = 30.0
 DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wake"
-# Fixed home for the hook-URL singleton lock, independent of --wake-dir (two
-# bridges with different wake dirs but the same hook URL must still contend).
-DEFAULT_LOCK_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "bridge-locks"
+# Home for the hook-URL singleton lock. MACHINE-scoped and uid-scoped, NOT
+# HOME-anchored: the webhook row it guards is global to the bus, so the lock
+# must contend for every process on this machine that could register the
+# same URL - a Path.home()-based path only contends within one HOME, so the
+# same uid under two HOMEs (a systemd unit vs a login shell) would both
+# acquire and both sweep. XDG_RUNTIME_DIR (per-user tmpfs) when set, else the
+# system temp dir; the uid-named subdir makes it HOME-independent and keeps a
+# shared /tmp safe (we own it, 0o700). Cross-USER on one loopback bus (a
+# different uid reaching the same bus, which the loopback-trusting auth
+# allows) stays out of scope for v1 - a different uid gets a different dir -
+# and is called out in the guide.
+DEFAULT_LOCK_DIR = (
+    Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    / f"agent-event-bus-bridge-{os.getuid()}"
+)
 
 # tmux send-keys is bounded like the notifier subprocesses in helpers.py -
 # a hung tmux must not wedge the bridge. Sized under the bus's
@@ -1780,23 +1793,22 @@ def _acquire_singleton_locks(config: BridgeConfig) -> list[int]:
       leaving the running bridge listening, reporting registered:true, and
       deaf. This is keyed on the hook URL (not the wake dir) because that is
       what the sweep contends on: two instances with different --wake-dir
-      and the same port still collide. The lock lives in a FIXED dir
-      independent of --wake-dir, keyed by a hash of the URL and the uid (so
-      a different user's same-URL lock - which they couldn't open under
-      0o600 anyway - never blocks this one).
+      and the same port still collide. The lock lives in DEFAULT_LOCK_DIR
+      (machine + uid scoped, HOME-independent - see its definition).
     - WAKE DIR: two bridges sharing a wake dir would interleave spool and
       lock files regardless of their hook URLs.
 
-    Returns the held fds (both kept for the process's lifetime). CLI-only:
-    embedders own their process model. Each lock name carries a "." so it
-    can never collide with a <session_id>.lock spool file (the id charset
-    forbids ".")."""
+    Acquired SEQUENTIALLY with cleanup: if the second lock refuses, the
+    first is closed before the SystemExit propagates. Returned fds are kept
+    for the process's lifetime. CLI-only: embedders own their process model.
+    Each lock name carries a "." so it can never collide with a
+    <session_id>.lock spool file (the id charset forbids ".")."""
     hook = bridge_hook_url(config)
     digest = hashlib.sha256(hook.encode()).hexdigest()[:16]
-    hook_lock = DEFAULT_LOCK_DIR / f"hook.{os.getuid()}.{digest}.lock"
+    hook_lock = DEFAULT_LOCK_DIR / f"hook.{digest}.lock"
     wake_lock = config.wake_dir / "bridge.singleton.lock"
-    return [
-        _flock_or_exit(
+    specs = [
+        (
             hook_lock,
             f"Another agent-event-bus-bridge is already registered for hook URL "
             f"{hook} ({hook_lock} is locked). Refusing to start: a second instance "
@@ -1805,7 +1817,7 @@ def _acquire_singleton_locks(config: BridgeConfig) -> list[int]:
             "--port AND --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL (a different "
             "--wake-dir alone does NOT change the hook URL, so it would not help).",
         ),
-        _flock_or_exit(
+        (
             wake_lock,
             f"Another agent-event-bus-bridge is already running on wake dir "
             f"{config.wake_dir} ({wake_lock} is locked). Refusing to start: two "
@@ -1814,6 +1826,19 @@ def _acquire_singleton_locks(config: BridgeConfig) -> list[int]:
             "AGENT_EVENT_BUS_WAKE_DIR.",
         ),
     ]
+    fds: list[int] = []
+    for lock_path, message in specs:
+        try:
+            fds.append(_flock_or_exit(lock_path, message))
+        except SystemExit:
+            # Close what we already hold, so a partial acquisition (e.g. the
+            # wake lock refuses after the hook lock succeeded) does not leak
+            # an fd - in-process that would hold the lock forever and 421 a
+            # later legitimate start on that hook URL.
+            for fd in fds:
+                os.close(fd)
+            raise
+    return fds
 
 
 def main():

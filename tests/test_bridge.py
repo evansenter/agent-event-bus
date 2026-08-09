@@ -2662,6 +2662,29 @@ class TestBindHost:
         for fd in (*fds_a, *fds_c):
             os.close(fd)
 
+    def test_partial_acquisition_does_not_leak_the_first_lock(self, tmp_path):
+        """Sequential acquisition must close an already-held lock when a
+        later one refuses: an instance sharing a wake dir but with a
+        DISTINCT hook URL takes the hook lock, then refuses on the wake lock
+        - the hook fd must be released, or in-process a later legitimate
+        start on that URL 421s against a bridge that is not running."""
+        clash_url = "http://127.0.0.1:9191/hook"
+        held = bridge._acquire_singleton_locks(BridgeConfig(wake_dir=tmp_path / "w1"))
+        try:
+            # Same wake dir as the holder, distinct hook URL: the hook lock
+            # acquires, then the wake lock refuses -> the hook fd must not leak
+            clash = BridgeConfig(wake_dir=tmp_path / "w1", hook_url=clash_url, secret="s")
+            with pytest.raises(SystemExit, match="wake dir"):
+                bridge._acquire_singleton_locks(clash)
+        finally:
+            for fd in held:
+                os.close(fd)
+        # If the hook fd leaked, this same-URL start (free wake dir) would
+        # spuriously refuse; it must acquire cleanly
+        fresh = BridgeConfig(wake_dir=tmp_path / "w2", hook_url=clash_url, secret="s")
+        for fd in bridge._acquire_singleton_locks(fresh):
+            os.close(fd)
+
     def test_main_refuses_and_never_sweeps_when_singleton_held(self, monkeypatch, tmp_path):
         """Pins the acquisition AND its ordering: with the lock already held,
         main() must SystemExit before uvicorn.run runs the lifespan (the

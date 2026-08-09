@@ -477,14 +477,20 @@ That lands with the supervision story.)
   the bus keeps dispatching to the dead address forever. Because that sweep
   can't tell a stale row from a *live peer's*, the CLI takes two flock'd
   singletons at startup (both released on exit): one keyed on the **hook
-  URL** (in a fixed lock dir, so a second instance registering the same URL
-  refuses *regardless of wake dir* - the URL is what the sweep contends on),
-  and one on the **wake dir** (`bridge.singleton.lock` there - two bridges
-  would otherwise interleave the same spool files). To run two bridges at
-  once they need BOTH a distinct hook URL (a different `--port` *and*
-  `--hook-url`) and a distinct `--wake-dir`; changing only `--wake-dir`
-  leaves the hook URL colliding, and changing only the port leaves the wake
-  dir colliding. Embedders manage their own single-instance story.
+  URL** (in a machine- and uid-scoped lock dir under `$XDG_RUNTIME_DIR` or
+  `/tmp`, HOME-independent so a second instance registering the same URL
+  refuses *regardless of wake dir or `$HOME`* - the URL is what the sweep
+  contends on), and one on the **wake dir** (`bridge.singleton.lock` there -
+  two bridges would otherwise interleave the same spool files). To run two
+  bridges at once they need BOTH a distinct hook URL (a different `--port`
+  *and* `--hook-url`) and a distinct `--wake-dir`; changing only
+  `--wake-dir` leaves the hook URL colliding, and changing only the port
+  leaves the wake dir colliding. One case is out of scope for v1: two
+  *different Unix users* on one machine sharing a bus (the loopback-trusting
+  auth lets a second account's default bus URL land on the first's bus) get
+  different uid-scoped lock dirs, so they do not contend - give each user's
+  bridge a distinct `--port`/`--hook-url` there. Embedders manage their own
+  single-instance story.
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
   hop (the bridge registers its webhook with the same secret).
 - The hook body is capped at 1 MiB (the HMAC can only be checked after
@@ -499,15 +505,20 @@ That lands with the supervision story.)
   can POST preflight-free via `fetch(mode:"no-cors")` only with a
   CORS-safelisted content type (text/plain et al); requiring the bus's
   media type forces a preflight the bridge never answers. (2) It requires
-  a recognized `Host` (421 otherwise): loopback literals plus the hook
-  URL's hostname. This closes DNS rebinding, where the attacker page is
-  *same-origin* (served from `evil.example:<port>`, A record then flipped
-  to 127.0.0.1) so CORS never applies - but the browser fills `Host` from
-  the page's URL, so a rebound request necessarily carries the attacker's
-  hostname. Neither guard authenticates the *sender* - that is the
-  secret's job, and off-box topologies still require it. When poking the
-  endpoint with `curl`, send the JSON content type and address the bridge
-  by a loopback literal or the hook URL's hostname.
+  a recognized `Host` (421 otherwise): loopback literals, the hook URL's
+  hostname, and the bound interface's address when `--bind` pins a
+  non-wildcard one (so a monitoring probe can address it by IP). This closes
+  DNS rebinding, where the attacker page is *same-origin* (served from
+  `evil.example:<port>`, A record then flipped to 127.0.0.1) so CORS never
+  applies - but the browser fills `Host` from the page's URL, so a rebound
+  request necessarily carries the attacker's hostname, never a loopback
+  literal or the bound address; allowlisting the bind address weakens
+  nothing. Both guards run in middleware ahead of routing, so a 405/404
+  cannot confirm a bridge is here either. Neither authenticates the
+  *sender* - that is the secret's job, and off-box topologies still require
+  it. When poking the endpoint with `curl`, send the JSON content type and
+  address the bridge by a loopback literal, the hook URL's hostname, or the
+  bound address.
 - `GET /health` reports `registered`: whether the *startup* registration
   succeeded. The row is not re-verified afterwards, so unregistering the
   webhook by hand (or restoring the bus DB from a backup) leaves
@@ -516,8 +527,8 @@ That lands with the supervision story.)
   follow-up. `/health` carries the same `Host` allowlist as `/hook` (421
   otherwise) - a supervisor probing `http://127.0.0.1:<port>/health` sends
   a loopback `Host` and passes, but a rebound browser tab cannot even
-  confirm a bridge runs here. Probe it by a loopback literal or the hook
-  URL's hostname, same as `/hook`.
+  confirm a bridge runs here. Probe it by a loopback literal, the hook
+  URL's hostname, or the bound address, same as `/hook`.
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
