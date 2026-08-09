@@ -13,6 +13,23 @@ logger = logging.getLogger("agent-event-bus")
 # worker that called it (issue #112).
 NOTIFY_TIMEOUT = 5.0  # seconds
 
+# The webhook signature header - a wire contract with three readers (the
+# server's _dispatch_webhook sets it, the bridge's hook endpoint reads it,
+# the bridge tests build theirs from it). It lives HERE, not in server.py,
+# because server.py is not side-effect-free at module scope (it opens and
+# migrates the bus database, attaches the bus log handler, and builds the
+# FastMCP app) - and the bridge, a pure HTTP client of the bus, must be
+# able to import the name without any of that. helpers.py is import-clean.
+SIGNATURE_HEADER = "X-Event-Bus-Signature"
+
+# The webhook media type - the same three-reader coupling as the header
+# above (the server's _dispatch_webhook sends it, the bridge's hook
+# endpoint REQUIRES it as its anti-browser guard, the bridge tests build
+# theirs from it). A rename touching only some readers would 415 every
+# delivery silently, so it is single-sourced here for the same
+# import-cleanliness reason.
+WEBHOOK_CONTENT_TYPE = "application/json"
+
 
 def _sanitize_name(name: str) -> str:
     """Sanitize a name by replacing problematic characters."""

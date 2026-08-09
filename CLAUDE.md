@@ -17,15 +17,17 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Repo | `agent-event-bus` |
 | Python package | `agent_event_bus` |
 | MCP server name | `agent-event-bus` |
-| CLI commands | `agent-event-bus`, `agent-event-bus-cli` |
+| CLI commands | `agent-event-bus`, `agent-event-bus-cli`, `agent-event-bus-bridge` (bridge is venv-only for now - run via `uv run`) |
 | Resource URI | `agent-event-bus://guide` |
 | Data directory | `~/.claude/contrib/agent-event-bus/` |
 | Database | `~/.claude/contrib/agent-event-bus/data.db` |
 | Log files | `agent-event-bus.log`, `agent-event-bus.err` |
 | LaunchAgent | `com.evansenter.agent-event-bus.plist` |
 | systemd service | `agent-event-bus.service` |
+| Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
+| Bridge hook-lock dir | `$XDG_RUNTIME_DIR/agent-event-bus-bridge-<uid>/`, else the system temp dir (`$TMPDIR`, or `/tmp` when unset; macOS: per-user `/var/folders/.../T`) - zero-byte, uid-scoped `hook.<hash>.lock` files, machine-scoped so a same-URL double-start refuses regardless of `$HOME`. Create-and-verified private (not adopted). Safe to remove when no bridge is running |
 
-**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`)
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_WAKE_DIR`)
 
 ---
 
@@ -66,7 +68,7 @@ make restart    # Lightweight service restart (no dependency sync)
 ./scripts/dev.sh  # Dev mode (foreground, auto-reload)
 ```
 
-**When to restart**: Code changes to `server.py`, `storage.py`, `helpers.py` require `make install-server` (or `make restart`). `guide.md` is read fresh each request. Dev mode auto-reloads.
+**When to restart**: Code changes to `server.py`, `storage.py`, `helpers.py` require `make install-server` (or `make restart`). `guide.md` is read fresh each request. Dev mode auto-reloads. The bridge is a separate process with no install target - after `bridge.py` changes, restart whatever runs `uv run agent-event-bus-bridge`.
 
 ## Testing
 
@@ -88,6 +90,7 @@ src/agent_event_bus/
 ├── middleware.py  # Request logging → ~/.claude/contrib/agent-event-bus/agent-event-bus.log
 ├── session_ids.py # Dinosaur-themed display_id generation
 ├── cli.py         # CLI wrapper for shell scripts
+├── bridge.py      # Webhook→injection re-awakening bridge (RFC #122, experimental)
 └── guide.md       # Usage guide (agent-event-bus://guide resource)
 ```
 

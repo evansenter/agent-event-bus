@@ -32,7 +32,18 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+# SIGNATURE_HEADER: one name, three readers (this module's _dispatch_webhook
+# sets it, the bridge's hook endpoint reads it, the bridge tests build theirs
+# from it) - a rename touching only some of them would 401 every delivery
+# silently. Defined in helpers.py (import-clean) so the bridge can read it
+# without this module's import-time side effects; the `as` form marks the
+# EXPLICIT re-export the tests resolve through server - an import cleanup
+# must not drop it.
 from agent_event_bus.helpers import (
+    SIGNATURE_HEADER as SIGNATURE_HEADER,
+)
+from agent_event_bus.helpers import (
+    WEBHOOK_CONTENT_TYPE,
     _dev_notify,
     extract_repo_from_cwd,
     is_client_alive,
@@ -803,8 +814,14 @@ def _compute_signature(payload: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
-async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
-    """Send event to a single webhook. Returns True on success."""
+def _webhook_payload(event: Event) -> dict:
+    """The JSON body every webhook receives for an event - a wire contract
+    with external consumers, split out so it is directly assertable. The
+    bridge resolves its wake target from `channel`, filters on
+    `signal_level`, and dedupes spool lines on `event_id`
+    (tests/test_bridge.py pins those keys against THIS function), so
+    removing or renaming a key is a breaking change; additions are
+    additive - consumers read the keys they know."""
     payload = {
         "event_id": event.id,
         "event_type": event.event_type,
@@ -820,12 +837,19 @@ async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
         for key in ("title", "tags"):
             if key in event.meta:
                 payload[key] = event.meta[key]
-    payload_bytes = json.dumps(payload).encode()
+    return payload
 
-    headers = {"Content-Type": "application/json"}
+
+async def _dispatch_webhook(webhook: Webhook, event: Event) -> bool:
+    """Send event to a single webhook. Returns True on success."""
+    payload_bytes = json.dumps(_webhook_payload(event)).encode()
+
+    # Single-sourced with the bridge's hook-endpoint requirement (its
+    # anti-browser guard 415s any other media type) - see helpers.py
+    headers = {"Content-Type": WEBHOOK_CONTENT_TYPE}
     if webhook.secret:
         signature = _compute_signature(payload_bytes, webhook.secret)
-        headers["X-Event-Bus-Signature"] = f"sha256={signature}"
+        headers[SIGNATURE_HEADER] = f"sha256={signature}"
 
     client = _get_webhook_client()
     for attempt in range(WEBHOOK_MAX_RETRIES + 1):
