@@ -88,8 +88,8 @@ def reset_reject_warn_state():
     (there is no per-request object to hang it on - the middleware 421 fires
     before any endpoint runs). A test that drives one reject reason leaves a
     real monotonic reading behind, so a later test asserting that reason's
-    WARNING would pass or fail on 60s of wall clock and run ordering. Clear
-    it around every test."""
+    WARNING would pass or fail on 60s of elapsed monotonic time and run
+    ordering. Clear it around every test."""
     bridge._reject_warn_state.clear()
     yield
     bridge._reject_warn_state.clear()

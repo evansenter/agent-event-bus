@@ -276,10 +276,12 @@ _unsafe_warn_state = {"last": -math.inf}
 # unparseable, unserializable, foreign Host) returned only a status the bus
 # discards - so a secret mismatch, a media-type change, or a Host-rewriting
 # proxy behind a 421 was diagnosable only by reproducing it with curl.
-# _log_rejection closes that asymmetry. Rate-limited PER REASON by wall
-# clock: the values (Host, signature) are attacker/proxy-controlled and
-# would otherwise spam. Process-wide like _unsafe_warn_state, same v1
-# caveat about mounted apps sharing the window.
+# _log_rejection closes that asymmetry. Rate-limited PER REASON on the
+# MONOTONIC clock (_now, like every other window in this module - so an
+# NTP step cannot stretch or collapse it): the values (Host, signature)
+# are attacker/proxy-controlled and would otherwise spam. Process-wide
+# like _unsafe_warn_state, same v1 caveat about mounted apps sharing the
+# window.
 _reject_warn_state: dict[str, float] = {}
 
 
