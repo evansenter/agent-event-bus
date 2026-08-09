@@ -323,8 +323,9 @@ small localhost daemon that registers a webhook on the bus, filters to
 **actionable** events on **`session:` channels** (DMs), and wakes the target
 session. Broadcast events stay pull-only. Address DMs by **`session_id`**
 (the UUID) - `display_id` is display-only bus-wide, so a
-`session:<display-id>` event still spools (every `session:` channel is
-actionable) but into a file no drain hook ever reads.
+`session:<display-id>` event still spools (a `session:` channel is
+actionable unless the publisher overrides `signal_level`) but into a file
+no drain hook ever reads.
 
 ```
 uv run agent-event-bus-bridge                    # spool backend (default)

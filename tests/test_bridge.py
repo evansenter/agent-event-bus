@@ -1164,6 +1164,16 @@ class TestDaemonLifecycle:
                     assert client.get("/health").json()["registered"] is True
         assert unregistered == [77]
 
+    def test_half_wired_registration_pair_is_rejected(self, config):
+        """Passing only one of registration_state/registration_stop would
+        bind and serve /health but never register - silently, with
+        registered:false forever. A partial pair is unambiguously a
+        programming error in an embedding, so it raises."""
+        with pytest.raises(ValueError, match="pair"):
+            create_bridge_app(config, registration_state={})
+        with pytest.raises(ValueError, match="pair"):
+            create_bridge_app(config, registration_stop=threading.Event())
+
     def test_app_without_registration_has_inert_lifespan(self, config):
         with TestClient(create_bridge_app(config)) as client:
             payload = client.get("/health").json()

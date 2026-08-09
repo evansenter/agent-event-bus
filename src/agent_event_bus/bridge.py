@@ -155,7 +155,9 @@ def verify_signature(body: bytes, signature_header: str | None, secret: str) -> 
 # radius). The charset happens to cover display ids ("brave-trex") as well
 # as the UUIDs sessions are actually addressed by - but the bus resolves
 # DMs by session_id only (display_id is display-only bus-wide), so a
-# session:<display-id> DM spools to a file no drain hook will ever read.
+# session:<display-id> DM (actionable by default - an explicit lower
+# signal_level is filtered before spooling) lands in a file no drain hook
+# will ever read.
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # The unsafe-id rejection below is publisher-drivable (the bus warns on
@@ -449,6 +451,16 @@ def create_bridge_app(
     removes it; any embedding (uvicorn --factory, an ASGI mount) gets clean
     shutdown without needing a main()-style finally of its own.
     """
+    # A half-wired pair would bind and serve /health but never register,
+    # with nothing logged and registered:false forever - the silent failure
+    # mode the lifespan wiring exists to prevent, reachable through the
+    # embedding surface this docstring advertises. main() always passes
+    # both, so a partial call is unambiguously a programming error.
+    if (registration_state is None) != (registration_stop is None):
+        raise ValueError(
+            "registration_state and registration_stop come as a pair - "
+            "pass both to enable bus registration, or neither"
+        )
     injector = Injector(config)
     registration_thread: threading.Thread | None = None
 
@@ -1084,7 +1096,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         hook_family == 4
         and bind_ip is not None
         and bind_ip.version == 6
-        and not bind_ip.is_unspecified
+        and not _is_host_wildcard(bind_host(config))
     ):
         logger.warning(
             f"Hook URL host is an IPv4 address but the listener binds "
