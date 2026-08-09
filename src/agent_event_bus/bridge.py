@@ -893,14 +893,26 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # ("http:///mcp") parses with no hostname and would read as loopback,
     # skipping the topology guard below - catch the misconfiguration here
     # instead of in a later connection error
-    parsed_bus = urllib.parse.urlsplit(config.bus_url)
+    # urlsplit itself raises ValueError("Invalid IPv6 URL") on an unbalanced
+    # bracket - one call earlier than the port guard below, same class of
+    # input, so it gets the same named-config-error treatment
+    try:
+        parsed_bus = urllib.parse.urlsplit(config.bus_url)
+    except ValueError as e:
+        raise SystemExit(f"Invalid bus URL {config.bus_url!r}: {e}") from None
     if parsed_bus.scheme not in ("http", "https") or not parsed_bus.hostname:
         raise SystemExit(f"Invalid bus URL {config.bus_url!r}: expected http(s)://host[:port]/path")
     # Same check for the hook URL - it is what BOTH topology guards below
     # read: a scheme-less value parses to hostname None, reads as loopback,
     # skips the guards, and registers a URL the bus can never POST to
     if config.hook_url is not None:
-        parsed_hook = urllib.parse.urlsplit(config.hook_url)
+        try:
+            parsed_hook = urllib.parse.urlsplit(config.hook_url)
+        except ValueError as e:
+            raise SystemExit(
+                f"Invalid hook URL {config.hook_url!r} "
+                f"(check --hook-url / AGENT_EVENT_BUS_BRIDGE_HOOK_URL): {e}"
+            ) from None
         # Require a hostname too: "http:///hook" parses to hostname None,
         # which reads as loopback and would skip every topology guard
         if parsed_hook.scheme not in ("http", "https") or not parsed_hook.hostname:
@@ -1034,21 +1046,38 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     # binds ("localhost") are exempt the other way - the resolver decides
     # their family.
     try:
-        hook_is_v6 = (
-            ipaddress.ip_address(urllib.parse.urlsplit(bridge_hook_url(config)).hostname).version
-            == 6
-        )
+        hook_family = ipaddress.ip_address(
+            urllib.parse.urlsplit(bridge_hook_url(config)).hostname
+        ).version
     except ValueError:
-        hook_is_v6 = False
+        hook_family = None  # hostname - the resolver decides its family
     try:
-        bind_is_v4 = ipaddress.ip_address(bind_host(config)).version == 4
+        bind_ip = ipaddress.ip_address(bind_host(config))
     except ValueError:
-        bind_is_v4 = False
-    if hook_is_v6 and bind_is_v4:
+        bind_ip = None  # "localhost" - the resolver decides its family
+    if hook_family == 6 and bind_ip is not None and bind_ip.version == 4:
         logger.warning(
             f"Hook URL host is an IPv6 address but the listener binds "
             f"{bind_host(config)} (IPv4 only) - the bus can't reach it; "
             "set --bind to '::' (dual-stack) or an IPv6 address"
+        )
+    # The mirror direction: a v4 hook literal with a PINNED v6 bind (::1, a
+    # tailnet v6 address) is refused at TCP the same way, with every other
+    # guard quiet - e.g. --bind ::1 under the default loopback hook URL is
+    # all-loopback, so neither the exposure nor the quadrant checks fire.
+    # :: stays quiet: dual-stack picks up v4 too (_is_host_wildcard is what
+    # distinguishes it from a pinned address).
+    if (
+        hook_family == 4
+        and bind_ip is not None
+        and bind_ip.version == 6
+        and not bind_ip.is_unspecified
+    ):
+        logger.warning(
+            f"Hook URL host is an IPv4 address but the listener binds "
+            f"{bind_host(config)} (IPv6 only) - the bus can't reach it; "
+            "bind an IPv4 or dual-stack ('::') address, or advertise an "
+            "IPv6 hook URL"
         )
     return config
 

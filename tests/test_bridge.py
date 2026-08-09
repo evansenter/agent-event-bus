@@ -660,11 +660,19 @@ class TestTmuxBackend:
             panes.write_bytes(b"[1, 2,")
             injector.deliver("target-1", make_event())
             assert len(warnings()) == 1  # the varying repeat was debug
+            # Re-break with the SAME reason after each re-arm path, so the
+            # re-arm lines are load-bearing: a different reason would warn
+            # regardless and mask a deleted re-arm
             panes.write_text("{}")  # healthy read re-arms the guard
             injector.deliver("target-1", make_event())
-            panes.write_text("[]")  # breaks again (new reason) - warns
+            panes.write_bytes(b"[1,")  # same reason again - warns only if re-armed
             injector.deliver("target-1", make_event())
-        assert len(warnings()) == 2
+            assert len(warnings()) == 2
+            panes.unlink()  # normal unmapped state re-arms too
+            injector.deliver("target-1", make_event())
+            panes.write_bytes(b"{again")  # same reason - warns only if re-armed
+            injector.deliver("target-1", make_event())
+        assert len(warnings()) == 3
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
@@ -1413,6 +1421,9 @@ class TestBindHost:
                 config = bridge.config_from_args(bridge.build_parser().parse_args(["--bind", bind]))
             assert bridge.bind_host(config) == bind
             assert not any("advertises loopback" in r.message for r in caplog.records)
+            # '::' is dual-stack, so the pinned-v6-bind family warning must
+            # not fire for it either
+            assert not any("IPv6 only" in r.message for r in caplog.records)
 
     def test_pinned_bind_with_loopback_hook_warns(self, monkeypatch, caplog):
         """The real fourth quadrant: a PINNED non-loopback bind does not
@@ -1466,6 +1477,32 @@ class TestBindHost:
             config = bridge.config_from_args(args)
         assert bridge.bind_host(config) == "0.0.0.0"
         assert any("IPv6" in r.message and "0.0.0.0" in r.message for r in caplog.records)
+
+    def test_ipv4_hook_with_pinned_ipv6_bind_warns(self, caplog):
+        """Mirror of the v6-hook/v4-bind arm: --bind ::1 under the default
+        v4 loopback hook URL is all-loopback, so neither the exposure nor
+        the quadrant guards fire - but the listener binds IPv6 only while
+        the bus POSTs to 127.0.0.1, refused at TCP. A PINNED v6 bind must
+        warn; '::' stays quiet because dual-stack picks up v4."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            bridge.config_from_args(bridge.build_parser().parse_args(["--bind", "::1"]))
+        assert any("IPv4 address" in r.message and "::1" in r.message for r in caplog.records)
+
+    def test_unbalanced_ipv6_bracket_is_a_named_config_error(self, monkeypatch):
+        """urlsplit itself raises ValueError('Invalid IPv6 URL') on an
+        unbalanced bracket - one call before every named guard, and it must
+        be a named config error like the rest, not a bare traceback."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_URL", "http://[::1:8080/mcp")
+        with pytest.raises(SystemExit, match="bus URL"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+        monkeypatch.delenv("AGENT_EVENT_BUS_URL")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_SECRET", "s3cret")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_HOOK_URL", "http://[fd7a:115c::1:8082/hook")
+        with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_HOOK_URL"):
+            bridge.config_from_args(bridge.build_parser().parse_args([]))
 
     def test_ipv6_hook_with_ipv6_bind_is_quiet(self, monkeypatch, caplog):
         import logging
