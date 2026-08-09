@@ -225,8 +225,11 @@ class Injector:
         self._last_wake_fail_reason: str | None = None
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
-        # operator isn't silently reverted on the next event. The dir is
-        # private (0o700) - spool files carry full event payloads.
+        # operator isn't silently reverted on the next event - though it IS
+        # re-asserted on the next restart (and by the self-heal path), on a
+        # directory the bridge did not necessarily create: spool files carry
+        # full event payloads, so the private mode is worth asserting every
+        # start rather than trusting whatever was there.
         try:
             self.config.wake_dir.mkdir(parents=True, exist_ok=True)
             self.config.wake_dir.chmod(0o700)

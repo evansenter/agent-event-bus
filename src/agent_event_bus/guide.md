@@ -390,7 +390,9 @@ That lands with the supervision story.)
   `event_id` when acting: a delivery that spools but then errors is retried by the bus, and
   a recovered orphan may overlap with what a dead drain already acted on,
   so the same event can legitimately appear more than once. The wake dir is
-  created 0o700 (spool files carry full event payloads); pruning spools and
+  *set* to 0o700 on every start - created or not, so a pre-existing
+  directory pointed at via `--wake-dir` is narrowed too (spool files carry
+  full event payloads); pruning spools and
   lock files for dead sessions is a follow-up - with one constraint: flock
   binds to an inode, so unlink a `<sid>.lock` only while holding its flock
   and only when no `<sid>.jsonl*` remains, or the next appender locks a
