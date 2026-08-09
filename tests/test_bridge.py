@@ -772,15 +772,19 @@ class TestTmuxBackend:
                     assert injector.deliver("target-1", make_event()) == "spool-unmapped"
                 mock_run.assert_not_called()
             assert len(warnings()) == 1  # same reason across values - repeats debug
+            # The repr names the entry to fix - null warned first
+            assert "(None)" in warnings()[0].message
             # Per-shape, not aggregate: the two repeats were DEMOTED (seen,
-            # logged at debug), not skipped - an aggregate count can't tell
-            # those apart
+            # logged at debug, carrying their own reprs), not skipped - an
+            # aggregate count can't tell those apart
             demoted = [
                 r
                 for r in caplog.records
                 if r.levelno == logging.DEBUG and "not a pane id" in r.message
             ]
             assert len(demoted) == 2
+            assert any("(0)" in r.message for r in demoted)
+            assert any("('')" in r.message for r in demoted)
             # A genuinely ABSENT key is the healthy shape and re-arms; a bad
             # value must not - so bad -> absent -> bad warns twice
             panes.write_text(json.dumps({"other-session": "%1"}))
@@ -789,6 +793,32 @@ class TestTmuxBackend:
             injector.deliver("target-1", make_event())
         assert len(warnings()) == 2
         assert "not a pane id" in warnings()[0].message
+
+    def test_bad_pane_value_bound_survives_interleaved_sessions(self, tmp_path, caplog):
+        """The guard must be keyed per CONDITION, not per last delivery: on
+        a multi-machine bus the unmapped arm is the documented NORMAL
+        outcome, so a bad entry interleaved with absent (or healthy)
+        sessions is the steady state - a single re-arm slot would oscillate
+        into one WARNING per DM."""
+        import logging
+
+        # cooldown 0 so every target-2 delivery attempts (and succeeds at)
+        # a real wake - the healthy-entry read is the arm under test
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux", cooldown_seconds=0.0)
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+        panes.write_text(json.dumps({"target-1": 0, "target-2": "%5"}))
+
+        def warnings():
+            return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", tmux_ok):
+                for _ in range(3):
+                    injector.deliver("target-1", make_event())  # bad entry
+                    injector.deliver("other-session", make_event())  # absent - normal
+                    assert injector.deliver("target-2", make_event()) == "tmux"  # healthy
+        assert len(warnings()) == 1  # neither absent nor healthy reads re-armed it
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")

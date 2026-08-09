@@ -210,10 +210,14 @@ class Injector:
         self.config = config
         self._lock = threading.Lock()
         self._last_wake: dict[str, float] = {}
-        # Last panes.json failure REASON warned about (not the message - a
-        # torn write varies its parse position per read), for the warn-once
-        # guard below
-        self._last_panes_warn_reason: str | None = None
+        # Armed panes.json warning KEYS (not messages - a torn write varies
+        # its parse position per read). A set, not a single slot: the
+        # file-level conditions and each session's bad-entry condition are
+        # independent, and a single slot would let a healthy read for one
+        # session re-arm another's warning - interleaved deliveries (the
+        # NORMAL multi-machine steady state, where most DMs are unmapped)
+        # would oscillate that into one WARNING per DM.
+        self._warned_panes_keys: set[str] = set()
         # Same idea for tmux wake failures, its own slot (the conditions
         # are independent): a missing/broken tmux binary fails every wake
         # with the same exception type forever, and per-DM WARNING for a
@@ -237,9 +241,10 @@ class Injector:
     def deliver(self, session_id: str, event: dict) -> str:
         """Wake session_id for event. Returns the action taken: "tmux",
         "spool" (spool backend working as designed), "spool-cooldown",
-        "spool-unmapped" (tmux backend, no pane mapping - the NORMAL outcome
-        for a session on another machine, since webhooks have no machine
-        scoping), or "spool-tmux-failed" (tmux backend, the send-keys
+        "spool-unmapped" (tmux backend, no USABLE pane mapping: absent -
+        the NORMAL outcome for a session on another machine, since webhooks
+        have no machine scoping - or present but not a pane id, which
+        warns), or "spool-tmux-failed" (tmux backend, the send-keys
         attempt itself failed - the arm that means tmux on this box is
         broken). The action value is in-band for a direct caller of /hook
         only - the bus discards the response body - so operator-facing
@@ -389,7 +394,7 @@ class Injector:
         try:
             panes = json.loads(panes_file.read_text())
         except FileNotFoundError:
-            self._last_panes_warn_reason = None  # normal unmapped state re-arms
+            self._disarm_file_keys()  # normal unmapped state re-arms
             return None
         except ValueError as e:
             # Parse failures (JSONDecodeError, UnicodeDecodeError from a
@@ -414,48 +419,60 @@ class Injector:
                 "not-an-object", "panes.json is not an object; treating as unmapped"
             )
             return None
+        self._disarm_file_keys()  # the FILE parsed - file-level conditions cleared
         # Membership, not .get(): a JSON null value and an absent key both
         # come back None from .get(), and null is the LIKELIEST bad value in
         # practice (panes[sid] = os.environ.get("TMUX_PANE") emits exactly
         # that outside tmux) - it must land in the bad-value arm below, not
         # read as healthy-absent and re-arm the guard
+        entry_key = f"bad-pane-value:{session_id}"
         if session_id not in panes:
-            self._last_panes_warn_reason = None  # genuinely absent - re-arms
+            # Genuinely absent re-arms THIS session's entry condition only -
+            # discarding more would let the (normal) unmapped arm re-arm a
+            # different session's warning and oscillate the bound
+            self._warned_panes_keys.discard(entry_key)
             return None
         pane = panes[session_id]
         if not (isinstance(pane, str) and pane):
             # Present but wrong-typed (0 instead of "%0", "", null): a
             # misconfiguration whose repair is nothing like "the mapping is
             # absent", so it must not fold into the unmapped debug line.
-            # Same bound as the file failures - and the re-arm deliberately
-            # does NOT run before this check, or every delivery would
-            # re-arm-then-warn.
+            # Keyed per session: the condition is per entry, unlike the
+            # file-level failures above.
             self._warn_panes_once(
-                "bad-pane-value",
+                entry_key,
                 f"panes.json entry for {session_id[:8]}... is not a pane id "
                 f"({pane!r}); treating as unmapped",
             )
             return None
-        self._last_panes_warn_reason = None  # healthy read re-arms the warning
+        self._warned_panes_keys.discard(entry_key)  # healthy entry re-arms it
         return pane
 
-    def _warn_panes_once(self, reason: str, message: str) -> None:
+    _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object"})
+
+    def _disarm_file_keys(self) -> None:
+        """A healthy file read (or the normal missing-file state) clears the
+        file-level conditions - and ONLY those; per-entry keys are cleared
+        by their own session's healthy or absent reads."""
+        self._warned_panes_keys -= self._PANES_FILE_KEYS
+
+    def _warn_panes_once(self, key: str, message: str) -> None:
         """A persistently broken panes.json must not emit one WARNING per
         delivered DM - the same unbounded-volume shape as the unsafe-channel
         warning, driven by DM rate against a stuck local condition instead
-        of a hostile publisher. Keyed on the REASON, not the message: the
-        message embeds str(e), and a torn non-atomic write yields a
-        different parse position on every read - message-keyed dedupe would
-        warn once per delivery, the value-keyed defect in local-file form.
-        The full exception text still reaches the log on the first sighting
-        (and every repeat at debug under DEV_MODE). Warn on the first
-        sighting of each distinct reason, debug repeats; a healthy read (or
-        the file going away) re-arms it, so a NEW breakage always warns.
+        of a hostile publisher. Keyed, not message-matched: the message
+        embeds str(e), and a torn non-atomic write yields a different parse
+        position on every read. Armed keys live in a SET so independent
+        conditions bound independently - file-level keys are cleared by a
+        healthy file read, per-entry keys by that session's own healthy or
+        absent read; a single slot would oscillate under interleaved
+        deliveries. The full exception text still reaches the log on the
+        first sighting (and every repeat at debug under DEV_MODE).
         Unlocked - a rare race just duplicates a warning."""
-        if reason == self._last_panes_warn_reason:
+        if key in self._warned_panes_keys:
             logger.debug(message)
         else:
-            self._last_panes_warn_reason = reason
+            self._warned_panes_keys.add(key)
             logger.warning(message)
 
     def _tmux_wake(self, session_id: str, pane: str) -> bool:

@@ -375,7 +375,11 @@ That lands with the supervision story.)
      drain-unique, so no two drains can ever target or delete the same
      name - and if the age test ever claims a merely *stalled*
      drainer's file, the `event_id` dedupe covers the double-action
-     while deletion stays claimant-only.
+     while deletion stays claimant-only. Skip lines that do not parse:
+     a host crash inside the writeback window can truncate the last
+     append, and the following append is glued onto the remnant - a
+     drainer that raises on `json.loads` would re-raise on every
+     attempt against its own claimed file, forever.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Spooled payloads are
@@ -425,8 +429,9 @@ That lands with the supervision story.)
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
-  backend, no `panes.json` entry - the *normal* outcome for a session on
-  another machine), or `spool-tmux-failed` (the `send-keys` attempt itself
+  backend, no usable `panes.json` entry: absent - the *normal* outcome for
+  a session on another machine - or present but not a pane id, which
+  warns), or `spool-tmux-failed` (the `send-keys` attempt itself
   failed). Only the last one means tmux is broken on this host. The bus
   discards the response body (it logs just the status code, at debug), so
   `action` is visible only to a direct caller of `/hook` - the bridge's own
