@@ -930,10 +930,12 @@ def create_bridge_app(
     # Operator-configured extras (--allowed-host): the ONLY way to accept a
     # reverse proxy's rewritten Host, which the derived wildcard bind above
     # never adds (and a name-rewriting proxy can't be covered by --bind at
-    # all). Canonicalized through _host_from_header so a "10.0.0.5:8082" or
-    # bracketed-IPv6 entry matches the incoming Host the same way.
-    for extra in config.allowed_hosts:
-        allowed_hook_hosts.add(_host_from_header(extra))
+    # all). Added VERBATIM: validate_config (called above, so this holds for
+    # embedders too) already stripped, dropped blanks, and canonicalized each
+    # entry. Re-applying _host_from_header here would be actively wrong, not
+    # merely redundant - it is not idempotent on IPv6, since the unbracketed
+    # branch splits on the last colon ("fd7a::1" -> "fd7a:").
+    allowed_hook_hosts.update(config.allowed_hosts)
     # Version-skew line bound (a closure cell: the arm lives in process(),
     # not on the injector). The condition - a bus predating derived levels -
     # is persistent and per-deployment, so it gets the same first-sighting
@@ -1613,6 +1615,42 @@ def validate_config(config: BridgeConfig) -> None:
     ):
         if value is not None and not isinstance(value, str):
             raise BridgeConfigError(f"Invalid value {value!r} (check {label}): expected a string")
+
+    # allowed_hosts is the one field whose ENTRIES feed a security guard, so
+    # it is canonicalized HERE rather than in config_from_args: the allowlist
+    # is built in create_bridge_app, which every embedder reaches without
+    # passing through argparse. Three inputs a hand-built config makes easy,
+    # each of which silently breaks the guard if it survives to that loop:
+    #   ("",)      - the `os.environ.get(..., "").split(",")` idiom. Empty
+    #                string canonicalizes to itself, and the middleware
+    #                defaults raw_host to "" when the Host header is absent
+    #                or blank (h11 permits both), so the entry MATCHES those
+    #                requests and turns the rebinding guard off entirely -
+    #                for /health too, while it still reports registered.
+    #   " host"    - never stripped, so it can never match: escape hatch
+    #                silently inert, the mirror image of the above.
+    #   "host"     - a bare str is iterable, so the loop would add one entry
+    #                PER CHARACTER (including "" for the empty string).
+    # A bare IPv6 literal is accepted too: _host_from_header's unbracketed
+    # branch splits on the last colon ("fd7a::1" -> "fd7a:"), but --bind
+    # takes bare literals, so that is the spelling an operator arrives with.
+    if isinstance(config.allowed_hosts, str):
+        config.allowed_hosts = (config.allowed_hosts,)
+    canonical_hosts = []
+    for entry in config.allowed_hosts:
+        if not isinstance(entry, str):
+            raise BridgeConfigError(
+                f"Invalid allowed host {entry!r} (check --allowed-host / "
+                "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS): expected a string"
+            )
+        stripped = entry.strip()
+        if not stripped:
+            continue  # blank entry (trailing comma, empty env var) - drop it
+        try:  # bare IPv6, which the port-splitting path would mangle
+            canonical_hosts.append(str(ipaddress.ip_address(stripped)))
+        except ValueError:
+            canonical_hosts.append(_host_from_header(stripped))
+    config.allowed_hosts = tuple(canonical_hosts)
 
     # argparse `choices` only guards command-line values, and an embedder
     # skips argparse entirely - an unknown backend would silently mean

@@ -773,6 +773,63 @@ class TestHookFiltering:
         # The allowlist is still a guard, not a bypass
         assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
 
+    def test_blank_allowed_host_does_not_disable_the_guard(self, tmp_path):
+        """THE bypass this sanitation exists for. `os.environ.get(X, "")
+        .split(",")` yields ("",) - the obvious embedder idiom - and an empty
+        entry canonicalizes to itself. The middleware defaults raw_host to ""
+        when the Host header is absent or blank (h11 permits both), so that
+        entry would MATCH those requests and turn the rebinding guard off for
+        /hook and /health alike, silently, while /health still reports
+        registered. Driven through create_bridge_app (not config_from_args)
+        because the embedder path is the one that was unprotected."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.example:8082/hook",
+            secret="s3cret",
+            allowed_hosts=tuple("".split(",")),  # ("",) - verbatim idiom
+        )
+        client = TestClient(create_bridge_app(config), base_url="http://bridge.example:8082")
+        assert client.get("/health", headers={"Host": ""}).status_code == 421
+        assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+        # and the legitimate name still passes, so this isn't a blanket deny
+        assert client.get("/health", headers={"Host": "bridge.example:8082"}).status_code == 200
+
+    def test_allowed_host_entries_are_canonicalized_for_embedders(self, tmp_path):
+        """The other two hand-built shapes, both of which leave the escape
+        hatch silently inert rather than open: an unstripped entry can never
+        match, and a BARE str is iterable, so an unsanitized loop would add
+        one entry per CHARACTER. A bare IPv6 literal is accepted too - --bind
+        takes them unbracketed, so that's the spelling operators arrive with,
+        and _host_from_header alone would mangle it to "fd7a:"."""
+        for allowed, host in (
+            ((" proxy.example ",), "proxy.example"),  # unstripped
+            ("proxy.example", "proxy.example"),  # bare str, not a tuple
+            (("fd7a::1",), "[fd7a::1]"),  # bare IPv6 -> bracketed on the wire
+        ):
+            config = BridgeConfig(
+                wake_dir=tmp_path / "wake",
+                hook_url="http://bridge.example:8082/hook",
+                secret="s3cret",
+                allowed_hosts=allowed,
+            )
+            client = TestClient(create_bridge_app(config), base_url="http://bridge.example:8082")
+            assert client.get("/health", headers={"Host": host}).status_code == 200, allowed
+            # a per-character allowlist would admit these single letters
+            assert client.get("/health", headers={"Host": "p"}).status_code == 421, allowed
+
+    def test_non_string_allowed_host_is_a_named_config_error(self, tmp_path):
+        """Same posture as the other hand-built-config type checks: a named
+        BridgeConfigError, not a bare AttributeError off .strip()."""
+        with pytest.raises(bridge.BridgeConfigError, match="allowed host"):
+            create_bridge_app(
+                BridgeConfig(
+                    wake_dir=tmp_path / "wake",
+                    hook_url="http://bridge.example:8082/hook",
+                    secret="s3cret",
+                    allowed_hosts=(123,),
+                )
+            )
+
     def test_rejected_host_names_itself_and_the_fix(self, config, caplog):
         """A 421 was the one reject with NO diagnostic anywhere on this side:
         the bus discards the response body and logs its own status on a
@@ -2678,9 +2735,12 @@ class TestBindHost:
     def test_allowed_hosts_from_flag_and_env(self, monkeypatch):
         """Comma-separated on both surfaces, blanks dropped so a trailing
         comma or an empty env var yields () rather than an "" entry that
-        would match a Host-less request."""
+        would match a Host-less request. Entries come back CANONICALIZED
+        (in validate_config, so embedders get the same treatment): the port
+        is stripped exactly as it is on the incoming Host, which is what
+        makes a "10.0.0.5:8082" entry match a request under that authority."""
         args = bridge.build_parser().parse_args(["--allowed-host", "proxy.example, 10.0.0.5:8082,"])
-        assert bridge.config_from_args(args).allowed_hosts == ("proxy.example", "10.0.0.5:8082")
+        assert bridge.config_from_args(args).allowed_hosts == ("proxy.example", "10.0.0.5")
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS", "edge.example")
         assert bridge.config_from_args(bridge.build_parser().parse_args([])).allowed_hosts == (
             "edge.example",
