@@ -51,6 +51,7 @@ BRIDGE_ENV = (
     "AGENT_EVENT_BUS_BRIDGE_SECRET",
     "AGENT_EVENT_BUS_BRIDGE_HOOK_URL",
     "AGENT_EVENT_BUS_BRIDGE_BIND",
+    "AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS",
     "AGENT_EVENT_BUS_WAKE_DIR",
     # Not AGENT_EVENT_BUS_*-prefixed, but main() honours it as THE debug
     # switch and CLAUDE.md tells developers to export it - exactly the
@@ -79,6 +80,19 @@ def reset_unsafe_warn_state():
     bridge._unsafe_warn_state["last"] = -float("inf")
     yield
     bridge._unsafe_warn_state["last"] = -float("inf")
+
+
+@pytest.fixture(autouse=True)
+def reset_reject_warn_state():
+    """_log_rejection rate-limits per reason in process-wide module state
+    (there is no per-request object to hang it on - the middleware 421 fires
+    before any endpoint runs). A test that drives one reject reason leaves a
+    real monotonic reading behind, so a later test asserting that reason's
+    WARNING would pass or fail on 60s of elapsed monotonic time and run
+    ordering. Clear it around every test."""
+    bridge._reject_warn_state.clear()
+    yield
+    bridge._reject_warn_state.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -549,7 +563,10 @@ class TestHookFiltering:
         ):
             resp = client.post("/hook", content=json.dumps(make_event()).encode())
         assert resp.status_code == 400
-        assert resp.json() == {"error": "invalid JSON"}
+        # A DISTINCT string from the parse-failure 400: the body was valid
+        # JSON, it just cannot re-serialize to a standard-JSON spool line -
+        # a different producer and fix than "not JSON".
+        assert resp.json() == {"error": "payload not serializable to a spool line"}
 
     def test_spool_serialization_failure_creates_no_file_or_lock(self, config):
         """_spool serializes BEFORE it opens the file or takes the flock, so
@@ -734,6 +751,121 @@ class TestHookFiltering:
         client = TestClient(create_bridge_app(config))
         assert client.get("/health", headers={"Host": "100.100.1.2"}).status_code == 200
         assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+
+    def test_allowed_host_admits_a_forwarding_proxy(self, tmp_path):
+        """The gap --allowed-hosts exists for: a non-loopback hook URL derives
+        bind 0.0.0.0, is_unspecified keeps the wildcard OUT of the allowlist,
+        and nginx's proxy_pass default rewrites Host to its UPSTREAM address -
+        so every forwarded dispatch 421s while /health stays green. --bind
+        cannot cover it (pinning drops the wildcard, and a name-rewriting
+        proxy has no address to pin). An operator-listed Host is admitted;
+        an unlisted one is still rejected."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.example:8082/hook",  # non-loopback -> bind 0.0.0.0
+            allowed_hosts=("10.0.0.5:8082",),
+            secret="s3cret",
+        )
+        client = TestClient(create_bridge_app(config), headers=JSON_CT)
+        body = json.dumps(make_event()).encode()
+        signed = {"Host": "10.0.0.5:8082", SIGNATURE_HEADER: sign(body, "s3cret")}
+        assert client.post("/hook", content=body, headers=signed).status_code == 200
+        # The allowlist is still a guard, not a bypass
+        assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+
+    def test_blank_allowed_host_does_not_disable_the_guard(self, tmp_path):
+        """THE bypass this sanitation exists for. `os.environ.get(X, "")
+        .split(",")` yields ("",) - the obvious embedder idiom - and an empty
+        entry canonicalizes to itself. The middleware defaults raw_host to ""
+        when the Host header is absent or blank (h11 permits both), so that
+        entry would MATCH those requests and turn the rebinding guard off for
+        /hook and /health alike, silently, while /health still reports
+        registered. Driven through create_bridge_app (not config_from_args)
+        because the embedder path is the one that was unprotected."""
+        config = BridgeConfig(
+            wake_dir=tmp_path / "wake",
+            hook_url="http://bridge.example:8082/hook",
+            secret="s3cret",
+            allowed_hosts=tuple("".split(",")),  # ("",) - verbatim idiom
+        )
+        client = TestClient(create_bridge_app(config), base_url="http://bridge.example:8082")
+        assert client.get("/health", headers={"Host": ""}).status_code == 421
+        assert client.get("/health", headers={"Host": "evil.example"}).status_code == 421
+        # and the legitimate name still passes, so this isn't a blanket deny
+        assert client.get("/health", headers={"Host": "bridge.example:8082"}).status_code == 200
+
+    def test_allowed_host_entries_are_canonicalized_for_embedders(self, tmp_path):
+        """The other two hand-built shapes, both of which leave the escape
+        hatch silently inert rather than open: an unstripped entry can never
+        match, and a BARE str is iterable, so an unsanitized loop would add
+        one entry per CHARACTER. A bare IPv6 literal is accepted too - --bind
+        takes them unbracketed, so that's the spelling operators arrive with,
+        and _host_from_header alone would mangle it to "fd7a:"."""
+        for allowed, host in (
+            ((" proxy.example ",), "proxy.example"),  # unstripped
+            ("proxy.example", "proxy.example"),  # bare str, not a tuple
+            (("fd7a::1",), "[fd7a::1]"),  # bare IPv6 -> bracketed on the wire
+        ):
+            config = BridgeConfig(
+                wake_dir=tmp_path / "wake",
+                hook_url="http://bridge.example:8082/hook",
+                secret="s3cret",
+                allowed_hosts=allowed,
+            )
+            client = TestClient(create_bridge_app(config), base_url="http://bridge.example:8082")
+            assert client.get("/health", headers={"Host": host}).status_code == 200, allowed
+            # a per-character allowlist would admit these single letters
+            assert client.get("/health", headers={"Host": "p"}).status_code == 421, allowed
+
+    def test_port_only_allowed_host_is_refused_not_silently_dropped(self, tmp_path):
+        """The same bypass by another door: these entries are NOT blank, so a
+        check on the raw input passes them through - but _host_from_header
+        PRODUCES the empty string from each (":8082" has nothing before the
+        last colon; "[]" has nothing between the brackets), which would then
+        match the middleware's raw_host default and disable the guard. The
+        emptiness test therefore runs on the CANONICAL value. Refused rather
+        than dropped: ":8082" is an operator reaching for "any host on this
+        port", which this flag cannot express."""
+        for entry in (":8082", "[]", "[]:8082"):
+            with pytest.raises(bridge.BridgeConfigError, match="no hostname"):
+                create_bridge_app(
+                    BridgeConfig(
+                        wake_dir=tmp_path / "wake",
+                        hook_url="http://bridge.example:8082/hook",
+                        secret="s3cret",
+                        allowed_hosts=(entry,),
+                    )
+                )
+
+    def test_non_string_allowed_host_is_a_named_config_error(self, tmp_path):
+        """Same posture as the other hand-built-config type checks: a named
+        BridgeConfigError, not a bare AttributeError off .strip()."""
+        with pytest.raises(bridge.BridgeConfigError, match="allowed host"):
+            create_bridge_app(
+                BridgeConfig(
+                    wake_dir=tmp_path / "wake",
+                    hook_url="http://bridge.example:8082/hook",
+                    secret="s3cret",
+                    allowed_hosts=(123,),
+                )
+            )
+
+    def test_rejected_host_names_itself_and_the_fix(self, config, caplog):
+        """A 421 was the one reject with NO diagnostic anywhere on this side:
+        the bus discards the response body and logs its own status on a
+        different host in every non-loopback topology. Diagnosing it needs
+        the rejected Host, so the warning carries it plus the flag that
+        admits it. Rate-limited per reason, so the repeat drops to debug."""
+        import logging
+
+        client = TestClient(create_bridge_app(config))
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            assert client.get("/health", headers={"Host": "10.0.0.5:8082"}).status_code == 421
+            assert client.get("/health", headers={"Host": "10.0.0.6:8082"}).status_code == 421
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the repeat must not re-warn inside the interval"
+        assert "10.0.0.5:8082" in warnings[0].message
+        assert "--allowed-hosts" in warnings[0].message
 
     def test_ipv6_bind_address_normalized_in_allowlist(self, tmp_path):
         """The bind address is stored NORMALIZED (str(ip_address)), so an
@@ -2619,6 +2751,22 @@ class TestBindHost:
                     bridge.build_parser().parse_args(["--bind", bind, "--hook-url", hook])
                 )
             assert not any("different loopback" in r.message for r in caplog.records), (bind, hook)
+
+    def test_allowed_hosts_from_flag_and_env(self, monkeypatch):
+        """Comma-separated on both surfaces, blanks dropped so a trailing
+        comma or an empty env var yields () rather than an "" entry that
+        would match a Host-less request. Entries come back CANONICALIZED
+        (in validate_config, so embedders get the same treatment): the port
+        is stripped exactly as it is on the incoming Host, which is what
+        makes a "10.0.0.5:8082" entry match a request under that authority."""
+        args = bridge.build_parser().parse_args(
+            ["--allowed-hosts", "proxy.example, 10.0.0.5:8082,"]
+        )
+        assert bridge.config_from_args(args).allowed_hosts == ("proxy.example", "10.0.0.5")
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_ALLOWED_HOSTS", "edge.example")
+        assert bridge.config_from_args(bridge.build_parser().parse_args([])).allowed_hosts == (
+            "edge.example",
+        )
 
     def test_invalid_bind_is_refused(self):
         args = bridge.build_parser().parse_args(["--bind", "localhost:8082"])
