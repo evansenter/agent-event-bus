@@ -138,6 +138,15 @@ class BridgeConfig:
     hook_url: str | None = None
     # Interface to bind; None derives it from the hook URL (see bind_host)
     bind: str | None = None
+    # Embedder-only opt-in for the exposure invariant: under
+    # `uvicorn --factory --host ...` or an ASGI mount the HOSTING server
+    # owns the real bind - this config never sees it, so bind_host reads
+    # the (None) bind as loopback and the exposed-listener secret
+    # requirement in validate_config cannot fire. Set True when the
+    # hosting server is not loopback-only to get the same hard refusal
+    # the CLI gives a wide --bind. The CLI path never needs it: there the
+    # bridge owns the bind, so the derived check is already real.
+    assume_exposed: bool = False
 
 
 class BridgeConfigError(ValueError):
@@ -393,8 +402,18 @@ class Injector:
         # gated, so ATTEMPTS is a budget multiplier, not a literal count.)
         deadline = time.monotonic() + SPOOL_LOCK_ATTEMPTS * SPOOL_LOCK_RETRY_SECONDS
 
+        def _open_append_0600(path: Path):
+            # Explicit create mode, not the process umask (a plain append
+            # open would land 0o644 under the usual one): spool lines carry
+            # full publisher-authored payloads, and the directory's 0o700 is
+            # the only other guard - --wake-dir can point at a pre-existing
+            # shared path, and the documented manual workflows invite a
+            # later chmod on it. Create-time only; the append path pays
+            # nothing once the file exists.
+            return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a")
+
         def _append() -> None:
-            with lock_file.open("a") as lock_fd:
+            with _open_append_0600(lock_file) as lock_fd:
                 while True:
                     try:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -408,7 +427,7 @@ class Injector:
                             ) from None
                         time.sleep(SPOOL_LOCK_RETRY_SECONDS)
                 try:
-                    with spool_file.open("a") as f:
+                    with _open_append_0600(spool_file) as f:
                         f.write(json.dumps(event) + "\n")
                 finally:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -610,6 +629,12 @@ def create_bridge_app(
     and unregisters the committed id. The app created the row, so the app
     removes it; any embedding (uvicorn --factory, an ASGI mount) gets clean
     shutdown without needing a main()-style finally of its own.
+
+    On those embeddings the HOSTING server owns the listener's bind, which
+    validate_config cannot see - its exposure check reads the config's
+    (None) bind as loopback. When the host is not loopback-only, set
+    assume_exposed=True on the config (opts into the CLI's hard refusal)
+    or just set the secret.
     """
     # A half-wired pair would bind and serve /health but never register,
     # with nothing logged and registered:false forever - the silent failure
@@ -1015,7 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         # Raw string default, cast in config_from_args - see _to_number
         default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_PORT") or str(DEFAULT_BRIDGE_PORT),
-        help=f"Localhost port to listen on (default: {DEFAULT_BRIDGE_PORT})",
+        help=f"Port to listen on (default: {DEFAULT_BRIDGE_PORT}; see --bind for the interface)",
     )
     parser.add_argument(
         "--backend",
@@ -1060,7 +1085,13 @@ def validate_config(config: BridgeConfig) -> None:
     calls it again for embedders (uvicorn --factory, an ASGI mount) that
     build a BridgeConfig by hand and never pass through argparse - the
     security posture (an exposed listener requires the HMAC secret) must
-    travel with the config, not with the entry point. Raises
+    travel with the config, not with the entry point. One caveat travels
+    the other way: exposure is derived from bind_host(config) and the hook
+    URL, and on embedding paths the HOSTING server owns the real bind
+    (uvicorn's --host, the enclosing app's) - invisible here, so the
+    bind-derived half of the check only binds on the CLI path. Embedders
+    whose hosting server is not loopback-only must set assume_exposed=True
+    (same refusal) or just set the secret. Raises
     BridgeConfigError (a ValueError - embedder-catchable, unlike
     SystemExit); config_from_args translates it for the CLI. NORMALIZES
     port / cooldown_seconds / wake_dir on the config IN PLACE before
@@ -1182,9 +1213,20 @@ def validate_config(config: BridgeConfig) -> None:
     # attacker-authored lines to a session spool, and a non-loopback hook
     # URL means the hop exists even behind a local TLS terminator. Hard
     # requirement either way - the bus itself defaults to auth-required,
-    # and the bridge must not invert that.
-    exposed = not _is_host_loopback(bind) or not _is_loopback(hook)
+    # and the bridge must not invert that. assume_exposed ORs in because
+    # the bind-derived half only binds on the CLI path: an embedder's
+    # hosting server owns the real bind, invisibly to this check.
+    exposed = not _is_host_loopback(bind) or not _is_loopback(hook) or config.assume_exposed
     if exposed and not config.secret:
+        if config.assume_exposed and _is_host_loopback(bind) and _is_loopback(hook):
+            # Name the actual lever: the generic message below would claim
+            # a loopback bind is "reachable off-box"
+            raise BridgeConfigError(
+                "assume_exposed is set but no secret is configured - the hosting "
+                "server's listener is reachable off-box and the HMAC signature is "
+                "the only authentication on this hop. Set "
+                "AGENT_EVENT_BUS_BRIDGE_SECRET (or secret= on the config)."
+            )
         raise BridgeConfigError(
             f"Listener would bind {bind} with hook URL "
             f"{hook} - reachable off-box, so set "

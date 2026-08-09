@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import os
 import threading
 import time
 from unittest.mock import patch
@@ -378,6 +379,21 @@ class TestHookFiltering:
         # backend's terminal must show more than the registration line, so
         # pin the INFO line carrying the event id like the warnings around it
         assert any("Spooled event 1" in r.message for r in caplog.records)
+
+    def test_spool_and_lock_files_created_0o600(self, config):
+        """Spool lines carry full publisher-authored payloads, and the wake
+        dir's 0o700 is the only other guard - one --wake-dir at a shared
+        pre-existing path, or one later manual chmod (the documented prune
+        and drain workflows invite it), and umask-mode files are world-
+        readable. The create mode must be explicit, not inherited."""
+        old_umask = os.umask(0o000)  # widest case: a plain open would land 0o666
+        try:
+            Injector(config).deliver("target-1", make_event())
+        finally:
+            os.umask(old_umask)
+        for name in ("target-1.jsonl", "target-1.lock"):
+            mode = (config.wake_dir / name).stat().st_mode & 0o777
+            assert mode == 0o600, (name, oct(mode))
 
     def test_health(self, client):
         assert client.get("/health").json()["status"] == "ok"
@@ -1504,6 +1520,20 @@ class TestDaemonLifecycle:
         # around app assembly must be able to catch it
         with pytest.raises(bridge.BridgeConfigError, match="AGENT_EVENT_BUS_BRIDGE_SECRET"):
             create_bridge_app(config)
+
+    def test_assume_exposed_requires_secret(self, tmp_path):
+        """The exposure check derives from config.bind, and on the embedding
+        paths this module documents (uvicorn --factory --host, an ASGI
+        mount) the HOSTING server owns the real bind - the config's None
+        reads as loopback, so a wide-open unauthenticated listener would
+        validate clean. assume_exposed is the embedder's opt-in to the same
+        hard refusal the CLI gives a wide --bind, and its error must name
+        that lever, not claim a loopback bind is reachable off-box."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", assume_exposed=True)
+        with pytest.raises(bridge.BridgeConfigError, match="assume_exposed"):
+            create_bridge_app(config)
+        config.secret = "s3cret"
+        create_bridge_app(config)  # the secret satisfies the requirement
 
     def test_hand_built_config_types_are_coerced_or_named(self, tmp_path):
         """An embedder passing raw env strings must get the named config

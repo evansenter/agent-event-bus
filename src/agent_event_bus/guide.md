@@ -379,7 +379,14 @@ That lands with the supervision story.)
      a host crash inside the writeback window can truncate the last
      append, and the following append is glued onto the remnant - a
      drainer that raises on `json.loads` would re-raise on every
-     attempt against its own claimed file, forever.
+     attempt against its own claimed file, forever. Claimed names are
+     stable only within the staleness window: stall in this step past it
+     and a concurrent drain legitimately re-claims your files (staleness
+     is age, not liveness - deliberately, per step 2), so glob your own
+     `.draining.<uniq>.*` afresh here rather than replaying a list
+     recorded in step 2, and treat `ENOENT` on any open or unlink as
+     benign - another drain judged you stale and claimed the file; its
+     `event_id` dedupe covers the overlap.
   (Read-then-truncate instead of this would race the bridge's appends: an
   event landing between the read and the truncate would be destroyed after
   the bus already got its 200, with no retry.) Spooled payloads are
@@ -392,7 +399,10 @@ That lands with the supervision story.)
   so the same event can legitimately appear more than once. The wake dir is
   *set* to 0o700 on every start - created or not, so a pre-existing
   directory pointed at via `--wake-dir` is narrowed too (spool files carry
-  full event payloads); pruning spools and
+  full event payloads). Spool and lock files are created 0o600 for the
+  same reason, independent of the process umask - and rename preserves
+  the mode, so your `.draining.*` claims inherit it; anything you
+  *create* in the wake dir yourself should match. Pruning spools and
   lock files for dead sessions is a follow-up - with one constraint: flock
   binds to an inode, so unlink a `<sid>.lock` only while holding its flock
   and only when no `<sid>.jsonl*` remains, or the next appender locks a
