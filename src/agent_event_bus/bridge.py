@@ -195,8 +195,10 @@ class Injector:
         self.config = config
         self._lock = threading.Lock()
         self._last_wake: dict[str, float] = {}
-        # Last panes.json warning emitted, for the warn-once guard below
-        self._last_panes_warning: str | None = None
+        # Last panes.json failure REASON warned about (not the message - a
+        # torn write varies its parse position per read), for the warn-once
+        # guard below
+        self._last_panes_warn_reason: str | None = None
         # Once at construction, not per delivery: keeps the lock hold to the
         # append itself, and a deliberate later permission change by the
         # operator isn't silently reverted on the next event. The dir is
@@ -219,8 +221,10 @@ class Injector:
         for a session on another machine, since webhooks have no machine
         scoping), or "spool-tmux-failed" (tmux backend, the send-keys
         attempt itself failed - the arm that means tmux on this box is
-        broken). The distinction rides the 200 response's `action` field,
-        the one in-band signal, since the unmapped arm logs only at debug.
+        broken). The action value is in-band for a direct caller of /hook
+        only - the bus discards the response body - so operator-facing
+        visibility is this module's log: failed wakes at warning, the quiet
+        arms at debug under DEV_MODE.
 
         The cooldown bounds successful injections only: spool writes are
         durable bookkeeping, not wakes, and a failed tmux attempt must not
@@ -265,13 +269,20 @@ class Injector:
                 for sid, ts in self._last_wake.items()
                 if (now - ts) < self.config.cooldown_seconds
             }
-            last = self._last_wake.get(session_id)
-            if last is not None:
-                return "spool-cooldown"
-            # Reserve the window before releasing the lock: two concurrent
-            # deliveries for the same session must not both pass the check
-            # and double-inject
-            self._last_wake[session_id] = now
+            in_cooldown = self._last_wake.get(session_id) is not None
+            if not in_cooldown:
+                # Reserve the window before releasing the lock: two
+                # concurrent deliveries for the same session must not both
+                # pass the check and double-inject
+                self._last_wake[session_id] = now
+        if in_cooldown:
+            # Logged outside the lock (a debug handler write is IO). Every
+            # other arm names itself somewhere; this one must too - it is
+            # the only case where the bridge chose not to wake a session it
+            # could have, which is exactly what a DEV_MODE operator asking
+            # "why didn't my session wake?" needs to see.
+            logger.debug(f"Cooldown active for {session_id[:8]}...; spooled only")
+            return "spool-cooldown"
 
         # tmux runs outside the lock (bounded at TMUX_TIMEOUT, but other
         # sessions' deliveries shouldn't wait on it). The pane can go stale
@@ -345,30 +356,39 @@ class Injector:
         try:
             panes = json.loads(panes_file.read_text())
         except FileNotFoundError:
-            self._last_panes_warning = None  # normal unmapped state re-arms
+            self._last_panes_warn_reason = None  # normal unmapped state re-arms
             return None
         except (OSError, ValueError) as e:
-            self._warn_panes_once(f"Unreadable panes.json ({e}); treating as unmapped")
+            self._warn_panes_once(
+                "unreadable", f"Unreadable panes.json ({e}); treating as unmapped"
+            )
             return None
         if not isinstance(panes, dict):
-            self._warn_panes_once("panes.json is not an object; treating as unmapped")
+            self._warn_panes_once(
+                "not-an-object", "panes.json is not an object; treating as unmapped"
+            )
             return None
-        self._last_panes_warning = None  # healthy read re-arms the warning
+        self._last_panes_warn_reason = None  # healthy read re-arms the warning
         pane = panes.get(session_id)
         return pane if isinstance(pane, str) and pane else None
 
-    def _warn_panes_once(self, message: str) -> None:
+    def _warn_panes_once(self, reason: str, message: str) -> None:
         """A persistently broken panes.json must not emit one WARNING per
         delivered DM - the same unbounded-volume shape as the unsafe-channel
         warning, driven by DM rate against a stuck local condition instead
-        of a hostile publisher. Warn on the first sighting of each distinct
-        condition, debug repeats; a healthy read (or the file going away)
-        re-arms it, so a NEW breakage always warns. Unlocked - a rare race
-        just duplicates a warning."""
-        if message == self._last_panes_warning:
+        of a hostile publisher. Keyed on the REASON, not the message: the
+        message embeds str(e), and a torn non-atomic write yields a
+        different parse position on every read - message-keyed dedupe would
+        warn once per delivery, the value-keyed defect in local-file form.
+        The full exception text still reaches the log on the first sighting
+        (and every repeat at debug under DEV_MODE). Warn on the first
+        sighting of each distinct reason, debug repeats; a healthy read (or
+        the file going away) re-arms it, so a NEW breakage always warns.
+        Unlocked - a rare race just duplicates a warning."""
+        if reason == self._last_panes_warn_reason:
             logger.debug(message)
         else:
-            self._last_panes_warning = message
+            self._last_panes_warn_reason = reason
             logger.warning(message)
 
     def _tmux_wake(self, session_id: str, pane: str) -> bool:

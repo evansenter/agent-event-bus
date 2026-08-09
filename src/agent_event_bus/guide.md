@@ -426,9 +426,11 @@ That lands with the supervision story.)
   `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
   backend, no `panes.json` entry - the *normal* outcome for a session on
   another machine), or `spool-tmux-failed` (the `send-keys` attempt itself
-  failed). Only the last one means tmux is broken on this host; the
-  unmapped arm logs only at debug, so the response body is where that
-  distinction surfaces at the default log level.
+  failed). Only the last one means tmux is broken on this host. The bus
+  discards the response body (it logs just the status code, at debug), so
+  `action` is visible only to a direct caller of `/hook` - the bridge's own
+  log is the operator-facing surface: failed wakes at warning, the quiet
+  arms (`spool-unmapped`, `spool-cooldown`) at debug under `DEV_MODE=1`.
 
 Flags mirror env vars: `--port`/`AGENT_EVENT_BUS_BRIDGE_PORT`,
 `--backend`/`AGENT_EVENT_BUS_BRIDGE_BACKEND`,

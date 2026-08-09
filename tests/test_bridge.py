@@ -337,13 +337,20 @@ class TestInjectorCooldown:
     """The cooldown bounds successful injections only - spool writes are
     durable bookkeeping, and failed wakes must not burn the window."""
 
-    def test_second_wake_within_cooldown_spools_only(self, tmp_path):
+    def test_second_wake_within_cooldown_spools_only(self, tmp_path, caplog):
+        import logging
+
         injector, config = make_tmux_injector(tmp_path)
 
-        with patch.object(bridge.subprocess, "run", tmux_ok):
-            assert injector.deliver("target-1", make_event()) == "tmux"
-            assert injector.deliver("target-1", make_event()) == "spool-cooldown"
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", tmux_ok):
+                assert injector.deliver("target-1", make_event()) == "tmux"
+                assert injector.deliver("target-1", make_event()) == "spool-cooldown"
 
+        # The one deliberately-suppressed arm still names itself under
+        # DEV_MODE - the only case where the bridge chose not to wake a
+        # session it could have
+        assert any("Cooldown active" in r.message for r in caplog.records)
         # Both events were spooled - cooldown bounds wakes, not durability
         lines = (config.wake_dir / "target-1.jsonl").read_text().splitlines()
         assert len(lines) == 2
@@ -616,9 +623,12 @@ class TestTmuxBackend:
             mock_run.assert_not_called()
 
     def test_persistent_panes_failure_warns_once(self, tmp_path, caplog):
-        """A stuck-broken panes.json must not emit one WARNING per DM (same
-        unbounded-volume shape as the unsafe-channel warning): first
-        sighting warns, repeats are debug, and a healthy read re-arms."""
+        """A stuck-broken panes.json must not emit one WARNING per DM - and
+        the guard must key on the REASON, not the message: a torn
+        non-atomic write yields a different parse position on every read,
+        so message-keyed dedupe would warn per delivery (the value-keyed
+        defect in local-file form). First sighting warns, repeats are
+        debug, a healthy read re-arms."""
         import logging
 
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
@@ -629,13 +639,16 @@ class TestTmuxBackend:
             return [r for r in caplog.records if r.levelno == logging.WARNING]
 
         with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
-            panes.write_text("[]")  # not an object
+            # Same reason, VARYING exception text (the torn-writer shape:
+            # a different parse position per read) - still one warning
+            panes.write_bytes(b"{broken")
             injector.deliver("target-1", make_event())
+            panes.write_bytes(b"[1, 2,")
             injector.deliver("target-1", make_event())
-            assert len(warnings()) == 1  # the repeat was debug
+            assert len(warnings()) == 1  # the varying repeat was debug
             panes.write_text("{}")  # healthy read re-arms the guard
             injector.deliver("target-1", make_event())
-            panes.write_text("[]")  # breaks again - warns again
+            panes.write_text("[]")  # breaks again (new reason) - warns
             injector.deliver("target-1", make_event())
         assert len(warnings()) == 2
 
