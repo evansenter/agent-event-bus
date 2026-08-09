@@ -109,11 +109,6 @@ MAX_BODY_BYTES = 1_048_576  # 1 MiB
 SPOOL_LOCK_ATTEMPTS = 20
 SPOOL_LOCK_RETRY_SECONDS = 0.1
 
-# Must stay a fixed multi-word constant: the send-keys call passes it as
-# one argument WITHOUT -l, so tmux would interpret a value matching a key
-# name (Enter, C-c, Escape) as a keystroke instead of typing it. If this
-# ever becomes configurable or carries payload text, switch the call to
-# `send-keys -l` for the text plus a separate `send-keys Enter`.
 # Cap on the warn-once key sets (wake failures and panes conditions): a
 # session that ends while broken never sheds its key - only a later
 # delivery for that same session can - so on a weeks-long daemon the sets
@@ -121,6 +116,11 @@ SPOOL_LOCK_RETRY_SECONDS = 0.1
 # clearing costs one repeat warning per still-live condition.
 _WARN_KEYS_CAP = 256
 
+# Must stay a fixed multi-word constant: the send-keys call passes it as
+# one argument WITHOUT -l, so tmux would interpret a value matching a key
+# name (Enter, C-c, Escape) as a keystroke instead of typing it. If this
+# ever becomes configurable or carries payload text, switch the call to
+# `send-keys -l` for the text plus a separate `send-keys Enter`.
 WAKE_PROMPT = "Check the event bus - a directed event arrived for this session."
 
 
@@ -274,9 +274,10 @@ class Injector:
         "spool" (spool backend working as designed), "spool-cooldown",
         "spool-unmapped" (tmux backend, no usable pane mapping - normally
         because the session lives on another machine, since webhooks have
-        no machine scoping, but also when panes.json is missing, unreadable,
-        malformed, or its entry is not a pane id; the misconfiguration
-        shapes warn, so check the log), or "spool-tmux-failed" (tmux backend, the send-keys
+        no machine scoping, but also when panes.json is missing,
+        unreadable, malformed, or its entry is not a pane id; the
+        misconfiguration shapes warn, so check the log), or
+        "spool-tmux-failed" (tmux backend, the send-keys
         attempt itself failed - the arm that means tmux on this box is
         broken). The action value is in-band for a direct caller of /hook
         only - the bus discards the response body - so operator-facing
@@ -488,10 +489,17 @@ class Injector:
             self._warned_panes_keys.discard(entry_key)
             return None
         pane = panes[session_id]
-        if not (isinstance(pane, str) and pane):
-            # Present but wrong-typed (0 instead of "%0", "", null): a
+        if not (isinstance(pane, str) and pane and pane.isprintable()):
+            # Present but wrong-shaped (0 instead of "%0", "", null, or a
+            # control character - JSON encodes NUL as \u0000): a
             # misconfiguration whose repair is nothing like "the mapping is
             # absent", so it must not fold into the unmapped debug line.
+            # isprintable() is load-bearing, not cosmetic: an argv element
+            # with an embedded NUL makes subprocess.run raise ValueError
+            # BEFORE check or timeout - a class _tmux_wake's post-spool arms
+            # don't catch - so it must be rejected here, where the warning
+            # names the entry to repair, and never reach argv. Real pane ids
+            # ("%0", "%12") are printable ASCII throughout.
             # Keyed per session: the condition is per entry, unlike the
             # file-level failures above.
             self._warn_panes_once(

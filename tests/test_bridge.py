@@ -51,6 +51,11 @@ BRIDGE_ENV = (
     "AGENT_EVENT_BUS_BRIDGE_HOOK_URL",
     "AGENT_EVENT_BUS_BRIDGE_BIND",
     "AGENT_EVENT_BUS_WAKE_DIR",
+    # Not AGENT_EVENT_BUS_*-prefixed, but main() honours it as THE debug
+    # switch and CLAUDE.md tells developers to export it - exactly the
+    # people who run this suite. An inherited DEBUG level would flip any
+    # test asserting a debug line is absent (or make caplog noisier).
+    "DEV_MODE",
 )
 
 
@@ -880,6 +885,29 @@ class TestTmuxBackend:
         assert len(warnings()) == 3
         assert "not a pane id" in warnings()[0].message
 
+    def test_nul_pane_value_degrades_to_spool_not_valueerror(self, tmp_path, caplog):
+        """A pane value carrying an embedded NUL (JSON encodes it as
+        \\u0000) is a non-empty str, so a type-and-truthiness guard alone
+        admits it to the send-keys argv - where subprocess.run raises
+        ValueError BEFORE check or timeout, a class _tmux_wake's post-spool
+        arms don't catch. The escape would 500 the webhook with the cooldown
+        reservation already taken and the rollback skipped: the bus retries
+        an already-spooled event while the session sits in a cooldown for a
+        wake that never happened. The isprintable() guard must instead route
+        it into the bad-pane-value arm - warning names the entry to repair -
+        and the value must never reach argv."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        (config.wake_dir / "panes.json").write_text(json.dumps({"target-1": "%0\x00"}))
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run") as mock_run:
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+        mock_run.assert_not_called()
+        assert any("not a pane id" in r.message for r in caplog.records)
+
     def test_bad_pane_value_bound_survives_interleaved_sessions(self, tmp_path, caplog):
         """The guard must be keyed per CONDITION, not per last delivery: on
         a multi-machine bus the unmapped arm is the documented NORMAL
@@ -905,6 +933,57 @@ class TestTmuxBackend:
                     injector.deliver("other-session", make_event())  # absent - normal
                     assert injector.deliver("target-2", make_event()) == "tmux"  # healthy
         assert len(warnings()) == 1  # neither absent nor healthy reads re-armed it
+
+    def test_warn_key_caps_bound_both_sets(self, tmp_path, caplog, monkeypatch):
+        """The round-47 retention caps are load-bearing: without a pin a
+        refactor could delete the clear, flip the comparison, or clear the
+        WRONG set (the two sit a screen apart under different locking).
+        Cap at 2, drive three distinct conditions per set, assert the bound
+        holds and the first condition warns again after the clear."""
+        import logging
+
+        monkeypatch.setattr(bridge, "_WARN_KEYS_CAP", 2)
+
+        def warnings(text):
+            return [r for r in caplog.records if r.levelno == logging.WARNING and text in r.message]
+
+        # Panes set: three sessions with bad values, then the first again
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
+        injector = Injector(config)
+        panes = config.wake_dir / "panes.json"
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            panes.write_text(json.dumps({"s1": 0, "s2": 0, "s3": 0}))
+            for sid in ("s1", "s2", "s3"):
+                injector.deliver(sid, make_event())
+            assert len(injector._warned_panes_keys) <= 2  # cap held
+            injector.deliver("s1", make_event())  # cleared at cap - warns again
+        assert len(warnings("not a pane id")) == 4
+
+        # Wake-fail set: three exception types for one session, then the first
+        caplog.clear()
+        injector2, _ = make_tmux_injector(tmp_path / "w2", sessions=("t1",), cooldown=0.0)
+
+        def raiser(exc):
+            def run(cmd, **kwargs):
+                raise exc
+
+            return run
+
+        with caplog.at_level(logging.DEBUG, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", raiser(PermissionError("a"))):
+                injector2.deliver("t1", make_event())
+            with patch.object(
+                bridge.subprocess, "run", raiser(bridge.subprocess.TimeoutExpired("x", 1))
+            ):
+                injector2.deliver("t1", make_event())
+            with patch.object(
+                bridge.subprocess, "run", raiser(bridge.subprocess.CalledProcessError(1, ["x"]))
+            ):
+                injector2.deliver("t1", make_event())  # third type - cap clears
+            assert len(injector2._warned_wake_fail_keys) <= 2  # cap held
+            with patch.object(bridge.subprocess, "run", raiser(PermissionError("a"))):
+                injector2.deliver("t1", make_event())  # re-warns after clear
+        assert len(warnings("tmux wake failed")) == 4
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
@@ -1907,8 +1986,8 @@ class TestBindHost:
             return None
 
         # The autouse restore_bridge_logger_level fixture undoes the level
-        # main() pins here, for this and every other main()-driving test
-        monkeypatch.delenv("DEV_MODE", raising=False)
+        # main() pins here, for this and every other main()-driving test;
+        # clean_bridge_env guarantees DEV_MODE starts unset for the off half.
         with patch.object(uvicorn, "run", run_quiet):
             bridge.main()
         assert not bridge.logger.isEnabledFor(logging.DEBUG)

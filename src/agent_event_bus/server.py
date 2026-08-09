@@ -32,8 +32,17 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+# SIGNATURE_HEADER: one name, three readers (this module's _dispatch_webhook
+# sets it, the bridge's hook endpoint reads it, the bridge tests build theirs
+# from it) - a rename touching only some of them would 401 every delivery
+# silently. Defined in helpers.py (import-clean) so the bridge can read it
+# without this module's import-time side effects; the `as` form marks the
+# EXPLICIT re-export the tests resolve through server - an import cleanup
+# must not drop it.
 from agent_event_bus.helpers import (
-    SIGNATURE_HEADER,
+    SIGNATURE_HEADER as SIGNATURE_HEADER,
+)
+from agent_event_bus.helpers import (
     _dev_notify,
     extract_repo_from_cwd,
     is_client_alive,
@@ -79,13 +88,6 @@ if (
 MAX_PAYLOAD_PREVIEW = 50  # Max chars to show in notification previews
 WEBHOOK_TIMEOUT = 5.0  # Seconds to wait for webhook response
 WEBHOOK_MAX_RETRIES = 2  # Number of retries for failed webhooks
-# One name, three readers: _dispatch_webhook sets it, the bridge reads it,
-# and the bridge tests build theirs from this constant - a rename that
-# touched only some of them would 401 every delivery silently (the bus
-# retries twice, then drops), with every mocked test still green. Defined
-# in helpers.py (import-clean) so the bridge can read it without pulling
-# in this module's import-time side effects; re-exported here as the
-# canonical bus-side name.
 
 # Known signal levels (RFC #121 / #129). Validation is soft: unknown values
 # are stored as-is with a warning, never rejected.
