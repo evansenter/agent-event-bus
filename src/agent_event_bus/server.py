@@ -814,25 +814,32 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # still the session saying it is alive.
     _auto_heartbeat(session_id)
 
+    previous = session.last_cursor
+    # What every refusal reports as `cursor`. A session that has never saved
+    # one is at 0 - the same place a null cursor reads from - and "0" can be
+    # re-acked where None cannot, so the documented recovery ("re-acking it is
+    # always a safe no-op") holds without a special case.
+    position = previous if previous is not None else "0"
+
     try:
         target = int(cursor)
     except (TypeError, ValueError):
         return {
             "error": f"Invalid cursor {cursor!r}: expected an event id",
             "session_id": session_id,
+            "cursor": position,
         }
     if target < 0:
         return {
             "error": f"Invalid cursor {cursor!r}: must not be negative",
             "session_id": session_id,
+            "cursor": position,
         }
 
     # Refuse to ack past the newest event. next_cursor never exceeds the tip,
     # so a cursor beyond it did not come from a read - and honoring it would
     # silently mark events that do not exist yet as seen, which is this API's
     # worst failure mode: consumed but never surfaced.
-    previous = session.last_cursor
-
     # A bus with no events yet has no tip, and the only ackable position is 0.
     # Treating "no tip" as "no ceiling" would let a fresh session ack past
     # events that have not been published yet - the same loss, earlier.
@@ -851,7 +858,7 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
             # unconditionally a loaded gun: acking it commits the whole
             # unsurfaced backlog, which is the exact loss this primitive
             # exists to prevent.
-            "cursor": previous,
+            "cursor": position,
             # The ceiling, under its own name, for a caller that wants to
             # clamp deliberately. Clamping is only safe if it has actually
             # surfaced everything up to here.
@@ -869,7 +876,7 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                     f"({previous}). Pass allow_rewind=true to replay deliberately."
                 ),
                 "session_id": session_id,
-                "cursor": previous,
+                "cursor": position,
             }
 
     # str(target), not the raw cursor: int() accepts " 42 ", "+42" and "4_2",

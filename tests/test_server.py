@@ -1994,6 +1994,41 @@ class TestAckRejectionShape:
         ]
         assert still_pending == ["e1", "e2", "e3", "e4"], "recovery must not consume anything"
 
+    def test_every_refusal_reports_a_re_ackable_position(self):
+        """The guide says recovery needs no branching on which refusal you
+        got. That has to hold for ALL of them - the malformed-cursor branches
+        omitted `cursor` entirely, so a hook acking a jq artifact and then
+        following the documented recovery got a KeyError instead."""
+        sid = self._session("exceptionless")
+        published = publish_event(event_type="e", payload="one")
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+        position = str(published["event_id"])
+
+        refusals = [
+            ack_events(session_id=sid, cursor="not-an-id"),
+            ack_events(session_id=sid, cursor="-3"),
+            ack_events(session_id=sid, cursor="999999"),
+            ack_events(session_id=sid, cursor="0"),
+        ]
+
+        for refusal in refusals:
+            assert "error" in refusal
+            assert refusal["cursor"] == position, f"no position on: {refusal['error']}"
+            # ...and the reported position is genuinely re-ackable
+            assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
+
+    def test_a_session_with_no_saved_cursor_reports_a_usable_position(self):
+        """`previous` is None until something advances the cursor, and acking
+        None fails - so the one session that most needs the recovery path
+        would have been the one it did not work for."""
+        sid = self._session("never-acked")
+        assert server.storage.get_session(sid).last_cursor is None
+
+        refusal = ack_events(session_id=sid, cursor="999999")
+
+        assert refusal["cursor"] == "0"
+        assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
+
     def test_each_tool_warns_once_for_the_same_dead_session(self, caplog):
         """A drain hook both polls and acks. Keyed without `tool`, whichever
         call warned first would silence the other forever, and the operator

@@ -211,6 +211,15 @@ def _format_result(result) -> str:
     # deleted-session polling stayed invisible in the log for months.
     if "error" in result:
         return f"{_RED}ERROR:{_RESET} {result['error']}"
+    # Before the session_id branch, for the same reason the error check sits
+    # above it: an ack's entire observable effect is the cursor move, and the
+    # generic session line would swallow it - logging every successful ack as
+    # `session=brave-trex`, indistinguishable from a register. `make logs` is
+    # how drains are watched, and `previous → cursor` is the one thing an
+    # operator debugging one wants to see.
+    if "cursor" in result and "previous_cursor" in result:
+        was = result["previous_cursor"] or "start"
+        return f"{_CYAN}cursor {was} → {result['cursor']}{_RESET}"
     if "session_id" in result:
         # For session results, prefer display_id if available, otherwise look it up
         sid = result["session_id"]

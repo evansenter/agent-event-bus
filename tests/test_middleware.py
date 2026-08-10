@@ -111,6 +111,45 @@ class TestFormatList:
         assert "2 items" in result
 
 
+class TestAckLogsTheCursorMove:
+    """An ack's whole observable effect is the cursor move.
+
+    The success dict carries session_id, so the generic session branch would
+    swallow it and every ack would log as `session=brave-trex` - the same
+    shape-swallowing that hid #140's errors, in the one tool where the moved
+    value IS the event worth logging.
+    """
+
+    def _plain(self, result):
+        import re
+
+        return re.sub(r"\033\[[0-9;]*m", "", _format_result(result))
+
+    def test_shows_the_movement_not_the_session(self):
+        out = self._plain(
+            {
+                "success": True,
+                "session_id": "drain-1",
+                "cursor": "55",
+                "previous_cursor": "42",
+            }
+        )
+        assert out == "cursor 42 → 55"
+
+    def test_first_ack_names_the_starting_point(self):
+        out = self._plain(
+            {"success": True, "session_id": "d", "cursor": "7", "previous_cursor": None}
+        )
+        assert out == "cursor start → 7"
+
+    def test_a_refused_ack_still_logs_as_an_error(self):
+        """The error branch stays above this one."""
+        out = self._plain(
+            {"error": "Cursor 9 is ahead of the newest event (5)", "session_id": "d", "cursor": "5"}
+        )
+        assert out.startswith("ERROR:")
+
+
 class TestFormatResult:
     """Tests for _format_result function."""
 
