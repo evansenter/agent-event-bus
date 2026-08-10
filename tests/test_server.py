@@ -1508,3 +1508,132 @@ class TestNarrowedReadsDoNotConsumeCursor:
 
         # The narrowed resume read from the tip without persisting it
         assert server.storage.get_session(sid).last_cursor is None
+
+
+class TestDeletedSessionPolling:
+    """A soft-deleted session must not be able to poll silently (#140).
+
+    Its cursor and heartbeat are frozen, so every poll re-asks from the same
+    position and gets an empty batch - byte-identical to "you are up to date"
+    while the session is also missing from list_sessions. Every read path has
+    to reject it, not just resume.
+    """
+
+    def _deleted_session(self, name):
+        reg = register_session(name=name, client_id=f"{name}-client")
+        sid = reg["session_id"]
+        assert server.storage.delete_session(sid)
+        return sid, reg
+
+    def test_resume_poll_reports_deletion(self):
+        sid, _ = self._deleted_session("deleted-resume")
+
+        result = get_events(session_id=sid, resume=True, order="asc", limit=20)
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+        assert result["session_id"] == sid
+        assert result["deleted_at"]
+        assert "events" not in result
+
+    def test_explicit_cursor_poll_reports_deletion(self):
+        """The hole #140 was actually reported through: a client feeding
+        next_cursor back never enters the resume branch."""
+        sid, reg = self._deleted_session("deleted-cursor")
+        publish_event(event_type="note", payload="after deletion")
+
+        result = get_events(session_id=sid, cursor=reg["cursor"], order="asc", limit=20)
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+
+    def test_cursorless_poll_reports_deletion(self):
+        sid, _ = self._deleted_session("deleted-bare")
+
+        result = get_events(session_id=sid)
+
+        assert result["error"] == "Session deleted"
+
+    def test_peek_reports_deletion(self):
+        sid, _ = self._deleted_session("deleted-peek")
+
+        result = get_events(session_id=sid, resume=True, peek=True)
+
+        assert result["error"] == "Session deleted"
+
+    def test_narrowed_poll_reports_deletion(self):
+        sid, _ = self._deleted_session("deleted-narrow")
+
+        result = get_events(session_id=sid, channel="all", order="asc")
+
+        assert result["error"] == "Session deleted"
+
+    def test_error_carries_display_id_for_operator_lookup(self):
+        """The detection path in #140 starts from display_id, so the error has
+        to name one - a UUID alone is not greppable against the server log."""
+        sid, reg = self._deleted_session("deleted-display")
+
+        result = get_events(session_id=sid, resume=True)
+
+        assert result["display_id"] == reg["display_id"]
+
+    def test_stale_cleanup_deletion_is_reported(self):
+        """Sessions soft-deleted by the heartbeat timeout - not by an explicit
+        unregister - are the ones that go unnoticed longest."""
+        reg = register_session(name="deleted-stale", client_id="deleted-stale-client")
+        sid = reg["session_id"]
+        server.storage.cleanup_stale_sessions(timeout_seconds=0)
+
+        result = get_events(session_id=sid, resume=True)
+
+        assert result["error"] == "Session deleted"
+
+    def test_unregistered_session_id_stays_silent(self):
+        """Foreign ids (Claude Code's own UUIDs) were never registered here and
+        must keep working - only ids we know we deleted are an error."""
+        publish_event(event_type="note", payload="visible to strangers")
+
+        result = get_events(session_id="never-registered-anywhere", order="desc")
+
+        assert "error" not in result
+        assert len(result["events"]) >= 1
+
+    def test_unregistered_session_id_still_errors_on_resume(self):
+        """Pre-existing behaviour from #115 is unchanged."""
+        result = get_events(session_id="never-registered-either", resume=True)
+
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_re_registering_restores_polling(self):
+        """The hint tells the caller to re-register; that has to actually work."""
+        sid, _ = self._deleted_session("deleted-revive")
+        assert "error" in get_events(session_id=sid, resume=True)
+
+        register_session(name="deleted-revive", client_id="deleted-revive-client")
+        publish_event(event_type="note", payload="after revival")
+
+        result = get_events(session_id=sid, resume=True, order="asc")
+        assert "error" not in result
+
+    def test_anonymous_session_id_is_not_rejected(self):
+        result = get_events(session_id="anonymous")
+
+        assert "error" not in result
+
+    def test_warning_is_logged_once_per_deletion(self, monkeypatch, caplog):
+        """An orphaned poller runs every few seconds; one WARNING per incident
+        is discoverable, 100k of them is the log volume that hid #140."""
+        # The warn-once set is module state no fixture resets; isolate it
+        # rather than leaning on deleted_at differing between suite runs
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+        sid, reg = self._deleted_session("deleted-warn-once")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            for _ in range(3):
+                get_events(session_id=sid, resume=True)
+
+        rejections = [r for r in caplog.records if "deleted session" in r.message]
+        assert len(rejections) == 1
+        # display_id is what an operator greps the request log for
+        assert reg["display_id"] in rejections[0].message

@@ -212,6 +212,32 @@ class TestSessionDeduplication:
         assert found.id == "test-123"
         assert found.display_id == "cool-cat"
 
+    def test_get_session_include_deleted(self, storage):
+        """include_deleted=True distinguishes "deleted" from "never existed"."""
+        now = datetime.now()
+        storage.add_session(
+            Session(
+                id="test-123",
+                display_id="cool-cat",
+                name="test-session",
+                machine="localhost",
+                cwd="/test",
+                repo="test",
+                registered_at=now,
+                last_heartbeat=now,
+                client_id="12345",
+            )
+        )
+        storage.delete_session("test-123")
+
+        assert storage.get_session("test-123") is None
+
+        found = storage.get_session("test-123", include_deleted=True)
+        assert found is not None
+        assert found.deleted_at is not None
+
+        assert storage.get_session("no-such-session", include_deleted=True) is None
+
     def test_find_session_by_client_include_deleted_prefers_active(self, storage):
         """Test that include_deleted=True prefers active over deleted sessions."""
         now = datetime.now()

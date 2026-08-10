@@ -330,12 +330,17 @@ def cmd_events(args):
 
     result = call_tool("get_events", arguments, url=args.url, timeout_ms=args.timeout)
 
-    # Check for server-side errors (e.g., session not found)
+    # Check for server-side errors (e.g., session not found or deleted)
     if "error" in result:
         if args.json:
             print(json.dumps(result))
         else:
-            print(f"Error: {result['error']}", file=sys.stderr)
+            message = f"Error: {result['error']}"
+            # #140: the hint carries the actionable half ("re-register or stop
+            # polling") - dropping it leaves an orphaned poller with no next step
+            if result.get("hint"):
+                message += f"\n{result['hint']}"
+            print(message, file=sys.stderr)
         sys.exit(1)
 
     # Result is now a dict with "events", "next_cursor", and "has_more"

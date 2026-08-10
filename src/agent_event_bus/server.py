@@ -559,6 +559,69 @@ def _event_wire_dict(event: Event, *, id_key: str) -> dict:
     return d
 
 
+# (session_id, deleted_at) pairs already warned about, so an orphaned poller
+# hammering the bus every 5s contributes one WARNING rather than 100k of them.
+# Keyed on deleted_at too: a session that is revived and later deleted again is
+# a fresh incident and warns again. Bounded by the sessions table.
+_warned_deleted_sessions: set[tuple[str, str]] = set()
+
+
+def _load_polling_session(session_id: str | None) -> Session | None:
+    """Load the session behind a read, soft-deleted ones included (#140).
+
+    One lookup serves both the deleted-session check and the resume branch's
+    cursor read - `get_events` is the highest-frequency call on the bus, and
+    an orphaned poller is exactly the load this change exists to surface.
+    """
+    if not session_id or session_id == "anonymous":
+        return None
+    return storage.get_session(session_id, include_deleted=True)
+
+
+def _deleted_session_error(session: Session | None) -> dict | None:
+    """Return an error dict if `session` is soft-deleted (#140).
+
+    A deleted session's cursor and heartbeat are both frozen (every write is
+    guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
+    same position forever and gets an empty batch that is indistinguishable
+    from "you are up to date" - while staying invisible in `list_sessions`.
+    Failing the read loudly is the only thing either side can notice.
+
+    Unregistered ids stay silent: callers legitimately pass foreign session
+    ids (Claude Code's own UUIDs) that were never registered here. Only an id
+    we know we deleted is an error.
+    """
+    if session is None or session.deleted_at is None:
+        return None
+
+    session_id = session.id
+    deleted_at = session.deleted_at
+    deleted_at_str = deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at)
+
+    warn_key = (session_id, deleted_at_str)
+    if warn_key not in _warned_deleted_sessions:
+        _warned_deleted_sessions.add(warn_key)
+        logger.warning(
+            f"get_events: rejecting polls from deleted session {session.display_id} "
+            f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
+            f"client is still polling. Further rejections are logged per-call by "
+            f"the request middleware."
+        )
+        _dev_notify("get_events", f"deleted session polled: {session.display_id}")
+
+    return {
+        "error": "Session deleted",
+        "session_deleted": True,
+        "session_id": session_id,
+        "display_id": session.display_id,
+        "deleted_at": deleted_at_str,
+        "hint": (
+            "This session was unregistered or timed out, and its cursor is frozen. "
+            "Call register_session to get a live session, or stop polling."
+        ),
+    }
+
+
 def _event_to_dict(e: Event) -> dict:
     """An event as get_events returns it (event id under "id")."""
     return _event_wire_dict(e, id_key="id")
@@ -577,13 +640,22 @@ def _get_events_impl(
     min_level: Literal["lifecycle", "info", "actionable"] | None = None,
 ) -> dict:
     """Sync implementation of get_events (runs in a worker thread)."""
+    # Fail loudly for soft-deleted sessions (#140) - checked on every read
+    # path, not just resume: a client feeding next_cursor back by hand never
+    # touches the resume branch and would otherwise poll forever unnoticed.
+    session = _load_polling_session(session_id)
+    deleted = _deleted_session_error(session)
+    if deleted:
+        return deleted
+
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
 
-    # Resume from saved cursor if requested
+    # Resume from saved cursor if requested. `session` is the row loaded
+    # above - active by this point, and _auto_heartbeat only touches
+    # last_heartbeat, so its last_cursor is still current.
     # Only applies when: resume=True, session_id provided, cursor not provided
     if resume and session_id and cursor is None:
-        session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
         elif session and (peek or channel or event_types or correlation_id):
@@ -605,7 +677,7 @@ def _get_events_impl(
                 "has_more": False,
             }
         else:
-            # Session doesn't exist
+            # Session was never registered (deleted ones are rejected above)
             logger.debug(
                 f"get_events: resume failed, session not found session_id={session_id[:8]}..."
             )
@@ -686,7 +758,9 @@ async def get_events(
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
     Narrowed reads (channel/event_types/correlation_id) never advance the
-    session cursor; min_level does.
+    session cursor; min_level does. A deleted session_id returns
+    {"error": ..., "session_deleted": true} instead of an empty batch -
+    re-register or stop polling.
 
     Args:
         cursor: Position from register_session or previous call
