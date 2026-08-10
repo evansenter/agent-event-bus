@@ -18,6 +18,7 @@ from agent_event_bus.middleware import (
     _format_session_id_value,
     _get_active_sessions_map,
     _is_human_readable_id,
+    _lookup_session_display_id,
     _parse_sse_response,
 )
 
@@ -216,6 +217,17 @@ class TestFormatResult:
         result = _format_result({"error": "Something went wrong"})
         assert "ERROR:" in result
         assert "Something went wrong" in result
+
+    def test_deleted_session_resolves_to_display_id(self):
+        """The #140 detection procedure is "grep the log for the display_id",
+        so a deleted session's calls must still log under its name rather than
+        a truncated UUID."""
+        from agent_event_bus import server
+
+        reg = server._register_session_impl(name="log-lookup", client_id="log-lookup-client")
+        server.storage.delete_session(reg["session_id"])
+
+        assert _lookup_session_display_id(reg["session_id"]) == reg["display_id"]
 
     def test_error_wins_over_session_id(self):
         """An error about a session still carries session_id; rendering it as

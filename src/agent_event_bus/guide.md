@@ -190,8 +190,11 @@ otherwise poll forever getting batches indistinguishable from "up to date".
 
 **Handling it**: call `register_session` with the same `client_id` to revive
 the session (it keeps its `display_id` and `last_cursor`), or stop polling.
-Do not retry the same `session_id` — the result will not change on its own.
-The CLI exits non-zero and prints the hint to stderr.
+`client_id` is the only key revival matches on — a session originally
+registered without one cannot be revived, and re-registering mints a fresh
+`session_id`, `display_id`, and cursor. Either way, do not retry the same
+`session_id`: the result will not change on its own. The CLI exits non-zero
+and prints the hint to stderr.
 
 Session ids that were *never* registered here stay silent — foreign ids (like
 Claude Code's own UUIDs) are a supported way to read the bus. Only ids the bus
@@ -205,8 +208,15 @@ cursor to resume from.
 SELECT display_id, last_cursor, deleted_at FROM sessions WHERE deleted_at IS NOT NULL;
 ```
 
-Then grep the server log for those `display_id`s — recent hits render as
-`ERROR: Session deleted`.
+Then grep the server log for those `display_id`s. The request log prefixes
+every call with the caller's name, so an orphaned poller's rejections read:
+
+```
+[grand-bison] get_events(order=asc, limit=20, resume=true) → ERROR: Session deleted
+```
+
+Recent hits mean the poller is still running. The server also logs one
+`WARNING` naming the session the first time it is rejected after a restart.
 
 ## Structured Payload Fields
 

@@ -1612,9 +1612,12 @@ class TestDeletedSessionPolling:
 
         assert "error" not in result
 
-    def test_warning_is_logged_once_per_deletion(self, caplog):
+    def test_warning_is_logged_once_per_deletion(self, monkeypatch, caplog):
         """An orphaned poller runs every few seconds; one WARNING per incident
         is discoverable, 100k of them is the log volume that hid #140."""
+        # The warn-once set is module state no fixture resets; isolate it
+        # rather than leaning on deleted_at differing between suite runs
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
         sid, reg = self._deleted_session("deleted-warn-once")
 
         with caplog.at_level(logging.WARNING, logger="agent-event-bus"):

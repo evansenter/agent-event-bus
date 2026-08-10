@@ -31,11 +31,17 @@ def _lookup_session_display_id(session_id: str) -> str | None:
     Session IDs are now UUIDs (or client_ids). This resolves them to
     human-readable display names like "brave-trex".
 
+    Soft-deleted sessions resolve too (#140): they are exactly the ones an
+    operator needs to find in the log - a deleted session's rejected polls
+    would otherwise log under a truncated UUID, and a deleted publisher would
+    drop out of the "from:" list entirely rather than rendering in red as the
+    active/inactive colouring below intends.
+
     Returns the display_id if found, None otherwise.
     """
     try:
         storage = _get_storage()
-        session = storage.get_session(session_id)
+        session = storage.get_session(session_id, include_deleted=True)
         return session.display_id if session else None
     except Exception:
         return None

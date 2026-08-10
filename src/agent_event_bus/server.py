@@ -545,8 +545,20 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
 _warned_deleted_sessions: set[tuple[str, str]] = set()
 
 
-def _deleted_session_error(session_id: str | None) -> dict | None:
-    """Return an error dict if `session_id` names a soft-deleted session (#140).
+def _load_polling_session(session_id: str | None) -> Session | None:
+    """Load the session behind a read, soft-deleted ones included (#140).
+
+    One lookup serves both the deleted-session check and the resume branch's
+    cursor read - `get_events` is the highest-frequency call on the bus, and
+    an orphaned poller is exactly the load this change exists to surface.
+    """
+    if not session_id or session_id == "anonymous":
+        return None
+    return storage.get_session(session_id, include_deleted=True)
+
+
+def _deleted_session_error(session: Session | None) -> dict | None:
+    """Return an error dict if `session` is soft-deleted (#140).
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
@@ -558,12 +570,10 @@ def _deleted_session_error(session_id: str | None) -> dict | None:
     ids (Claude Code's own UUIDs) that were never registered here. Only an id
     we know we deleted is an error.
     """
-    if not session_id or session_id == "anonymous":
-        return None
-    session = storage.get_session(session_id, include_deleted=True)
     if session is None or session.deleted_at is None:
         return None
 
+    session_id = session.id
     deleted_at = session.deleted_at
     deleted_at_str = deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at)
 
@@ -627,17 +637,19 @@ def _get_events_impl(
     # Fail loudly for soft-deleted sessions (#140) - checked on every read
     # path, not just resume: a client feeding next_cursor back by hand never
     # touches the resume branch and would otherwise poll forever unnoticed.
-    deleted = _deleted_session_error(session_id)
+    session = _load_polling_session(session_id)
+    deleted = _deleted_session_error(session)
     if deleted:
         return deleted
 
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
 
-    # Resume from saved cursor if requested
+    # Resume from saved cursor if requested. `session` is the row loaded
+    # above - active by this point, and _auto_heartbeat only touches
+    # last_heartbeat, so its last_cursor is still current.
     # Only applies when: resume=True, session_id provided, cursor not provided
     if resume and session_id and cursor is None:
-        session = storage.get_session(session_id)
         if session and session.last_cursor:
             cursor = session.last_cursor
         elif session and (peek or channel or event_types or correlation_id):
