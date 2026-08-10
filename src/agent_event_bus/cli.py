@@ -632,7 +632,6 @@ def main():
     )
     p_events.set_defaults(func=cmd_events)
 
-    # notify
     # ack
     p_ack = subparsers.add_parser(
         "ack", help="Advance the session cursor to an event id you already hold"

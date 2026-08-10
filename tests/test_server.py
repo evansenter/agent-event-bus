@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -1755,3 +1756,100 @@ class TestAckEvents:
         assert result["session_deleted"] is True
         assert result["error"] == "Session deleted"
         assert "hint" in result and result["display_id"]
+
+    def test_rejects_any_positive_cursor_on_a_bus_with_no_events(self, tmp_path):
+        """The ahead-of-tip guard must not be inert on a fresh bus. With no
+        events, get_cursor() is None; treating that as "no ceiling" would let a
+        session ack past events that have not been published yet.
+
+        Runs against its own empty database: the suite shares one DB and never
+        deletes events, so ids only ever climb.
+        """
+        fresh = SQLiteStorage(db_path=str(tmp_path / "empty.db"))
+        now = datetime.now()
+        fresh.add_session(
+            Session(
+                id="fresh-session",
+                display_id="fresh-dino",
+                name="fresh",
+                machine="remote-host",
+                cwd="/x",
+                repo="x",
+                registered_at=now,
+                last_heartbeat=now,
+            )
+        )
+
+        with patch.object(server, "storage", fresh):
+            assert fresh.get_cursor() is None, "precondition: no events exist"
+            result = ack_events(session_id="fresh-session", cursor="5")
+
+        assert "ahead of the newest event" in result["error"]
+        assert "none published yet" in result["error"]
+        assert fresh.get_session("fresh-session").last_cursor is None
+
+    def test_reports_failure_if_the_session_dies_mid_ack(self):
+        """update_session_cursor is guarded by deleted_at IS NULL, so a
+        deletion racing the write makes the ack a no-op. Returning success for
+        a write the bus did not perform would break the one contract cmd_ack
+        relies on to exit non-zero."""
+        sid = self._session("raced")
+        published = publish_event(event_type="e", payload="one")
+        real_update = server.storage.update_session_cursor
+
+        def delete_then_update(session_id, cursor):
+            server.storage.delete_session(session_id)
+            return real_update(session_id, cursor)
+
+        with patch.object(server.storage, "update_session_cursor", delete_then_update):
+            result = ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert "success" not in result
+        assert result["session_deleted"] is True
+
+
+class TestAckOrderingHazard:
+    """Peeking at the default order="desc" makes an ack lose events.
+
+    Not a defect in ack_events - it cannot know how the peek was ordered - but
+    the reason guide.md's example specifies order="asc" and says why. Pinned
+    here so the hazard survives as executable knowledge rather than prose
+    someone edits away.
+    """
+
+    def test_desc_peek_then_ack_discards_the_unsurfaced_backlog(self):
+        reg = register_session(name="hazard", client_id="hazard-client")
+        sid = reg["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        for i in range(1, 21):
+            publish_event(event_type="help_needed", payload=f"event-{i}")
+
+        # The wrong way: default order (desc) returns the NEWEST slice while
+        # next_cursor is still the tip.
+        peeked = get_events(session_id=sid, resume=True, peek=True, limit=5)
+        assert [e["payload"] for e in peeked["events"]] == [
+            f"event-{i}" for i in (20, 19, 18, 17, 16)
+        ]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        remaining = get_events(session_id=sid, resume=True, order="asc")["events"]
+        assert remaining == [], "the 15 never-surfaced events are gone - permanently"
+
+    def test_asc_peek_then_ack_surfaces_everything_it_commits(self):
+        """The documented way: the ack covers exactly what the peek returned."""
+        reg = register_session(name="safe", client_id="safe-client")
+        sid = reg["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        for i in range(1, 21):
+            publish_event(event_type="help_needed", payload=f"event-{i}")
+
+        surfaced = []
+        while True:
+            peeked = get_events(session_id=sid, resume=True, peek=True, limit=5, order="asc")
+            if not peeked["events"]:
+                break
+            surfaced += [e["payload"] for e in peeked["events"]]
+            ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        assert surfaced == [f"event-{i}" for i in range(1, 21)], "nothing lost, nothing repeated"

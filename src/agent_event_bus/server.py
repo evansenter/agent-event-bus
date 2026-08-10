@@ -609,10 +609,10 @@ def _deleted_session_error(session: Session | None, tool: str = "get_events") ->
         logger.warning(
             f"{tool}: rejecting calls from deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
-            f"client is still polling. Further rejections are logged per-call by "
-            f"the request middleware."
+            f"client is still calling the bus. Further rejections are logged "
+            f"per-call by the request middleware."
         )
-        _dev_notify(tool, f"deleted session polled: {session.display_id}")
+        _dev_notify(tool, f"deleted session call: {session.display_id}")
 
     return {
         "error": "Session deleted",
@@ -820,10 +820,16 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # so a cursor beyond it did not come from a read - and honoring it would
     # silently mark events that do not exist yet as seen, which is this API's
     # worst failure mode: consumed but never surfaced.
+    # A bus with no events yet has no tip, and the only ackable position is 0.
+    # Treating "no tip" as "no ceiling" would let a fresh session ack past
+    # events that have not been published yet - the same loss, earlier.
     tip = storage.get_cursor()
-    if tip is not None and target > int(tip):
+    if target > (int(tip) if tip else 0):
         return {
-            "error": f"Cursor {cursor} is ahead of the newest event ({tip})",
+            "error": (
+                f"Cursor {cursor} is ahead of the newest event "
+                f"({tip if tip else 'none published yet'})"
+            ),
             "session_id": session_id,
             "next_cursor": tip,
         }
@@ -844,7 +850,15 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                 "cursor": previous,
             }
 
-    storage.update_session_cursor(session_id, cursor)
+    if not storage.update_session_cursor(session_id, cursor):
+        # Lost a race with deletion between the load above and this write
+        # (the UPDATE is guarded by deleted_at IS NULL). Re-read so the caller
+        # gets the same shape a rejected poll gets, rather than a success the
+        # bus did not actually perform - cmd_ack exits non-zero on error
+        # precisely so a drain hook cannot mistake one for the other.
+        raced = _deleted_session_error(_load_polling_session(session_id), tool="ack_events")
+        return raced or {"error": "Session not found", "session_id": session_id}
+
     # Acking is session activity, same as polling. A consumer that only acked
     # would otherwise go stale and be swept out from under itself.
     _auto_heartbeat(session_id)

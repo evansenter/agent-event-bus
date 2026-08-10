@@ -181,8 +181,10 @@ Peek and ack name the same window by construction, because the ack uses the
 cursor the peek returned:
 
 ```
-# 1. Peek: see what's pending, cursor untouched
-pending = get_events(session_id=sid, resume=True, peek=True, min_level="actionable")
+# 1. Peek: see what's pending, cursor untouched. order="asc" is REQUIRED here
+#    - see the warning below.
+pending = get_events(session_id=sid, resume=True, peek=True,
+                     min_level="actionable", order="asc")
 
 # 2. Act on pending["events"] - surface them, wake something, whatever
 
@@ -193,6 +195,14 @@ ack_events(session_id=sid, cursor=pending["next_cursor"])
 
 Everything in the peek's raw window is now seen, filtered-out noise included
 — which is the point of a server-side noise policy.
+
+> **An ack is only as bounded as the peek that produced it.** Always peek with
+> `order="asc"`. With the default `order="desc"` the batch is the *newest*
+> slice of the window while `next_cursor` is still the tip, so acking it marks
+> every older event as seen — including the ones the peek never returned.
+> Measured: a 20-event backlog peeked at `limit=5` under `desc` surfaces 5 and
+> silently loses the other 15. That is the consumed-but-never-surfaced loss
+> this primitive exists to prevent, so ordering is not a stylistic choice here.
 
 Refused, rather than silently honored:
 - a cursor **ahead of the newest event** — it would mark events that don't
