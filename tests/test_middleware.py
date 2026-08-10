@@ -660,6 +660,36 @@ class TestTailscaleAuthMiddleware:
         assert responses[0]["status"] == 200
 
     @pytest.mark.asyncio
+    async def test_explicit_null_headers_does_not_raise(self, mock_app):
+        """Sibling of the client=None case: dict(scope.get("headers", []))
+        subscript-fails the same way on an explicit headers=None. Both reads
+        of the scope use the same defensive form, so neither can be the one
+        that 500s."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "client": ("100.64.0.1", 4321),
+            "headers": None,
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        # No identity, so a 401 - the point is that it answers rather than raising
+        assert not mock_app.called
+        assert responses[0]["status"] == 401
+
+    @pytest.mark.asyncio
     async def test_rejects_request_without_tailscale_header(self, mock_app):
         """Requests without Tailscale-User-Login header get 401."""
         middleware = TailscaleAuthMiddleware(mock_app)
@@ -997,6 +1027,23 @@ class TestPeerLogging:
         )
 
         assert "from 127.0.0.1:54321 via tailscale" in line
+
+    def test_ipv6_peers_are_bracketed(self, monkeypatch):
+        """`from ::1:54321` hides where the address ends and the port begins,
+        and the port is the half the line exists for. `[::1]:54321` is the
+        conventional form and what lsof/ss print back."""
+        line = self._run(monkeypatch, scope_extra={"client": ("::1", 54321)})
+
+        assert "from [::1]:54321" in line
+
+    def test_ipv4_peers_are_not_bracketed(self, monkeypatch):
+        """The bracketing must key on the address family, not apply always."""
+        line = self._run(monkeypatch)
+
+        assert "from 127.0.0.1:54321" in line
+        # Not `"[" not in ...`: the line is full of ANSI escapes, which are
+        # all brackets. Name the shape that would actually be wrong.
+        assert "[127.0.0.1]" not in line
 
     def test_empty_identity_header_is_not_treated_as_proxied(self, monkeypatch):
         """TailscaleAuthMiddleware treats an empty value as no identity at

@@ -218,7 +218,9 @@ DEV_MODE=1 agent-event-bus
 # `from 127.0.0.1:54321 via tailscale` (Tailscale's identity header is the
 # only thing in the ASGI scope that distinguishes them, and loopback bypasses
 # auth - so the marker narrows the candidates, it does not authenticate).
-# An unmarked loopback peer is a genuinely local process.
+# An unmarked loopback peer is a local process as far as anything in the
+# scope can tell: `tailscale serve` is the only proxy this deployment puts
+# in front of the bus, but nothing here proves the absence of another.
 #
 # CAVEAT - the SUPERVISED bus does not see this. The line below is a
 # foreground invocation; `scripts/com.evansenter.agent-event-bus.plist`

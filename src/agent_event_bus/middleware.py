@@ -362,8 +362,11 @@ class TailscaleAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Check for Tailscale identity header
-        headers = dict(scope.get("headers", []))
+        # Check for Tailscale identity header. Same defensive read as the
+        # client line above, and for the same reason: an explicit
+        # headers=None would subscript-fail here instead. Two lines reading
+        # one scope should not disagree about how.
+        headers = dict(scope.get("headers") or [])
         tailscale_user = headers.get(self.TAILSCALE_USER_HEADER)
 
         if not tailscale_user:
@@ -458,6 +461,14 @@ def _peer_label(scope) -> str | None:
     except (TypeError, ValueError):
         return "unknown peer"
 
+    # Bracket an IPv6 host. `from ::1:54321` gives a reader no way to see
+    # where the address ends and the port begins, and the port is the half
+    # this whole line exists for - a tailnet peer (fd7a:...) is worse still.
+    # `[::1]:54321` is the conventional form and what lsof/ss print back.
+    # IPv4 is untouched.
+    if ":" in str(host):
+        host = f"[{host}]"
+
     # Behind `tailscale serve` the connection is terminated by the LOCAL
     # tailscaled and proxied here, so this is tailscaled's socket rather than
     # the caller's: `lsof -i :PORT` names tailscaled while the real caller is
@@ -474,8 +485,16 @@ def _peer_label(scope) -> str | None:
     # Advisory, not proof: loopback bypasses auth entirely, so a local
     # process CAN set this header itself and be marked as proxied. It
     # narrows the candidate set; it does not authenticate anything.
-    headers = dict(scope.get("headers") or [])
-    if headers.get(TailscaleAuthMiddleware.TAILSCALE_USER_HEADER):
+    #
+    # Scanned rather than dict()-ed: this runs on the event loop for every
+    # /mcp POST once peer logging is on, while only register_session
+    # consumes the result (the tool name lives in the request body, so
+    # PEER_LOGGED_TOOLS cannot be checked until _log_tool_call). Scanning
+    # short-circuits on the first match instead of materializing a dict that
+    # every get_events poll then discards.
+    wanted = TailscaleAuthMiddleware.TAILSCALE_USER_HEADER
+    identity = next((v for k, v in (scope.get("headers") or []) if k == wanted), None)
+    if identity:
         return f"{host}:{port} via tailscale"
     return f"{host}:{port}"
 
