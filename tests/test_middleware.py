@@ -325,6 +325,14 @@ class TestFormatResult:
         assert "event #7" in result
         assert "deleted" not in result
 
+    def test_flagged_call_without_event_details_still_names_the_session(self):
+        """The branch is keyed on session_deleted, not on session_deleted plus
+        event_id: a flagging disposition carries no "error" to catch it, so
+        anything missing this guard renders as an ordinary register."""
+        result = _format_result({"session_deleted": True, "display_id": "grand-bison"})
+        assert "grand-bison" in result
+        assert "session=" not in result
+
     def test_structured_content_unwrapping(self):
         """FastMCP structuredContent wrapper is unwrapped."""
         wrapped = {

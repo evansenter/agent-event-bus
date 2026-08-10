@@ -332,13 +332,17 @@ def cmd_publish(args):
         # and flags it. The warning goes to stderr because the callers this
         # actually reaches are hooks that discard stdout, and it names the id
         # the operator would grep for.
+        #
+        # Only the preamble is written here - naming the id an operator would
+        # grep for is the CLI-specific half. The rest is the server's `hint`,
+        # echoed rather than reworded: a second wording of one contract drifts,
+        # and this one had already dropped "will not come back on its own",
+        # which is what makes re-registering mandatory rather than optional.
         name = result.get("display_id") or session_id
-        print(
-            f"Warning: session {name} was deleted at {result.get('deleted_at')}; "
-            f"the event was stored under it anyway. Re-register to publish as a "
-            f"live session.",
-            file=sys.stderr,
-        )
+        warning = f"Warning: session {name} was deleted at {result.get('deleted_at')}."
+        if result.get("hint"):
+            warning += f" {result['hint']}"
+        print(warning, file=sys.stderr)
 
 
 def cmd_events(args):

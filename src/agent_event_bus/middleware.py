@@ -219,12 +219,20 @@ def _format_result(result) -> str:
     # and the generic session_id branch below would render it as a plain
     # register. Naming the dead session here is what makes an orphaned publisher
     # greppable in `make logs`, the same way a rejected poll already is.
-    if result.get("session_deleted") and "event_id" in result:
+    #
+    # Keyed on session_deleted alone rather than on session_deleted+event_id:
+    # the property that needs the branch belongs to the flag, so any later
+    # disposition that flags instead of refusing stays visible here without a
+    # second guard to remember. Event details fold in when they are present.
+    if result.get("session_deleted"):
         name = result.get("display_id") or _format_session_id_value(result.get("session_id", "?"))
-        return (
-            f"{_MAGENTA}event #{result['event_id']}{_RESET} "
-            f"[{result.get('channel', 'all')}] {_RED}from deleted {name}{_RESET}"
-        )
+        marker = f"{_RED}from deleted {name}{_RESET}"
+        if "event_id" in result:
+            return (
+                f"{_MAGENTA}event #{result['event_id']}{_RESET} "
+                f"[{result.get('channel', 'all')}] {marker}"
+            )
+        return marker
     # Before the session_id branch, for the same reason the error check sits
     # above it: an ack's entire observable effect is the cursor move, and the
     # generic session line would swallow it - logging every successful ack as

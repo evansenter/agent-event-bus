@@ -264,20 +264,24 @@ class TestCmdPublish:
         """#144: the event was stored, so the exit status stays 0 - but the
         warning has to reach stderr, since the hooks this affects discard
         stdout and would otherwise never see the flag."""
+        from agent_event_bus.server import _PUBLISH_HINT
+
         mock_call.return_value = {
             "event_id": 4211,
             "session_deleted": True,
             "session_id": "stale-id",
             "display_id": "grand-bison",
             "deleted_at": "2026-03-21T11:04:00",
-            "hint": "Call register_session to get a live session.",
+            "hint": _PUBLISH_HINT,
         }
 
         cli.cmd_publish(make_publish_args(session_id="stale-id"))
 
         captured = capsys.readouterr()
         assert "grand-bison" in captured.err
-        assert "stored" in captured.err
+        # The server's hint verbatim, not a second wording of it - the CLI
+        # writes only the preamble naming the id to grep for
+        assert _PUBLISH_HINT in captured.err
         # The event id still lands on stdout for anything parsing the result
         assert "4211" in captured.out
 
