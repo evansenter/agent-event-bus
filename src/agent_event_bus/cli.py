@@ -406,7 +406,11 @@ def cmd_ack(args):
     """Advance the session cursor to an event id already held."""
     session_id = args.session_id or _session_id_from_env()
     if not session_id:
-        print("Error: ack requires --session-id (or $AGENT_EVENT_BUS_SESSION_ID)", file=sys.stderr)
+        print(
+            "Error: ack requires --session-id (or $AGENT_EVENT_BUS_SESSION_ID, "
+            "else $CLAUDE_CODE_SESSION_ID)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     arguments = {"session_id": session_id, "cursor": args.cursor}
@@ -662,7 +666,8 @@ def main():
         help="Event id to mark as seen - the next_cursor from an order=asc, unfiltered peek",
     )
     p_ack.add_argument(
-        "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
+        "--session-id",
+        help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID, else $CLAUDE_CODE_SESSION_ID)",
     )
     p_ack.add_argument(
         "--allow-rewind",

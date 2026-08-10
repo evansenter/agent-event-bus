@@ -194,6 +194,9 @@ pending = get_events(session_id=sid, resume=True, peek=True,
 if pending["next_cursor"]:
     ack_events(session_id=sid, cursor=pending["next_cursor"])
     → {success: true, cursor: "55", previous_cursor: "42"}
+
+# 4. One pass drains at most `limit` (default 50). Loop while
+#    pending["has_more"] to catch up on a backlog in a single invocation.
 ```
 
 Everything in the peek's raw window is now seen, filtered-out noise included
@@ -232,10 +235,14 @@ Refused, rather than silently honored:
   replay deliberately
 - an ack from a **deleted session** — same error shape as a poll, see below
 
-Every refusal tells you where you are the same way, so recovery does not
-branch on *which* refusal you got — only on whether you have ever acked:
-re-ack `cursor` when it is set, and when it is `null` re-ack your own peek's
-`next_cursor` instead (see below).
+The four **cursor** refusals above all tell you where you are the same way,
+so recovery does not branch on which of them you got — only on whether you
+have ever acked: re-ack `cursor` when it is set, and when it is `null` re-ack
+your own peek's `next_cursor` instead (see below).
+
+The deleted-session refusal is the exception, and it carries no `cursor` key
+at all — there is no position to return to, because the session is gone. Its
+recovery is `register_session`, which is what its `hint` says.
 
 ```
 ack_events(session_id=sid, cursor="999999")
