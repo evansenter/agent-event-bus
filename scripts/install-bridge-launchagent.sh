@@ -27,8 +27,8 @@ fi
 # the module alone would not surface its absence - and a missing uvicorn is
 # precisely the crash-loop this check exists to prevent. A stale venv missing
 # a bridge dependency would otherwise become an import crash-loop under
-# KeepAlive - the one case where the log-truncation caveat bites hardest, since
-# every respawn wipes the previous traceback. Checking beats syncing: `uv sync
+# KeepAlive - respawning every ThrottleInterval forever, never serving a
+# delivery, with /health never answering to say so. Checking beats syncing: `uv sync
 # --no-dev` (what install-server runs) would silently strip pytest/ruff from a
 # venv someone just set up with `make dev`.
 # mktemp, not a predictable /tmp path: the 2> redirect follows symlinks, so a
@@ -62,11 +62,11 @@ mkdir -p "$DATA_DIR"
 # the job simply fails to start.
 mkdir -p "$(dirname "$BRIDGE_LOG_FILE")" "$(dirname "$BRIDGE_ERR_FILE")"
 
-REPLACED_LIVE_BRIDGE=false
+REPLACED_LOADED_JOB=false
 if launchctl list | grep -q "$LABEL$"; then
     echo "Stopping existing bridge service..."
     launchctl unload "$PLIST_DEST" 2>/dev/null || true
-    REPLACED_LIVE_BRIDGE=true
+    REPLACED_LOADED_JOB=true
 fi
 
 echo "Installing bridge LaunchAgent..."
@@ -89,9 +89,17 @@ launchctl load "$PLIST_DEST"
 # and running" and the outgoing registered: value while the replacement had
 # just exited on the singleton flock, not to return for ~ThrottleInterval.
 # /health carries nothing instance-specific to tell them apart, so wait the
-# throttle out first. Skipped entirely on a fresh install, where the first
-# answer can only come from the process we just started.
-if [[ "$REPLACED_LIVE_BRIDGE" == true ]]; then
+# throttle out first. Skipped on a fresh install, where no job was displaced.
+#
+# Two honest limits. The flag is set from `launchctl list`, which reports the
+# JOB is loaded, not that a process is alive - a loaded-but-dead job pays the
+# wait for no handoff. And 12s bounds ThrottleInterval, not the outgoing
+# shutdown: an unregister retrying against a slow bus can outlive it, and an
+# unsupervised `uv run agent-event-bus-bridge` already holding 8082 produces
+# the same shape on the fresh-install path. Both dissolve once /health carries
+# something instance-specific (a pid or start timestamp), which would let the
+# poll assert it is talking to the new process and drop this sleep entirely.
+if [[ "$REPLACED_LOADED_JOB" == true ]]; then
     echo "Waiting out the restart throttle so /health reports the NEW instance..."
     sleep 12
 fi
