@@ -82,6 +82,8 @@ Examples:
     if [ -n "$CUR" ]; then
         agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
     fi
+    # One pass drains at most --limit (default 50). Loop while
+    # `jq -r '.has_more'` is true to clear a backlog in a single hook run.
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -663,7 +665,8 @@ def main():
     p_ack.add_argument(
         "--cursor",
         required=True,
-        help="Event id to mark as seen - the next_cursor from an order=asc, unfiltered peek",
+        help="Event id to mark as seen - the next_cursor from an --order asc peek "
+        "with no --channel/--event-types/--correlation-id (--min-level is safe)",
     )
     p_ack.add_argument(
         "--session-id",

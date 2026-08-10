@@ -234,15 +234,19 @@ Refused, rather than silently honored:
 - a cursor **behind your current position** — pass `allow_rewind=True` to
   replay deliberately
 - an ack from a **deleted session** — same error shape as a poll, see below
+- an ack from a **session id that never registered** — a plain
+  `{error: "Session not found", session_id}`
 
-The four **cursor** refusals above all tell you where you are the same way,
-so recovery does not branch on which of them you got — only on whether you
-have ever acked: re-ack `cursor` when it is set, and when it is `null` re-ack
-your own peek's `next_cursor` instead (see below).
+The **cursor** refusals — the first three bullets — all tell you where you
+are the same way, so recovery does not branch on which of them you got, only
+on whether you have ever acked: re-ack `cursor` when it is set, and when it
+is `null` re-ack your own peek's `next_cursor` instead (see below).
 
-The deleted-session refusal is the exception, and it carries no `cursor` key
-at all — there is no position to return to, because the session is gone. Its
-recovery is `register_session`, which is what its `hint` says.
+The last two bullets are the **session** refusals, and neither carries a
+`cursor` key at all: there is no position to return to, because there is no
+session. Both recover through `register_session` — the deleted one says so in
+its `hint`. Reading `cursor` unconditionally on a refusal will `KeyError` on
+these two, so branch on `error` first.
 
 ```
 ack_events(session_id=sid, cursor="999999")
