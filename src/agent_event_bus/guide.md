@@ -364,6 +364,11 @@ fire-and-forget hooks with no retry and no error handling. The event keeps its
 original attribution rather than falling back to `anonymous`, so which dead
 session published stays on the record.
 
+Attribution costs downstream consumers nothing: deletion is *soft*, so the row
+stays in `sessions` and `events.session_id` still joins against `sessions.id`.
+A consumer only loses these events if it filters on `deleted_at IS NULL` — the
+events point at a real row that `list_sessions` happens not to return.
+
 **Handling it** is the same as for a poll: `register_session` (same `client_id`
 to revive) and publish under the live id from then on. Nothing needs re-sending
 — the flagged event is already stored. The CLI exits **0** and prints the
