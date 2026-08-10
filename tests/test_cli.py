@@ -39,16 +39,51 @@ class TestCallTool:
         assert result == {"success": True}
 
     @patch("agent_event_bus.cli.requests.post")
-    def test_connection_error(self, mock_post):
-        """Test connection error handling."""
+    def test_connection_error_raises_bus_unreachable(self, mock_post):
+        """A bus that isn't listening raises BusUnreachableError, naming the URL.
+
+        The type is the contract, not just the message: bridge.py branches on
+        it to tell "not up yet, retry" from a real fault.
+        """
         import requests
 
         mock_post.side_effect = requests.exceptions.ConnectionError()
 
-        with pytest.raises(SystemExit) as exc_info:
+        with pytest.raises(cli.BusUnreachableError) as exc_info:
+            cli.call_tool("list_sessions", {}, url="http://bus.example/mcp")
+
+        assert "http://bus.example/mcp" in str(exc_info.value)
+        assert isinstance(exc_info.value, cli.BusError)
+
+    @patch("agent_event_bus.cli.requests.post")
+    def test_call_tool_never_exits_the_process(self, mock_post, capsys):
+        """call_tool is a library function: it raises, it does not exit or print.
+
+        Regression guard for the coupling this replaced - bridge.py imports
+        call_tool, so a sys.exit here would take the daemon down with it.
+        """
+        mock_post.side_effect = ValueError("Something went wrong")
+
+        with pytest.raises(ValueError, match="Something went wrong"):
             cli.call_tool("list_sessions", {})
 
-        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    @patch("agent_event_bus.cli.requests.post")
+    def test_http_status_errors_propagate_untyped(self, mock_post):
+        """A 401/500 keeps its own exception type - only unreachability is wrapped."""
+        import requests
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "401 Client Error"
+        )
+        mock_post.return_value = mock_response
+
+        with pytest.raises(requests.exceptions.HTTPError, match="401"):
+            cli.call_tool("list_sessions", {})
 
     @patch("agent_event_bus.cli.requests.post")
     def test_empty_response(self, mock_post):
@@ -61,28 +96,6 @@ class TestCallTool:
         result = cli.call_tool("list_sessions", {})
 
         assert result == {}
-
-    @patch("agent_event_bus.cli.requests.post")
-    def test_debug_false_prints_error_and_exits(self, mock_post, capsys):
-        """Test that debug=False (default) prints error and exits."""
-        mock_post.side_effect = ValueError("Something went wrong")
-
-        with pytest.raises(SystemExit) as exc_info:
-            cli.call_tool("list_sessions", {}, debug=False)
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "Something went wrong" in captured.err
-
-    @patch("agent_event_bus.cli.requests.post")
-    def test_debug_true_propagates_exception(self, mock_post):
-        """Test that debug=True causes exception to propagate."""
-        mock_post.side_effect = ValueError("Something went wrong")
-
-        with pytest.raises(ValueError) as exc_info:
-            cli.call_tool("list_sessions", {}, debug=True)
-
-        assert "Something went wrong" in str(exc_info.value)
 
     @patch("agent_event_bus.cli.requests.post")
     def test_multiline_sse_response(self, mock_post):
@@ -118,7 +131,6 @@ class TestCmdRegister:
             "register_session",
             {"name": "my-session", "cwd": "/home/user/project"},
             url=None,
-            debug=False,
         )
 
     @patch("agent_event_bus.cli.call_tool")
@@ -135,7 +147,6 @@ class TestCmdRegister:
             "register_session",
             {"name": "my-project", "cwd": "/home/user/my-project"},
             url=None,
-            debug=False,
         )
 
     @patch("agent_event_bus.cli.call_tool")
@@ -167,7 +178,6 @@ class TestCmdUnregister:
             "unregister_session",
             {"session_id": "abc123"},
             url=None,
-            debug=False,
         )
 
     @patch("agent_event_bus.cli.call_tool")
@@ -182,7 +192,6 @@ class TestCmdUnregister:
             "unregister_session",
             {"client_id": "my-client-123"},
             url=None,
-            debug=False,
         )
 
     def test_unregister_requires_identifier(self):
@@ -248,7 +257,6 @@ class TestCmdPublish:
             "publish_event",
             {"event_type": "test_event", "payload": "hello", "channel": "all"},
             url=None,
-            debug=False,
         )
 
     @patch("agent_event_bus.cli.call_tool")
@@ -621,6 +629,62 @@ class TestCmdNotify:
         assert call_args["sound"] is True
 
 
+class TestMainErrorHandling:
+    """main() owns the exit policy that call_tool used to own.
+
+    Moving it here is what lets bridge.py import call_tool safely; these
+    tests make sure the CLI's own behavior - a friendly message and exit 1 -
+    survived the move intact.
+    """
+
+    def _run(self, argv, side_effect):
+        import sys
+
+        with patch.object(sys, "argv", argv):
+            with patch("agent_event_bus.cli.cmd_sessions", side_effect=side_effect):
+                with pytest.raises(SystemExit) as exc_info:
+                    cli.main()
+        return exc_info.value
+
+    def test_unreachable_bus_exits_1_with_start_hint(self, capsys):
+        exc = self._run(
+            ["cli", "sessions"], cli.BusUnreachableError("Cannot connect at http://x/mcp")
+        )
+
+        assert exc.code == 1
+        err = capsys.readouterr().err
+        assert "Cannot connect at http://x/mcp" in err
+        assert "agent-event-bus" in err
+
+    def test_other_failures_exit_1_with_the_message(self, capsys):
+        exc = self._run(["cli", "sessions"], ValueError("401 Unauthorized"))
+
+        assert exc.code == 1
+        assert "401 Unauthorized" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "failure",
+        [ValueError("boom"), cli.BusUnreachableError("boom")],
+        ids=["generic", "unreachable-bus"],
+    )
+    def test_debug_flag_reraises_every_failure(self, failure):
+        """--debug means the same thing for every failure, including an
+        unreachable bus - the one a user reaching for the flag is most likely
+        to be debugging."""
+        import sys
+
+        with patch.object(sys, "argv", ["cli", "--debug", "sessions"]):
+            with patch("agent_event_bus.cli.cmd_sessions", side_effect=failure):
+                with pytest.raises(type(failure), match="boom"):
+                    cli.main()
+
+    def test_handler_sys_exit_passes_through_untouched(self):
+        """A handler's own exit for a logical error is not an Exception, so
+        the new except-Exception arm must not intercept and relabel it."""
+        exc = self._run(["cli", "sessions"], SystemExit(3))
+        assert exc.code == 3
+
+
 class TestMainArgumentParsing:
     """Tests for main function argument parsing."""
 
@@ -748,7 +812,7 @@ class TestCmdChannels:
         args = Namespace(url=None, debug=False)
         cli.cmd_channels(args)
 
-        mock_call.assert_called_once_with("list_channels", {}, url=None, debug=False)
+        mock_call.assert_called_once_with("list_channels", {}, url=None)
 
 
 class TestCmdSessionsWithChannels:
@@ -941,6 +1005,21 @@ class TestWebhookCommands:
         assert calls[0]["tool"] == "unregister_webhook"
         assert calls[0]["arguments"] == {"webhook_id": 7}
         assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_disable_posts_active_false(self, monkeypatch):
+        calls = self._run_main(["webhook", "disable", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "set_webhook_active"
+        assert calls[0]["arguments"] == {"webhook_id": 7, "active": False}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_enable_posts_active_true(self, monkeypatch):
+        """The two verbs share one handler, so the mapping is the thing that
+        can silently invert - pin both directions, not just one."""
+        calls = self._run_main(["webhook", "enable", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "set_webhook_active"
+        assert calls[0]["arguments"] == {"webhook_id": 7, "active": True}
 
 
 class TestCmdEventsPeek:

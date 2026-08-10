@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-import shutil
 import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -16,7 +15,7 @@ logger = logging.getLogger("agent-event-bus")
 
 # Schema version for migrations
 # Increment this when adding new migrations
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Migration function type: takes a connection, returns nothing
 MigrationFunc = Callable[[sqlite3.Connection], None]
@@ -141,6 +140,29 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_correlation ON events(correlation_id)")
 
 
+@migration(5, "backfill_pre_registry_columns")
+def migrate_v5(conn: sqlite3.Connection) -> None:
+    """Add the two columns that pre-registry code added inline.
+
+    sessions.last_cursor and events.channel were added by bare ALTER TABLE
+    statements sitting in _init_db, each wrapped in
+    except-OperationalError-pass, from before the @migration registry
+    existed. Fresh installs get both from CREATE TABLE; a database old enough
+    to lack them is upgraded here instead, so the registry is now the single
+    mechanism for schema change and _init_db only ever creates.
+
+    Conditional, so it is a no-op on every database that already has them -
+    which is every database at v4.
+    """
+    session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "last_cursor" not in session_columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_cursor TEXT")
+
+    event_columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "channel" not in event_columns:
+        conn.execute("ALTER TABLE events ADD COLUMN channel TEXT NOT NULL DEFAULT 'all'")
+
+
 # Register datetime adapters/converters (required for Python 3.12+)
 # See: https://docs.python.org/3/library/sqlite3.html#default-adapters-and-converters-deprecated
 
@@ -252,40 +274,59 @@ class SQLiteStorage:
 
         self.db_path = Path(db_path)
 
-        # Migrate from old location if needed (only for default path, not custom/test paths)
-        if self.db_path == DEFAULT_DB_PATH:
-            self._migrate_db_location()
-
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
 
-    def _migrate_db_location(self) -> None:
-        """Migrate database from old location to new location.
+        # Report a pre-rename database if one is lying around (only for the
+        # default path, not custom/test paths). After _init_db, so the
+        # still-empty check below has tables to query.
+        if self.db_path == DEFAULT_DB_PATH:
+            self._warn_about_legacy_db_location()
 
-        Old: ~/.claude/event-bus.db or ~/.claude/contrib/event-bus/data.db
-        New: ~/.claude/contrib/agent-event-bus/data.db
+    def _is_empty(self) -> bool:
+        """True when this database holds no sessions and no events."""
+        with self._connect() as conn:
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            if sessions:
+                return False
+            return not conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
-        Moving only data.db is safe here ONLY because the old paths predate
-        WAL mode (single-file databases). Do not reuse this pattern for a
-        WAL-era path: data.db-wal / data.db-shm are part of the database and
-        would be left behind.
+    def _warn_about_legacy_db_location(self) -> None:
+        """Point out a database left at a pre-rename path. Never moves it.
+
+        The repo was renamed in January 2026 and the automatic move has had
+        months to run everywhere it was going to. What remains is a
+        move-the-user's-only-copy operation that fires on a path this code
+        has not written to since - so it now reports instead of acting, and
+        the operator runs a WAL-aware copy at a moment of their choosing.
+
+        Silence is not an option either: without this, a stale old-path
+        database would present as a brand-new empty bus with the real history
+        sitting unnoticed on disk.
+
+        Which is why the condition is "this database is still empty" and not
+        "this database does not exist yet". The latter is true on exactly one
+        boot - the one that creates it - so the operator would get a single
+        line at the moment they are least likely to be reading logs, then
+        silence forever while the bus runs empty. Keyed on emptiness, the
+        warning repeats for as long as it is actionable and stops on its own
+        once real history accumulates here (or the operator restores the old
+        file), without nagging anyone who deliberately started fresh.
         """
-        if self.db_path.exists():
-            return  # Already at new location, nothing to do
+        legacy = next((p for p in (OLD_CONTRIB_DB_PATH, OLD_DB_PATH) if p.exists()), None)
+        if legacy is None:
+            return
+        if not self._is_empty():
+            return  # real history lives here now; the operator has moved on
 
-        # Try old contrib path first (more recent)
-        if OLD_CONTRIB_DB_PATH.exists():
-            logger.info(f"Migrating database from {OLD_CONTRIB_DB_PATH} to {self.db_path}")
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(OLD_CONTRIB_DB_PATH), str(self.db_path))
-            logger.info("Database migration complete")
-        # Fall back to very old path
-        elif OLD_DB_PATH.exists():
-            logger.info(f"Migrating database from {OLD_DB_PATH} to {self.db_path}")
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(OLD_DB_PATH), str(self.db_path))
-            logger.info("Database migration complete")
+        logger.warning(
+            f"Found a database at the pre-rename path {legacy}, and this one "
+            f"({self.db_path}) is EMPTY. To keep the old history, stop the server "
+            f"and run:\n"
+            f'  sqlite3 "{legacy}" ".backup \'{self.db_path}\'"\n'
+            f"(sqlite3 .backup, not cp: it is WAL-aware.)"
+        )
 
     @contextmanager
     def _connect(self):
@@ -312,19 +353,34 @@ class SQLiteStorage:
         finally:
             conn.close()
 
-    def _migrate_sessions_schema(self, conn: sqlite3.Connection) -> None:
-        """Migrate from old pid-based schema to client_id schema.
+    def _reject_prehistoric_schema(self, conn: sqlite3.Connection) -> None:
+        """Refuse to open a pre-RFC-#29 (pid-based) sessions table.
 
-        This is a breaking change migration - we drop the old sessions table
-        and recreate with the new schema. Approved for clean break in RFC #29.
+        This used to silently DROP TABLE sessions and recreate it - a clean
+        break approved when the pid schema was weeks old and the data was
+        worth nothing. It has long since stopped being a migration anyone
+        needs, and what it still is, is an unconditional destructive
+        statement aimed at user data.
+
+        A database in this shape cannot realistically exist. If one does,
+        refusing is right: the operator keeps their rows and decides.
+
+        Runs before _init_db creates anything, so the refusal adds no tables
+        of its own - it only reads PRAGMA table_info. One caveat, since the
+        promise above should be exact: merely opening the file asserts
+        journal_mode=WAL (in _connect, before any statement here), which
+        rewrites the journal format. That is format, not content; no row is
+        read, written, or dropped.
         """
-        # Check if sessions table exists with old schema (pid column)
         cursor = conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
 
         if "pid" in columns and "client_id" not in columns:
-            logger.warning("Migrating sessions table: dropping old pid-based schema")
-            conn.execute("DROP TABLE sessions")
+            raise RuntimeError(
+                f"{self.db_path} has a pre-RFC-#29 pid-based sessions table, which this "
+                f"version cannot upgrade. Its session rows are obsolete but its events are "
+                f"not: back the file up, then drop the sessions table by hand to continue."
+            )
 
     def _get_schema_version(self, conn: sqlite3.Connection) -> int:
         """Get current schema version from database."""
@@ -350,20 +406,24 @@ class SQLiteStorage:
     def _init_db(self):
         """Create tables if they don't exist.
 
-        NOTE: Schema elements are defined here for fresh installs.
-        Migrations incrementally upgrade existing databases.
-        Both paths must result in identical schemas.
+        This path CREATES for fresh installs; the @migration registry ALTERs
+        for existing databases. Nothing here alters - a schema change belongs
+        in a migration (and in the CREATE below, for fresh installs).
+        Migrations run for fresh installs too (version 0 -> SCHEMA_VERSION),
+        so anything a migration creates need not be repeated here.
+
+        TestSchemaParity enforces that the two paths agree.
         """
         with self._connect() as conn:
-            # Create schema_version table first
+            # Before anything is created: a refusal should not leave its own
+            # scaffolding in the file it refused to touch.
+            self._reject_prehistoric_schema(conn)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY
                 )
             """)
-
-            # Check if we need to migrate from pid to client_id schema
-            self._migrate_sessions_schema(conn)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -380,11 +440,6 @@ class SQLiteStorage:
                     deleted_at TIMESTAMP
                 )
             """)
-            # Add last_cursor column if upgrading from older schema
-            try:
-                conn.execute("ALTER TABLE sessions ADD COLUMN last_cursor TEXT")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,17 +452,11 @@ class SQLiteStorage:
                     payload_meta TEXT
                 )
             """)
-            # Add channel column if upgrading from older schema
-            try:
-                conn.execute("ALTER TABLE events ADD COLUMN channel TEXT NOT NULL DEFAULT 'all'")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
             # Index for efficient event polling
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_events_id ON events(id)
             """)
-            # idx_events_correlation is created by migration v4, which runs for
-            # fresh installs too (version 0 -> SCHEMA_VERSION)
+            # idx_events_correlation comes from migration v4
             # Index for efficient session ordering by activity
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat)
@@ -416,18 +465,9 @@ class SQLiteStorage:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_dedup ON sessions(machine, client_id)
             """)
-            # Webhooks table for push notifications
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS webhooks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT NOT NULL,
-                    channel_filter TEXT,
-                    event_types TEXT,
-                    created_at TIMESTAMP NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    secret TEXT
-                )
-            """)
+            # The webhooks table comes from migration v3, which runs for fresh
+            # installs too - repeating its CREATE here would be a second
+            # definition to keep in sync for no gain
 
             # Run any pending migrations (also handles fresh installs where version=0)
             current_version = self._get_schema_version(conn)
@@ -689,40 +729,27 @@ class SQLiteStorage:
                 except ValueError:
                     since_id = 0  # Malformed cursor, reset to start
 
-            # Build WHERE clause based on cursor
-            if since_id == 0:
-                where_clause = ""
-                params_base: tuple = ()
-            else:
-                where_clause = "WHERE id > ?"
-                params_base = (since_id,)
+            # Build the WHERE clause from whichever filters are present.
+            # Every condition is parameterized; the only interpolated text is
+            # the placeholder run for the IN clauses, whose length comes from
+            # the caller's list, never its contents.
+            conditions: list[str] = []
+            params_base: list = []
 
+            if since_id:
+                conditions.append("id > ?")
+                params_base.append(since_id)
             if channels:
-                placeholders = ",".join("?" * len(channels))
-                channel_filter = f"channel IN ({placeholders})"
-                if where_clause:
-                    where_clause += f" AND {channel_filter}"
-                else:
-                    where_clause = f"WHERE {channel_filter}"
-                params_base = (*params_base, *channels)
-
-            if event_types and len(event_types) > 0:
-                placeholders = ",".join("?" * len(event_types))
-                type_filter = f"event_type IN ({placeholders})"
-                if where_clause:
-                    where_clause += f" AND {type_filter}"
-                else:
-                    where_clause = f"WHERE {type_filter}"
-                params_base = (*params_base, *event_types)
-
+                conditions.append(f"channel IN ({','.join('?' * len(channels))})")
+                params_base.extend(channels)
+            if event_types:
+                conditions.append(f"event_type IN ({','.join('?' * len(event_types))})")
+                params_base.extend(event_types)
             if correlation_id:
-                corr_filter = "correlation_id = ?"
-                if where_clause:
-                    where_clause += f" AND {corr_filter}"
-                else:
-                    where_clause = f"WHERE {corr_filter}"
-                params_base = (*params_base, correlation_id)
+                conditions.append("correlation_id = ?")
+                params_base.append(correlation_id)
 
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             params = (*params_base, limit)
 
             query = f"""
@@ -814,8 +841,14 @@ class SQLiteStorage:
             secret=row["secret"],
         )
 
-    def list_webhooks(self, active_only: bool = False) -> list[Webhook]:
-        """List all webhooks, optionally filtering to active only."""
+    def list_webhooks(self, active_only: bool = True) -> list[Webhook]:
+        """List webhooks, active ones only unless active_only=False.
+
+        Defaults to active-only to match the MCP tool, and because the unsafe
+        direction is asymmetric: a caller that forgets the argument while
+        deciding whom to deliver to would otherwise wake every webhook its
+        owner had deliberately paused.
+        """
         with self._connect() as conn:
             if active_only:
                 rows = conn.execute(

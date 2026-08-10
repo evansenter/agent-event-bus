@@ -1732,8 +1732,8 @@ class TestBusRegistration:
         )
         calls = []
 
-        def fake_call_tool(tool_name, arguments, url=None, debug=False, **kwargs):
-            calls.append({"tool": tool_name, "arguments": arguments, "url": url, "debug": debug})
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments, "url": url})
             if tool_name == "list_webhooks":
                 return []
             return {"webhook_id": 42}
@@ -1742,12 +1742,6 @@ class TestBusRegistration:
             webhook_id = bridge.register_with_bus(config)
 
         assert webhook_id == 42
-        # debug=True is the whole mechanism behind the named-cause logs:
-        # without it call_tool swallows a 401/timeout/bad body into a bare
-        # SystemExit(1) with the reason on stderr. Every registration call
-        # must carry it, or the daemon silently reverts to logging
-        # "SystemExit(1)" for every failure alike.
-        assert all(c["debug"] is True for c in calls)
         register = next(c for c in calls if c["tool"] == "register_webhook")
         assert register["arguments"]["url"] == "http://127.0.0.1:9999/hook"
         assert register["arguments"]["secret"] == "s3cret"
@@ -1817,7 +1811,7 @@ class TestBusRegistration:
             return {"webhook_id": 43}
 
         with patch.object(bridge, "call_tool", fake_call_tool):
-            with pytest.raises(SystemExit, match="unexpected result"):
+            with pytest.raises(bridge.BridgeRegistrationError, match="unexpected result"):
                 bridge.register_with_bus(config)
 
     def test_already_gone_stale_row_is_benign(self, tmp_path):
@@ -1840,8 +1834,8 @@ class TestBusRegistration:
         config = BridgeConfig(wake_dir=tmp_path / "wake", bus_url="http://bus/mcp")
         calls = []
 
-        def fake_call_tool(tool_name, arguments, url=None, debug=False, **kwargs):
-            calls.append({"tool": tool_name, "arguments": arguments, "url": url, "debug": debug})
+        def fake_call_tool(tool_name, arguments, url=None, **kwargs):
+            calls.append({"tool": tool_name, "arguments": arguments, "url": url})
             return {"success": True}
 
         with patch.object(bridge, "call_tool", fake_call_tool):
@@ -1852,7 +1846,6 @@ class TestBusRegistration:
                 "tool": "unregister_webhook",
                 "arguments": {"webhook_id": 42},
                 "url": "http://bus/mcp",
-                "debug": True,
             }
         ]
 
@@ -1880,6 +1873,51 @@ class TestBusRegistration:
         unregisters = [c["arguments"] for c in calls if c["tool"] == "unregister_webhook"]
         # Only the stale hook at OUR url is removed, not other consumers'
         assert unregisters == [{"webhook_id": 7}]
+        # The sweep must see paused rows too - see the next test for why
+        listings = [c["arguments"] for c in calls if c["tool"] == "list_webhooks"]
+        assert listings == [{"active_only": False}]
+
+    def test_startup_sweep_removes_a_paused_row_at_our_url(self, tmp_path):
+        """A PAUSED webhook at this bridge's URL must be swept like any other.
+
+        Regression for a sweep that listed active rows only. That held while
+        nothing could set `active = 0`; `set_webhook_active` removes the
+        guarantee, and pausing a hook that is spamming you is precisely what
+        that feature is for - so the bridge's own endpoint is a likely target.
+        Missing the paused row means: restart adds a SECOND row at this URL,
+        re-enabling the first makes the bus deliver every DM twice, and
+        shutdown unregisters only the newer id so the paused one leaks.
+
+        Driven through the REAL bus tool implementations rather than a
+        canned listing, so the paused row is genuinely absent from an
+        active-only listing and a regression cannot pass by mocking around
+        it.
+        """
+        from agent_event_bus import server
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port=9999)
+        hook_url = bridge.bridge_hook_url(config)
+
+        stale = server._register_webhook_impl(url=hook_url, channel="session:")
+        server._set_webhook_active_impl(webhook_id=stale["webhook_id"], active=False)
+        assert server._list_webhooks_impl(active_only=True) == [], "precondition: row is paused"
+
+        def bus_call_tool(tool_name, arguments, url=None, **kwargs):
+            impls = {
+                "list_webhooks": server._list_webhooks_impl,
+                "unregister_webhook": server._unregister_webhook_impl,
+                "register_webhook": server._register_webhook_impl,
+            }
+            return impls[tool_name](**arguments)
+
+        with patch.object(bridge, "call_tool", bus_call_tool):
+            new_id = bridge.register_with_bus(config)
+
+        rows = server._list_webhooks_impl(active_only=False)
+        assert [r["webhook_id"] for r in rows] == [new_id], (
+            "exactly one row must remain at this hook URL; the paused one was "
+            f"left behind and will double-deliver once re-enabled: {rows}"
+        )
 
     def test_empty_secret_env_is_normalized_to_none(self, monkeypatch):
         """An accidentally empty secret must not split registration (skips
@@ -1897,11 +1935,11 @@ class TestBusRegistration:
         assert config.secret == "s3cret"
 
     def test_registration_retries_until_bus_is_up(self, tmp_path, caplog):
-        """call_tool exits the process on connection errors, and at boot the
-        bus is often not up yet - the daemon must retry, not die. The bare
-        SystemExit(1) must render as the connection error it provably is
-        (debug=True re-raises everything else), not as "SystemExit(1)"."""
+        """At boot the bus is often not up yet - the daemon must retry, not
+        die, and the log must name the real cause."""
         import logging
+
+        from agent_event_bus.cli import BusUnreachableError
 
         config = BridgeConfig(wake_dir=tmp_path / "wake")
         attempts = []
@@ -1909,7 +1947,7 @@ class TestBusRegistration:
         def flaky_register(cfg):
             attempts.append(1)
             if len(attempts) < 3:
-                raise SystemExit(1)
+                raise BusUnreachableError("Cannot connect to agent event bus at http://bus/mcp")
             return 42
 
         state: dict = {}
@@ -1919,7 +1957,29 @@ class TestBusRegistration:
 
         assert state["webhook_id"] == 42
         assert len(attempts) == 3
-        assert any("bus unreachable (connection error)" in r.message for r in caplog.records)
+        assert any("Cannot connect to agent event bus" in r.message for r in caplog.records)
+
+    def test_registration_retries_on_named_check_failures_too(self, tmp_path, caplog):
+        """A bus that answers with something unusable is retryable as well,
+        and its own message - not a generic one - must reach the log."""
+        import logging
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake")
+        attempts = []
+
+        def flaky_register(cfg):
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise bridge.BridgeRegistrationError("register_webhook returned no webhook_id: {}")
+            return 7
+
+        state: dict = {}
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "register_with_bus", flaky_register):
+                bridge.register_with_retry(config, state, threading.Event(), initial_delay=0.01)
+
+        assert state["webhook_id"] == 7
+        assert any("no webhook_id" in r.message for r in caplog.records)
 
     def test_registration_without_id_is_retryable(self, tmp_path):
         """A bus that answers but returns no webhook_id must be a retryable
@@ -1933,7 +1993,7 @@ class TestBusRegistration:
             return {}  # answered, but no webhook_id
 
         with patch.object(bridge, "call_tool", fake_call_tool):
-            with pytest.raises(SystemExit, match="no webhook_id"):
+            with pytest.raises(bridge.BridgeRegistrationError, match="no webhook_id"):
                 bridge.register_with_bus(config)
 
     def test_non_dict_webhook_rows_are_skipped(self, tmp_path):
@@ -1962,7 +2022,7 @@ class TestBusRegistration:
             return {"webhook_id": 5}
 
         with patch.object(bridge, "call_tool", fake_call_tool):
-            with pytest.raises(SystemExit, match="list_webhooks"):
+            with pytest.raises(bridge.BridgeRegistrationError, match="list_webhooks"):
                 bridge.register_with_bus(config)
 
     def test_registration_retries_on_unexpected_errors(self, tmp_path, caplog):
@@ -2004,20 +2064,27 @@ class TestBusRegistration:
         with patch.object(bridge, "register_with_bus", never_called):
             bridge.register_with_retry(config, {}, stop, initial_delay=0.01)
 
-    def test_unregister_swallows_bus_unreachable(self, tmp_path):
+    def test_unregister_swallows_bus_unreachable(self, tmp_path, caplog):
+        import logging
+
+        from agent_event_bus.cli import BusUnreachableError
+
         config = BridgeConfig(wake_dir=tmp_path / "wake")
 
         def fake_call_tool(*args, **kwargs):
-            raise SystemExit(1)
+            raise BusUnreachableError("Cannot connect to agent event bus at http://bus/mcp")
 
-        with patch.object(bridge, "call_tool", fake_call_tool):
-            bridge.unregister_from_bus(config, 42)  # must not raise
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge, "call_tool", fake_call_tool):
+                bridge.unregister_from_bus(config, 42)  # must not raise
+        assert any("bus unreachable" in r.message for r in caplog.records)
 
     def test_unregister_logs_real_cause_for_non_connection_failures(self, tmp_path, caplog):
-        """The except-Exception arm: with debug=True a 401/timeout/bad body
-        re-raises out of call_tool - shutdown must stay best-effort AND the
-        one log line an operator has when a row leaks must carry the real
-        cause, not the connection-error misdiagnosis."""
+        """The except-Exception arm: a 401/timeout/bad body propagates out of
+        call_tool with its own type (only unreachability is wrapped), so
+        shutdown must stay best-effort AND the one log line an operator has
+        when a row leaks must carry the real cause, not the
+        connection-error misdiagnosis."""
         import logging
 
         config = BridgeConfig(wake_dir=tmp_path / "wake")
@@ -2031,14 +2098,14 @@ class TestBusRegistration:
         assert any("401" in r.message and "#42" in r.message for r in caplog.records)
         assert not any("bus unreachable" in r.message for r in caplog.records)
 
-    def test_call_tool_debug_contract(self):
-        """A bare SystemExit(1) meaning 'connection error' is a cross-module
-        contract with cli.call_tool: its ConnectionError arm exits WITHOUT
-        consulting debug, while the trailing except honours debug=True and
-        re-raises. Pin both halves against the real call_tool - the same
-        idiom as sign() and the signal-level and session-filter contract
-        tests - since either half moving would turn the named-cause log
-        lines into confident misdiagnoses with every mocked test green."""
+    def test_call_tool_failure_contract(self):
+        """The failure TYPES are a cross-module contract with cli.call_tool,
+        and this module branches on them: BusUnreachableError means "the bus isn't
+        up, back off and retry", everything else is a real fault whose own
+        exception reaches the daemon log. Pinned against the REAL call_tool -
+        the same idiom as the signal-level and session-filter contract tests -
+        because if that mapping moved, every mocked test here would stay
+        green while the daemon's log lines became confident misdiagnoses."""
         import requests
 
         from agent_event_bus import cli
@@ -2046,15 +2113,35 @@ class TestBusRegistration:
         with patch.object(
             cli.requests, "post", side_effect=requests.exceptions.ConnectionError("refused")
         ):
-            with pytest.raises(SystemExit) as exc:
-                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp", debug=True)
-        assert exc.value.code == 1
+            with pytest.raises(cli.BusUnreachableError):
+                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp")
 
         with patch.object(
             cli.requests, "post", side_effect=requests.exceptions.HTTPError("401 Client Error")
         ):
             with pytest.raises(requests.exceptions.HTTPError, match="401"):
-                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp", debug=True)
+                cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp")
+
+    def test_call_tool_does_not_exit_the_bridge(self):
+        """The whole point of the split: call_tool must never terminate the
+        process that imports it. A daemon killed by its own HTTP helper stops
+        waking sessions with nothing in its log to explain why."""
+        import requests
+
+        from agent_event_bus import cli
+
+        for side_effect in (
+            requests.exceptions.ConnectionError("refused"),
+            requests.exceptions.HTTPError("401 Client Error"),
+            requests.exceptions.Timeout("slow"),
+        ):
+            with patch.object(cli.requests, "post", side_effect=side_effect):
+                try:
+                    cli.call_tool("list_webhooks", {}, url="http://127.0.0.1:1/mcp")
+                except SystemExit:  # pragma: no cover - the regression itself
+                    pytest.fail(f"call_tool exited the process on {side_effect!r}")
+                except Exception:
+                    pass  # any ordinary exception is fine; exiting is not
 
 
 class TestDaemonLifecycle:

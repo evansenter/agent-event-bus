@@ -70,6 +70,7 @@ Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 | `notify` | System notification |
 | `register_webhook` | Register HTTP endpoint for push notifications |
 | `list_webhooks` | List registered webhooks |
+| `set_webhook_active` | Pause/resume a webhook without unregistering |
 | `unregister_webhook` | Remove a webhook |
 
 ## Channels
@@ -108,10 +109,9 @@ Push events to HTTP endpoints instead of polling. Webhooks are called asynchrono
 
 `agent-event-bus-bridge` is the experimental local consumer of this
 mechanism: a daemon that wakes idle sessions when an actionable DM arrives
-(RFC #122). Run it as `uv run agent-event-bus-bridge` from the checkout -
-unlike the CLI, nothing symlinks it onto PATH until the supervision story
-lands. See the "Re-awakening Bridge" section of the usage guide
-(`agent-event-bus://guide`).
+(RFC #122). On macOS, `make install-bridge` supervises it as a LaunchAgent;
+elsewhere run it as `uv run agent-event-bus-bridge` from the checkout, since
+nothing symlinks it onto PATH. See [`docs/BRIDGE.md`](docs/BRIDGE.md).
 
 ### MCP
 
@@ -129,7 +129,8 @@ register_webhook(url="https://...", event_types=["task_completed", "help_needed"
 register_webhook(url="https://...", secret="your-shared-secret")
 
 # List and manage
-list_webhooks()
+list_webhooks()                                  # active_only=False also shows paused
+set_webhook_active(webhook_id=1, active=False)   # pause, keeping the registration
 unregister_webhook(webhook_id=1)
 ```
 
@@ -140,10 +141,15 @@ unregister_webhook(webhook_id=1)
 agent-event-bus-cli webhook register --url https://your-server.com/events
 agent-event-bus-cli webhook register --url https://... --channel "session:" --secret "my-secret"
 
-# List
+# List (paused webhooks only show under --all)
 agent-event-bus-cli webhook list
+agent-event-bus-cli webhook list --all
 
-# Remove
+# Pause / resume - keeps the URL, filters, and secret
+agent-event-bus-cli webhook disable 1
+agent-event-bus-cli webhook enable 1
+
+# Remove (permanent)
 agent-event-bus-cli webhook unregister 1
 ```
 

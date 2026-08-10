@@ -400,6 +400,63 @@ class TestWebhookMCPTools:
         assert result["webhook_id"] == 99999
 
 
+class TestSetWebhookActive:
+    """set_webhook_active pauses deliveries without losing the registration.
+
+    The storage method and the `active` column existed from the start, but
+    nothing in MCP or the CLI could reach them, so `active` could never
+    actually be 0 in production and list_webhooks(active_only=...) was a
+    distinction without a difference. These tests cover the tool that closes
+    that gap - including the part that matters, that a paused webhook really
+    stops receiving deliveries.
+    """
+
+    def test_disable_then_enable_round_trip(self):
+        from agent_event_bus import server
+
+        wh = server._register_webhook_impl(url="https://example.com/hook")
+
+        disabled = server._set_webhook_active_impl(webhook_id=wh["webhook_id"], active=False)
+        assert disabled == {"success": True, "webhook_id": wh["webhook_id"], "active": False}
+        assert server._list_webhooks_impl(active_only=True) == []
+        assert len(server._list_webhooks_impl(active_only=False)) == 1
+
+        enabled = server._set_webhook_active_impl(webhook_id=wh["webhook_id"], active=True)
+        assert enabled["active"] is True
+        assert len(server._list_webhooks_impl(active_only=True)) == 1
+
+    def test_unknown_webhook_reports_failure(self):
+        from agent_event_bus import server
+
+        result = server._set_webhook_active_impl(webhook_id=99999, active=False)
+
+        assert result["success"] is False
+        assert result["error"] == "Webhook not found"
+        assert result["webhook_id"] == 99999
+
+    def test_disabled_webhook_receives_no_deliveries(self):
+        """The whole point: a paused webhook must drop out of the dispatch
+        set. Asserted through the real matcher, not just the listing."""
+        from agent_event_bus import server
+        from agent_event_bus.storage import Event
+
+        wh = server._register_webhook_impl(url="https://example.com/hook")
+        event = Event(
+            id=1,
+            event_type="task_completed",
+            payload="done",
+            session_id="s1",
+            timestamp=datetime.now(),
+        )
+        assert len(server.storage.get_matching_webhooks(event)) == 1
+
+        server._set_webhook_active_impl(webhook_id=wh["webhook_id"], active=False)
+        assert server.storage.get_matching_webhooks(event) == []
+
+        server._set_webhook_active_impl(webhook_id=wh["webhook_id"], active=True)
+        assert len(server.storage.get_matching_webhooks(event)) == 1
+
+
 class TestWebhookIntegration:
     """Integration tests for webhook dispatch on publish."""
 
