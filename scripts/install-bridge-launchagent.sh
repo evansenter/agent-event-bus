@@ -36,6 +36,10 @@ fi
 # user. The trap also covers an interrupt between creation and cleanup.
 IMPORT_ERR="$(mktemp "${TMPDIR:-/tmp}/agent-event-bus-bridge-import.XXXXXX")"
 trap 'rm -f "$IMPORT_ERR"' EXIT
+# uvicorn is named explicitly because bridge.py imports it lazily INSIDE
+# main(), so importing the module alone would not surface its absence. Keep
+# this list in sync with the deferred imports in bridge.py:main() - a second
+# one added there silently reopens the crash-loop hole this check closes.
 if ! PYTHONPATH="$PROJECT_DIR/src" "$VENV_PYTHON" -c "import agent_event_bus.bridge, uvicorn" 2>"$IMPORT_ERR"; then
     echo "Error: the venv cannot import the bridge and its runtime deps:"
     sed 's/^/  /' "$IMPORT_ERR"
@@ -91,6 +95,12 @@ launchctl load "$PLIST_DEST"
 # /health carries nothing instance-specific to tell them apart, so wait the
 # throttle out first. Skipped on a fresh install, where no job was displaced.
 #
+# The 12 is ThrottleInterval (10, set in the plist) plus margin, and the two
+# are coupled with nothing but this comment to link them: raise the plist's
+# ThrottleInterval without raising this and the gate under-waits, letting the
+# dying instance answer the poll again - the exact failure it was added to
+# close. The plist comment points back here.
+#
 # Two honest limits. The flag is set from `launchctl list`, which reports the
 # JOB is loaded, not that a process is alive - a loaded-but-dead job pays the
 # wait for no handoff. And 12s bounds ThrottleInterval, not the outgoing
@@ -140,7 +150,11 @@ if [[ -n "$HEALTH" ]]; then
             echo "  Not registered yet - retrying with backoff (is the bus up?)." ;;
     esac
 else
-    echo "  /health did not answer within 20s; check $BRIDGE_ERR_FILE."
+    # No elapsed figure: the poll's real bound is 20s only if every probe
+    # fails instantly (40 x sleep 0.5) and ~100s if they all hang out to
+    # --max-time 2, and the re-install path adds the 12s throttle wait ahead
+    # of it. The log path is what the operator needs anyway.
+    echo "  /health did not answer; check $BRIDGE_ERR_FILE."
 fi
 
 echo ""

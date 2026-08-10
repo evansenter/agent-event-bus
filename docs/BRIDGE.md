@@ -63,6 +63,12 @@ accumulates rather than overwrites, and the bridge needs no append-mode file
 handler of its own. The split follows from `basicConfig` being stderr-only:
 bridge records land in `.err`, while `.log` collects uvicorn's access lines.
 
+Both default under the data dir and are overridable with
+`AGENT_EVENT_BUS_BRIDGE_LOG` / `_ERR` - but unlike every other `_BRIDGE_*`
+name, those two are **install-time only**: the installer reads them and bakes
+the result into the plist, so they must be in the environment of
+`make install-bridge` itself. Setting them for a running bridge does nothing.
+
 ## Verifying supervision
 
 The test suite mocks launchd entirely, so these four are manual - and two of
@@ -78,11 +84,14 @@ them check claims the unit's own comments make:
    bus-less: `/health` shows `registered: false`. Load the bus; within ~30s
    it flips to `true` with no intervention. This is `register_with_retry`'s
    backoff doing its job. The restart is the step that makes this
-   reproducible - `registered` is the *startup* result and is never
-   re-verified, so unloading the bus under a bridge that `install-bridge`
-   just left registered leaves `/health` still reporting `true`. Corollary:
-   `/health` is not a bus-liveness probe. It answers "did I register at
-   startup", not "am I registered now".
+   reproducible - `registered` is the result of the *last registration
+   attempt*, never re-checked against the bus afterwards. (The retry thread
+   writes it, which is what the flip above is; what never happens is
+   re-validation once that thread succeeds and stops.) So unloading the bus
+   under a bridge that `install-bridge` just left registered leaves `/health`
+   still reporting `true`. Corollary: `/health` is not a bus-liveness probe.
+   It answers "did my last registration attempt succeed", not "am I
+   registered now".
 3. **Reboot** - the actual requirement. `RunAtLoad` plus login.
 4. **Clean unload** - `make uninstall-bridge`, then confirm the webhook row
    is gone and port 8082 is free.

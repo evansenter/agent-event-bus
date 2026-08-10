@@ -21,7 +21,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Resource URI | `agent-event-bus://guide` |
 | Data directory | `~/.claude/contrib/agent-event-bus/` |
 | Database | `~/.claude/contrib/agent-event-bus/data.db` |
-| Log files | `agent-event-bus.log`, `agent-event-bus.err`; bridge: `agent-event-bus-bridge.log`, `agent-event-bus-bridge.err` (the bridge's are launchd's stdout/stderr capture; launchd APPENDS across restarts, so no file handler of its own is needed. Bridge records go to `.err` - it logs to stderr - while `.log` gets uvicorn access lines) |
+| Log files | Bus: `agent-event-bus.log` (the Python `FileHandler`, the one `_LOG` moves), `agent-event-bus.err`, plus `agent-event-bus.stdout` - launchd's stdout capture, hardcoded in the plist and therefore the one file no env var relocates. Bridge: `agent-event-bus-bridge.log`, `agent-event-bus-bridge.err` (both launchd captures; launchd APPENDS across restarts, so no file handler of its own is needed. Bridge records go to `.err` - it logs to stderr - while `.log` gets uvicorn access lines) |
 | LaunchAgent | `com.evansenter.agent-event-bus.plist`; bridge: `com.evansenter.agent-event-bus-bridge.plist` (separate unit - a bus host need not run a bridge) |
 | systemd service | `agent-event-bus.service` |
 | Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |

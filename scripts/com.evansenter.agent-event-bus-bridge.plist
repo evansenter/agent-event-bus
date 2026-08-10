@@ -52,7 +52,10 @@
 
     <!-- launchd's default respawn throttle, stated explicitly so the unit
          describes its own restart cadence: it bounds how fast a failing
-         bridge re-registers against the bus. -->
+         bridge re-registers against the bus.
+         install-bridge-launchagent.sh sleeps this out (12s = this + margin)
+         on a re-install so /health answers from the NEW instance - raise
+         this and raise that sleep too, or the gate under-waits. -->
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
