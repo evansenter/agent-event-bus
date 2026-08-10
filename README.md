@@ -109,9 +109,9 @@ Push events to HTTP endpoints instead of polling. Webhooks are called asynchrono
 
 `agent-event-bus-bridge` is the experimental local consumer of this
 mechanism: a daemon that wakes idle sessions when an actionable DM arrives
-(RFC #122). Run it as `uv run agent-event-bus-bridge` from the checkout -
-unlike the CLI, nothing symlinks it onto PATH until the supervision story
-lands. See [`docs/BRIDGE.md`](docs/BRIDGE.md).
+(RFC #122). On macOS, `make install-bridge` supervises it as a LaunchAgent;
+elsewhere run it as `uv run agent-event-bus-bridge` from the checkout, since
+nothing symlinks it onto PATH. See [`docs/BRIDGE.md`](docs/BRIDGE.md).
 
 ### MCP
 

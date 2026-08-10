@@ -51,6 +51,24 @@ def storage(temp_db):
     return SQLiteStorage(db_path=temp_db)
 
 
+# Both names the CLI consults when --session-id is omitted (#137).
+# CLAUDE_CODE_SESSION_ID is injected by Claude Code into every subprocess it
+# spawns - including the one running this suite - so an ambient value would
+# silently satisfy any assertion expecting NO attribution, making results
+# depend on where the suite runs. Scrubbed suite-wide rather than per-module:
+# test_structured_payload.py and test_signal_levels.py also drive
+# cmd_publish/cmd_events, and are safe today only because none of their
+# assertions check for absence. The first one that does would be silently
+# machine-dependent.
+SESSION_ID_ENV = ("AGENT_EVENT_BUS_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+
+
+@pytest.fixture(autouse=True)
+def clean_session_id_env(monkeypatch):
+    for name in SESSION_ID_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def clean_storage():
     """Clean the storage before each test.

@@ -6,8 +6,9 @@ subsystem (RFC #122). It is documented here rather than in
 into working sessions, and this is operator documentation for a component
 most sessions never run.
 
-**Status: prototype.** No install target, no supervision story, and the
-addressability and durability caveats below are real. See issue #122.
+**Status: prototype.** Supervised on macOS since #139 (`make install-bridge`);
+no systemd unit yet, and the addressability and durability caveats below are
+real. See issue #122.
 
 ---
 
@@ -34,8 +35,55 @@ uv run agent-event-bus-bridge --backend tmux     # also types a wake prompt into
 ```
 
 (`uv run` from the repo checkout: the console script lives in the project
-venv - unlike `agent-event-bus-cli`, nothing symlinks it onto PATH yet.
-That lands with the supervision story.)
+venv - unlike `agent-event-bus-cli`, nothing symlinks it onto PATH.)
+
+## Running it supervised (macOS)
+
+```
+make install-bridge     # LaunchAgent: starts at login, restarts on crash
+make uninstall-bridge   # stops it; leaves the bus, the DB, and wake/ alone
+```
+
+A **separate unit** from the bus (`com.evansenter.agent-event-bus-bridge`)
+because a bus host does not have to run a bridge, and the bridge is
+experimental while the bus is not. The unit pins `--backend spool`; tmux
+additionally needs `wake/panes.json` maintained by something session-side.
+
+**Boot ordering is a non-issue.** launchd has no dependency ordering, so the
+bridge can start before the bus is listening. `register_with_retry` backs off
+1s->30s until the bus answers rather than exiting, so a cold boot in the
+"wrong" order self-corrects; `/health` reports `registered: false` until it
+does. That is also why the installer's `registered: false` is a status line
+and not an error.
+
+**The bridge log is launchd's stdout/stderr capture** and launchd
+**truncates it on every restart** - the bridge logs via `basicConfig`
+(stderr) and has no append-mode file logger like the bus does. A crash loop
+therefore overwrites earlier iterations; `ThrottleInterval` (10s) is what
+keeps the surviving window useful. Giving the bridge its own file handler is
+the follow-up that removes this caveat.
+
+## Verifying supervision
+
+The test suite mocks launchd entirely, so these four are manual - and two of
+them check claims the unit's own comments make:
+
+1. **Crash restart** - `kill -9` the bridge; launchd respawns it within
+   `ThrottleInterval`. Confirms the singleton flock releases on process death
+   (so the replacement acquires it rather than refusing to start) and that
+   the startup sweep reclaims the dead instance's webhook row instead of
+   leaving a duplicate: `agent-event-bus-cli webhook list --all` should show
+   one.
+2. **Boot order** - unload the bus, load the bridge: `/health` shows
+   `registered: false`. Load the bus; within ~30s it flips to `true` with no
+   intervention. This is `register_with_retry`'s backoff doing its job.
+3. **Reboot** - the actual requirement. `RunAtLoad` plus login.
+4. **Clean unload** - `make uninstall-bridge`, then confirm the webhook row
+   is gone and port 8082 is free.
+
+What none of this covers: whether a session actually *wakes*. The spool line
+lands, but nothing drains it yet (see the pruning note below), so the far end
+of the pipeline stays unobservable until a drain hook exists.
 
 ## Backends
 
@@ -324,8 +372,7 @@ delivery is a v2 item.
 
 ## Supervision
 
-Supervision is deliberately out of scope for the v1 prototype: there is no
-`make install-bridge`, launchd plist, or systemd unit yet - run the bridge in
-a terminal (or your own supervisor) while experimenting. Startup ordering is
-already safe for a future supervisor (registration retries until the bus is
-up); unit files land once the prototype proves out (RFC #122).
+Supervision exists on macOS only: `make install-bridge` installs a LaunchAgent
+(see "Running it supervised" above). There is no systemd unit yet - on Linux,
+run the bridge under your own supervisor. Startup ordering is safe either way,
+since registration retries until the bus is up.

@@ -9,19 +9,6 @@ import pytest
 from agent_event_bus import cli
 from conftest import make_events_args, make_publish_args
 
-# Both names the CLI consults when --session-id is omitted. CLAUDE_CODE_SESSION_ID
-# is injected by Claude Code into every subprocess it spawns - including the one
-# running this suite - so without the scrub below an ambient value would silently
-# satisfy assertions that expect NO attribution, and the suite would pass on a
-# developer's machine while failing in CI (or the reverse).
-SESSION_ID_ENV = ("AGENT_EVENT_BUS_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
-
-
-@pytest.fixture(autouse=True)
-def clean_session_id_env(monkeypatch):
-    for name in SESSION_ID_ENV:
-        monkeypatch.delenv(name, raising=False)
-
 
 class TestCallTool:
     """Tests for call_tool function."""
