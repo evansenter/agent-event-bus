@@ -2080,10 +2080,11 @@ class TestBusRegistration:
         assert any("bus unreachable" in r.message for r in caplog.records)
 
     def test_unregister_logs_real_cause_for_non_connection_failures(self, tmp_path, caplog):
-        """The except-Exception arm: with debug=True a 401/timeout/bad body
-        re-raises out of call_tool - shutdown must stay best-effort AND the
-        one log line an operator has when a row leaks must carry the real
-        cause, not the connection-error misdiagnosis."""
+        """The except-Exception arm: a 401/timeout/bad body propagates out of
+        call_tool with its own type (only unreachability is wrapped), so
+        shutdown must stay best-effort AND the one log line an operator has
+        when a row leaks must carry the real cause, not the
+        connection-error misdiagnosis."""
         import logging
 
         config = BridgeConfig(wake_dir=tmp_path / "wake")

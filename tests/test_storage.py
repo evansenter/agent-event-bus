@@ -712,8 +712,11 @@ KNOWN_CONSTRAINT_DIVERGENCES = {("sessions", "display_id")}
 
 
 def _schema_snapshot(db_path) -> dict:
-    """Per table: columns as name → (type, notnull, default), and indexes as
-    name → CREATE statement.
+    """Per table: columns as name → (type, notnull, pk, default), and indexes
+    as name → CREATE statement.
+
+    That tuple order is load-bearing: _compare_columns indexes [0] for the
+    declared type and [1:] for the constraints it relaxes on an exempt column.
 
     Column ORDER is deliberately not compared: ALTER TABLE appends, so a
     migrated database legitimately orders columns differently from a fresh
@@ -840,16 +843,40 @@ class TestSchemaParity:
                 f"Indexes diverged on '{table}' (name → CREATE statement)."
             )
 
-    def test_the_recorded_divergences_are_still_real(self):
-        """An allowance nobody rechecks becomes a permanent blind spot.
+    def test_the_recorded_divergences_are_still_real(self, tmp_path):
+        """Every recorded allowance must still be earning its place.
 
-        If a rebuild migration ever fixes sessions.display_id, this fails and
-        the entry comes out of the list - rather than silently exempting a
-        column that no longer needs exempting.
+        OBSERVES the divergence rather than asserting the constant against its
+        own literal. The literal form would be a change-detector: a rebuild
+        migration that made display_id NOT NULL on migrated databases too
+        would leave the constant untouched (green here) and the parity test
+        green as well - an exemption only ever relaxes a comparison - so the
+        stale allowance would survive precisely the event meant to retire it,
+        and its blind spot would be permanent from then on.
+
+        Compares everything except the declared type, since type is compared
+        for exempt columns anyway: an entry whose (notnull, pk, default) all
+        match is exempting nothing.
         """
-        assert KNOWN_CONSTRAINT_DIVERGENCES == {("sessions", "display_id")}, (
-            "Update this test alongside the list, and say why in the comment there."
-        )
+        fresh_path = tmp_path / "fresh.db"
+        SQLiteStorage(db_path=str(fresh_path))
+
+        migrated_path = tmp_path / "migrated.db"
+        self._build_v1_db(migrated_path)
+        SQLiteStorage(db_path=str(migrated_path))
+
+        fresh = _schema_snapshot(fresh_path)
+        migrated = _schema_snapshot(migrated_path)
+
+        for table, column in KNOWN_CONSTRAINT_DIVERGENCES:
+            migrated_spec = migrated[table]["columns"][column]
+            fresh_spec = fresh[table]["columns"][column]
+            assert migrated_spec[1:] != fresh_spec[1:], (
+                f"'{table}.{column}' no longer diverges between a fresh and a migrated "
+                f"database (both {fresh_spec[1:]} for notnull/pk/default). The entry in "
+                f"KNOWN_CONSTRAINT_DIVERGENCES is now exempting nothing - delete it, so "
+                f"the column goes back to being compared in full."
+            )
 
     def test_reopening_is_idempotent(self, tmp_path):
         """Re-opening an up-to-date database must not re-run or re-alter anything."""
