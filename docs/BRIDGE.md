@@ -165,6 +165,7 @@ That lands with the supervision story.)
   types the wake prompt into whatever now owns the pane (usually a shell
   after the session exits), so the maintainer of `panes.json` should prune
   entries when sessions end.
+
 ## Loop prevention and single-instance
 
 - Per-session cooldown (default 30s, `--cooldown`) bounds *successful tmux
@@ -197,6 +198,7 @@ That lands with the supervision story.)
   different uid-scoped lock dirs, so they do not contend - give each user's
   bridge a distinct `--port`/`--hook-url` there. Embedders manage their own
   single-instance story.
+
 ## Security and operation
 
 - Set `AGENT_EVENT_BUS_BRIDGE_SECRET` to HMAC-authenticate the bus->bridge
@@ -253,7 +255,8 @@ That lands with the supervision story.)
   loopback literal, or any value listed with `--allowed-hosts` - the same
   allowlist covers both endpoints, so a monitoring probe arriving through
   the same reverse proxy as the deliveries passes on the proxy's Host.
-### Delivery outcomes
+
+## Delivery outcomes
 
 - Each delivered `200` carries an `action` field naming what happened:
   `spool` (spool backend, working as designed), `tmux` (wake injected),

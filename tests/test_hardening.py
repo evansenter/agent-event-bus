@@ -15,21 +15,45 @@ from agent_event_bus.storage import BUSY_TIMEOUT_MS, Event
 class TestAsyncToolWrappers:
     """Tool functions must not block the server's event loop."""
 
+    def _registered_tools(self):
+        """Every @mcp.tool()-decorated function, taken from the registry.
+
+        Enumerated rather than hand-listed: a hand-list silently stops
+        covering the next tool someone adds, which is how set_webhook_active
+        arrived uncovered. The registry cannot fall behind the code.
+
+        Matched by TYPE, anchored on one known tool, rather than by duck-typing
+        on .fn/.name - conftest's autouse fixture patches a MagicMock into this
+        module, and a MagicMock answers hasattr for every name.
+        """
+        tool_type = type(server.register_session)
+        tools = [v for v in vars(server).values() if isinstance(v, tool_type)]
+        assert tools, "found no registered tools - has FastMCP's tool wrapper changed shape?"
+        return tools
+
     def test_all_tools_are_async(self):
-        tools = [
-            server.register_session,
-            server.list_sessions,
-            server.list_channels,
-            server.publish_event,
-            server.get_events,
-            server.unregister_session,
-            server.notify,
-            server.register_webhook,
-            server.list_webhooks,
-            server.unregister_webhook,
-        ]
-        for tool in tools:
+        """The #112 invariant: a blocking tool body freezes the whole server."""
+        for tool in self._registered_tools():
             assert inspect.iscoroutinefunction(tool.fn), f"{tool.name} is not async"
+
+    def test_tool_coverage_includes_every_known_tool(self):
+        """Guard the guard: if the registry scan ever silently matches
+        nothing (or stops matching some tools), the loop above passes
+        vacuously. Pin the roster so a shape change fails loudly."""
+        found = {tool.name for tool in self._registered_tools()}
+        assert found == {
+            "register_session",
+            "list_sessions",
+            "list_channels",
+            "publish_event",
+            "get_events",
+            "unregister_session",
+            "notify",
+            "register_webhook",
+            "list_webhooks",
+            "set_webhook_active",
+            "unregister_webhook",
+        }, f"tool roster changed: {sorted(found)} - update this list and guide.md together"
 
     def test_wrappers_pass_through_end_to_end(self):
         async def main():

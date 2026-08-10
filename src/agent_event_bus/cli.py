@@ -629,14 +629,16 @@ def main():
     # (SystemExit is not an Exception) passes through untouched.
     try:
         args.func(args)
-    except BusUnreachableError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        print("Start with: agent-event-bus", file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
+        # --debug is checked before the friendly arms so it means one thing
+        # everywhere: give me the traceback. Handling BusUnreachableError
+        # first instead would swallow the stack for the single failure a user
+        # is most likely to be debugging when they reach for the flag.
         if args.debug:
             raise
         print(f"Error: {e}", file=sys.stderr)
+        if isinstance(e, BusUnreachableError):
+            print("Start with: agent-event-bus", file=sys.stderr)
         sys.exit(1)
 
 

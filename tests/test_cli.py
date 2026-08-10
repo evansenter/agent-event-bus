@@ -631,12 +631,20 @@ class TestMainErrorHandling:
         assert exc.code == 1
         assert "401 Unauthorized" in capsys.readouterr().err
 
-    def test_debug_flag_reraises_instead_of_exiting(self):
+    @pytest.mark.parametrize(
+        "failure",
+        [ValueError("boom"), cli.BusUnreachableError("boom")],
+        ids=["generic", "unreachable-bus"],
+    )
+    def test_debug_flag_reraises_every_failure(self, failure):
+        """--debug means the same thing for every failure, including an
+        unreachable bus - the one a user reaching for the flag is most likely
+        to be debugging."""
         import sys
 
         with patch.object(sys, "argv", ["cli", "--debug", "sessions"]):
-            with patch("agent_event_bus.cli.cmd_sessions", side_effect=ValueError("boom")):
-                with pytest.raises(ValueError, match="boom"):
+            with patch("agent_event_bus.cli.cmd_sessions", side_effect=failure):
+                with pytest.raises(type(failure), match="boom"):
                     cli.main()
 
     def test_handler_sys_exit_passes_through_untouched(self):

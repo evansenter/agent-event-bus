@@ -1873,6 +1873,51 @@ class TestBusRegistration:
         unregisters = [c["arguments"] for c in calls if c["tool"] == "unregister_webhook"]
         # Only the stale hook at OUR url is removed, not other consumers'
         assert unregisters == [{"webhook_id": 7}]
+        # The sweep must see paused rows too - see the next test for why
+        listings = [c["arguments"] for c in calls if c["tool"] == "list_webhooks"]
+        assert listings == [{"active_only": False}]
+
+    def test_startup_sweep_removes_a_paused_row_at_our_url(self, tmp_path):
+        """A PAUSED webhook at this bridge's URL must be swept like any other.
+
+        Regression for a sweep that listed active rows only. That held while
+        nothing could set `active = 0`; `set_webhook_active` removes the
+        guarantee, and pausing a hook that is spamming you is precisely what
+        that feature is for - so the bridge's own endpoint is a likely target.
+        Missing the paused row means: restart adds a SECOND row at this URL,
+        re-enabling the first makes the bus deliver every DM twice, and
+        shutdown unregisters only the newer id so the paused one leaks.
+
+        Driven through the REAL bus tool implementations rather than a
+        canned listing, so the paused row is genuinely absent from an
+        active-only listing and a regression cannot pass by mocking around
+        it.
+        """
+        from agent_event_bus import server
+
+        config = BridgeConfig(wake_dir=tmp_path / "wake", port=9999)
+        hook_url = bridge.bridge_hook_url(config)
+
+        stale = server._register_webhook_impl(url=hook_url, channel="session:")
+        server._set_webhook_active_impl(webhook_id=stale["webhook_id"], active=False)
+        assert server._list_webhooks_impl(active_only=True) == [], "precondition: row is paused"
+
+        def bus_call_tool(tool_name, arguments, url=None, **kwargs):
+            impls = {
+                "list_webhooks": server._list_webhooks_impl,
+                "unregister_webhook": server._unregister_webhook_impl,
+                "register_webhook": server._register_webhook_impl,
+            }
+            return impls[tool_name](**arguments)
+
+        with patch.object(bridge, "call_tool", bus_call_tool):
+            new_id = bridge.register_with_bus(config)
+
+        rows = server._list_webhooks_impl(active_only=False)
+        assert [r["webhook_id"] for r in rows] == [new_id], (
+            "exactly one row must remain at this hook URL; the paused one was "
+            f"left behind and will double-deliver once re-enabled: {rows}"
+        )
 
     def test_empty_secret_env_is_normalized_to_none(self, monkeypatch):
         """An accidentally empty secret must not split registration (skips

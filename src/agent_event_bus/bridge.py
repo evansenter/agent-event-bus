@@ -1351,13 +1351,20 @@ def register_with_bus(config: BridgeConfig) -> int:
     register_with_retry backs off on all of them.
 
     Idempotent: an unclean exit (SIGKILL, crash, reboot) skips main()'s
-    finally, leaving a stale active webhook at this URL - and the bus neither
-    dedupes by URL nor deactivates failing hooks, so each stale row would
-    duplicate every wake. Remove matching URLs before registering.
+    finally, leaving a stale webhook at this URL - and the bus neither dedupes
+    by URL nor deactivates failing hooks, so each stale row would duplicate
+    every wake. Remove matching URLs before registering.
     """
     hook_url = bridge_hook_url(config)
 
-    existing = call_tool("list_webhooks", {"active_only": True}, url=config.bus_url)
+    # active_only=False: a row at THIS bridge's hook URL is stale whether or
+    # not someone paused it, and the removal is a delete either way. Sweeping
+    # active-only would skip a paused row and add a second row at the same
+    # URL - and re-enabling the paused one then makes the bus dispatch every
+    # DM here twice. (Harmless until set_webhook_active existed, since
+    # `active` could never be 0; pausing a noisy hook is exactly the case
+    # that feature is for, and this endpoint fits it.)
+    existing = call_tool("list_webhooks", {"active_only": False}, url=config.bus_url)
     if not isinstance(existing, list):
         # Proceeding without the dedupe would stack the duplicate deliveries
         # this sweep exists to prevent - retryable failure, like the no-id

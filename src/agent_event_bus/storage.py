@@ -274,14 +274,23 @@ class SQLiteStorage:
 
         self.db_path = Path(db_path)
 
-        # Report a pre-rename database if one is lying around (only for the
-        # default path, not custom/test paths)
-        if self.db_path == DEFAULT_DB_PATH:
-            self._warn_about_legacy_db_location()
-
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
+
+        # Report a pre-rename database if one is lying around (only for the
+        # default path, not custom/test paths). After _init_db, so the
+        # still-empty check below has tables to query.
+        if self.db_path == DEFAULT_DB_PATH:
+            self._warn_about_legacy_db_location()
+
+    def _is_empty(self) -> bool:
+        """True when this database holds no sessions and no events."""
+        with self._connect() as conn:
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            if sessions:
+                return False
+            return not conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
     def _warn_about_legacy_db_location(self) -> None:
         """Point out a database left at a pre-rename path. Never moves it.
@@ -295,20 +304,29 @@ class SQLiteStorage:
         Silence is not an option either: without this, a stale old-path
         database would present as a brand-new empty bus with the real history
         sitting unnoticed on disk.
-        """
-        if self.db_path.exists():
-            return  # Already at the current location, nothing to say
 
-        for legacy in (OLD_CONTRIB_DB_PATH, OLD_DB_PATH):
-            if legacy.exists():
-                logger.warning(
-                    f"Found a database at the pre-rename path {legacy}, and none at "
-                    f"{self.db_path} - starting with an EMPTY database. To keep the old "
-                    f"history, stop the server and run:\n"
-                    f'  sqlite3 "{legacy}" ".backup \'{self.db_path}\'"\n'
-                    f"(sqlite3 .backup, not cp: it is WAL-aware.)"
-                )
-                return
+        Which is why the condition is "this database is still empty" and not
+        "this database does not exist yet". The latter is true on exactly one
+        boot - the one that creates it - so the operator would get a single
+        line at the moment they are least likely to be reading logs, then
+        silence forever while the bus runs empty. Keyed on emptiness, the
+        warning repeats for as long as it is actionable and stops on its own
+        once real history accumulates here (or the operator restores the old
+        file), without nagging anyone who deliberately started fresh.
+        """
+        legacy = next((p for p in (OLD_CONTRIB_DB_PATH, OLD_DB_PATH) if p.exists()), None)
+        if legacy is None:
+            return
+        if not self._is_empty():
+            return  # real history lives here now; the operator has moved on
+
+        logger.warning(
+            f"Found a database at the pre-rename path {legacy}, and this one "
+            f"({self.db_path}) is EMPTY. To keep the old history, stop the server "
+            f"and run:\n"
+            f'  sqlite3 "{legacy}" ".backup \'{self.db_path}\'"\n'
+            f"(sqlite3 .backup, not cp: it is WAL-aware.)"
+        )
 
     @contextmanager
     def _connect(self):
