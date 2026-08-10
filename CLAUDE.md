@@ -188,7 +188,14 @@ AGENT_EVENT_BUS_DB=/path/to/db.sqlite agent-event-bus
 # them first) — bare shell assignments below will NOT apply at install time.
 AGENT_EVENT_BUS_LOG=/path/to/custom.log AGENT_EVENT_BUS_ERR=/path/to/custom.err make install-server
 
-# Dev mode console logging
+# Dev mode console logging. Also appends the caller's peer address to the
+# `register_session` log line (#145) - `register_session(...) → session=x
+# from 127.0.0.1:54321`. Off outside DEV_MODE: this is instrumentation for
+# "which process is registering?", not a permanent log line. The PORT is the
+# identifying half (the bus is loopback/tailnet, so the address says
+# nothing); map it to a PID with `lsof -i :54321` while the calls are live.
+# Only register_session carries it - get_events runs every few seconds per
+# session and would drown the log you are reading.
 DEV_MODE=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)

@@ -809,3 +809,109 @@ class TestLoggingOffLoop:
         # The lookup ran (the log line was built) but not on the loop thread
         assert "thread" in seen
         assert seen["thread"] is not threading.current_thread()
+
+
+class TestPeerLogging:
+    """DEV_MODE-gated peer address/port on register_session (#145).
+
+    Instrumentation, not a permanent log line: something registers and
+    immediately unregisters a session ~1.5x/min on the bus host and nothing
+    records where the calls come from. The port is the identifying half -
+    it is what `lsof -i` maps back to a PID.
+    """
+
+    def _run(self, monkeypatch, tool_name="register_session", scope_extra=None, dev_mode=True):
+        """Drive one MCP tool call through the middleware, return the log line."""
+        import asyncio
+        import json
+
+        from agent_event_bus import middleware as mw
+
+        if dev_mode:
+            monkeypatch.setenv("DEV_MODE", "1")
+        else:
+            monkeypatch.delenv("DEV_MODE", raising=False)
+        monkeypatch.setattr(mw, "_lookup_session_display_id", lambda sid: None)
+
+        lines = []
+        monkeypatch.setattr(mw.logger, "info", lambda msg: lines.append(msg))
+
+        async def fake_app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'event: message\ndata: {"result": {"session_id": "abc-123"}}\n\n',
+                    "more_body": False,
+                }
+            )
+
+        app = mw.RequestLoggingMiddleware(fake_app)
+        request_body = json.dumps(
+            {
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": {"name": "evansenter"}},
+            }
+        ).encode()
+
+        async def main():
+            scope = {"type": "http", "path": "/mcp", "method": "POST"}
+            scope.update(
+                scope_extra if scope_extra is not None else {"client": ("127.0.0.1", 54321)}
+            )
+            messages = [{"type": "http.request", "body": request_body, "more_body": False}]
+
+            async def receive():
+                return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+            async def send(message):
+                pass
+
+            await app(scope, receive, send)
+
+        asyncio.run(main())
+        assert len(lines) == 1
+        return lines[0]
+
+    def test_register_session_logs_the_peer_under_dev_mode(self, monkeypatch):
+        line = self._run(monkeypatch)
+
+        # The port is the point: `lsof -i :54321` is what names the process
+        assert "from 127.0.0.1:54321" in line
+        # On the same line as the call it belongs to, so the peer is already
+        # paired with the registration it produced
+        assert "register_session" in line
+
+    def test_nothing_is_logged_without_dev_mode(self, monkeypatch):
+        """Off by default - this must not become a permanent log line."""
+        line = self._run(monkeypatch, dev_mode=False)
+
+        assert "127.0.0.1" not in line
+        assert "54321" not in line
+        assert " from " not in line
+        # The rest of the line is untouched
+        assert "register_session" in line
+
+    def test_other_tools_stay_quiet_even_under_dev_mode(self, monkeypatch):
+        """Scoped to the one call that answers the question. get_events runs
+        every few seconds per session; a peer on each would drown the log the
+        diagnosis is being read from."""
+        line = self._run(monkeypatch, tool_name="get_events")
+
+        assert "54321" not in line
+        assert " from " not in line
+
+    def test_missing_peer_is_named_rather_than_dropped(self, monkeypatch):
+        """A scope with no client (unix socket, or an ASGI server that omits
+        it) must not read as "DEV_MODE isn't on" to the operator who just
+        turned it on - and must not raise inside the logging path."""
+        line = self._run(monkeypatch, scope_extra={})
+
+        assert "from unknown peer" in line
+
+    def test_malformed_client_does_not_break_logging(self, monkeypatch):
+        line = self._run(monkeypatch, scope_extra={"client": "127.0.0.1"})
+
+        assert "from unknown peer" in line
+        assert "register_session" in line

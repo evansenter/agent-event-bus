@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import anyio.to_thread
@@ -397,6 +398,45 @@ class TailscaleAuthMiddleware:
         )
 
 
+# Tools whose log line carries the caller's peer address under DEV_MODE
+# (#145). Just register_session: the churn being diagnosed arrives as
+# register/unregister pairs, and the registration alone names the process, so
+# there is no reason to double the noise.
+PEER_LOGGED_TOOLS = ("register_session",)
+
+
+def _peer_label(scope) -> str | None:
+    """Peer of the connection behind an ASGI scope, as host:port - DEV_MODE only.
+
+    Instrumentation for #145, not a permanent log line: something registers
+    and immediately unregisters a session ~1.5x/min on the bus host, and
+    nothing recorded WHERE the calls came from. Returns None (and the log
+    line is unchanged) unless DEV_MODE is set, so a bus serving real sessions
+    does not start recording a peer for every registration forever.
+
+    The PORT is the identifying half. The bus is loopback or tailnet, so the
+    address is nearly always 127.0.0.1 and says nothing; the ephemeral port is
+    what `lsof -i :PORT` maps back to a PID while the churn is live.
+
+    Read from the environment per call rather than captured at import, so
+    flipping it in a test does not depend on import order. An operator flips
+    it by restarting the server with DEV_MODE=1 either way.
+    """
+    if not os.environ.get("DEV_MODE"):
+        return None
+    # Absent for a unix socket, and some ASGI servers omit it entirely. Say
+    # so rather than dropping the suffix, which would read as "not enabled"
+    # to an operator who just turned this on.
+    client = scope.get("client")
+    if not client:
+        return "unknown peer"
+    try:
+        host, port = client
+    except (TypeError, ValueError):
+        return "unknown peer"
+    return f"{host}:{port}"
+
+
 class RequestLoggingMiddleware:
     """ASGI middleware that logs MCP tool calls with pretty formatting."""
 
@@ -415,6 +455,10 @@ class RequestLoggingMiddleware:
         if path != "/mcp" or method != "POST":
             await self.app(scope, receive, send)
             return
+
+        # Read here, not in the worker thread: the scope is the only place
+        # the peer exists, and _log_tool_call never sees it.
+        peer = _peer_label(scope)
 
         # Collect request body
         body_parts = []
@@ -441,10 +485,15 @@ class RequestLoggingMiddleware:
         # (#112 invariant - same class of fix as the tool bodies).
         request_body = b"".join(body_parts)
         response_body = b"".join(response_parts)
-        await anyio.to_thread.run_sync(self._log_tool_call, request_body, response_body)
+        await anyio.to_thread.run_sync(self._log_tool_call, request_body, response_body, peer)
 
-    def _log_tool_call(self, request_body: bytes, response_body: bytes) -> None:
-        """Parse and log one MCP tool call (runs in a worker thread)."""
+    def _log_tool_call(
+        self, request_body: bytes, response_body: bytes, peer: str | None = None
+    ) -> None:
+        """Parse and log one MCP tool call (runs in a worker thread).
+
+        `peer` is None unless DEV_MODE is on (#145); see _peer_label.
+        """
         try:
             req_json = json.loads(request_body) if request_body else {}
             req_method = req_json.get("method", "?")
@@ -490,10 +539,21 @@ class RequestLoggingMiddleware:
             args_colored = f"{_DIM}{args_str}{_RESET}" if args_str else ""
             arrow = f"{_DIM}→{_RESET}"
 
+            # Appended to the SAME line, not logged separately, so the peer is
+            # already paired with the session_id the call minted - matching a
+            # port to a PID is useless if you cannot tell which registration
+            # it belongs to.
+            peer_suffix = ""
+            if peer and tool_name in PEER_LOGGED_TOOLS:
+                peer_suffix = f" {_DIM}from {peer}{_RESET}"
+
             if args_str:
-                logger.info(f"{caller_prefix}{tool_colored}({args_colored}) {arrow} {result_str}")
+                logger.info(
+                    f"{caller_prefix}{tool_colored}({args_colored}) {arrow} "
+                    f"{result_str}{peer_suffix}"
+                )
             else:
-                logger.info(f"{caller_prefix}{tool_colored}() {arrow} {result_str}")
+                logger.info(f"{caller_prefix}{tool_colored}() {arrow} {result_str}{peer_suffix}")
 
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.debug(f"Skipping malformed MCP request: {e}")
