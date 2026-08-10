@@ -820,19 +820,17 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # What every refusal reports as `cursor`, and it has to be genuinely
     # INERT to re-ack, not merely accepted.
     #
-    # A session that has never saved a cursor is not at 0 - every resume
-    # branch reads a cursor-less session from the TIP (it persists the tip, or
-    # reads from it without persisting). Reporting "0" made the ack succeed
-    # and persist 0, which flips the next resume from tip-relative to a full
-    # history replay: a peek-only drain that hit one refusal would re-read the
-    # entire bus.
-    #
-    # Handing back the tip is right HERE and was wrong on the ahead-of-tip
-    # refusal (see below) for the same reason in both cases: report where the
-    # session actually is. For a cursor-less session that IS the tip, so
-    # nothing sits behind it to lose; for a session with a saved cursor the
-    # tip is somewhere ahead of it, and acking it would bury the gap.
-    position = previous if previous is not None else (tip or "0")
+    # For a session that has never saved a cursor, NO id is both. "0" is
+    # lossless but persists, flipping the next resume from tip-relative to a
+    # full history replay. The tip is inert only if nothing was published
+    # between the peek and the ack - and it is read HERE, at ack time, so a
+    # publish in that window makes re-acking it commit events the session
+    # never saw. That is the loss this primitive exists to prevent, so the
+    # honest answer is that such a session has no position to restore: null.
+    # The resume path resolves a cursor-less session lazily (it initializes
+    # from the tip at resume time), and only leaving the field null preserves
+    # that. See guide.md - a null `cursor` means "don't ack, just resume".
+    position = previous
 
     try:
         target = int(cursor)
@@ -863,7 +861,7 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                 f"({tip if tip else 'none published yet'})"
             ),
             "session_id": session_id,
-            # `cursor` is ALWAYS the session's current position, on every
+            # `cursor` is ALWAYS the session's saved position, on every
             # refusal - never the tip. It has one meaning ("where you are"),
             # and re-acking it is always a safe no-op. Handing back the tip
             # here would make the one key a caller is told to read
@@ -876,6 +874,12 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
             # surfaced everything up to here.
             "tip": tip,
         }
+    # Keyed on `previous`, which is now exactly `position` - one notion of
+    # where the session is serves both the guard and what a refusal reports.
+    # A cursor-less session is deliberately unguarded: with no saved position
+    # nothing is behind, and a low ack only makes the bus RE-SERVE the events
+    # above it. That is a replay, the safe direction; the guard exists to stop
+    # loss, not to stop repetition (which allow_rewind exists to ask for).
     if previous is not None and not allow_rewind:
         try:
             moving_backwards = target < int(previous)

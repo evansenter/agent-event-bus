@@ -188,9 +188,12 @@ pending = get_events(session_id=sid, resume=True, peek=True,
 
 # 2. Act on pending["events"] - surface them, wake something, whatever
 
-# 3. Ack exactly what step 1 covered
-ack_events(session_id=sid, cursor=pending["next_cursor"])
-→ {success: true, cursor: "55", previous_cursor: "42"}
+# 3. Ack exactly what step 1 covered - but only if there was anything.
+#    On a bus with no events at all next_cursor is null, and acking null is
+#    an error, not a no-op.
+if pending["next_cursor"]:
+    ack_events(session_id=sid, cursor=pending["next_cursor"])
+    → {success: true, cursor: "55", previous_cursor: "42"}
 ```
 
 Everything in the peek's raw window is now seen, filtered-out noise included
@@ -240,10 +243,25 @@ ack_events(session_id=sid, cursor="999999")
   }
 ```
 
-`cursor` means the same thing on every refusal: your current position, never
+`cursor` means the same thing on every refusal: your **saved** position, never
 the tip. Clamping to `tip` is only safe if you have actually surfaced
-everything up to it. A deleted-session refusal adds `session_deleted: true`
-and a `hint` (see below).
+everything up to it.
+
+`cursor` is `null` when you have never acked — you have no saved position, so
+there is nothing for the server to hand back. Recover with the `next_cursor`
+your peek returned: you still hold it, and it is the only value that names
+the window you actually surfaced. The server deliberately does not substitute
+the tip here, because it would read it at *ack* time — anything published
+between your peek and your ack would be committed without ever being shown.
+
+Don't fall back to a bare `resume=True` instead. A cursor-less session's
+resume initializes from the tip *at that moment*, so it skips whatever
+arrived after your peek — the same loss by a different route. That is why the
+loop above acks on every pass: the first successful ack is what makes your
+position durable.
+
+A deleted-session refusal adds `session_deleted: true` and a `hint` (see
+below).
 
 CLI: `agent-event-bus-cli ack --session-id ID --cursor 55 [--allow-rewind]`.
 Refusals exit non-zero; `--json` prints the error object above to stdout.

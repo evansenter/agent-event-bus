@@ -2003,6 +2003,10 @@ class TestAckRejectionShape:
         published = publish_event(event_type="e", payload="one")
         ack_events(session_id=sid, cursor=str(published["event_id"]))
         position = str(published["event_id"])
+        # Move the tip past the session so `position` and the tip are distinct
+        # values - acked-at-the-tip lets a `cursor: tip` bug pass unnoticed.
+        publish_event(event_type="e", payload="two")
+        assert server.storage.get_cursor() != position, "precondition: position is behind the tip"
 
         refusals = [
             ack_events(session_id=sid, cursor="not-an-id"),
@@ -2017,32 +2021,41 @@ class TestAckRejectionShape:
             # ...and the reported position is genuinely re-ackable
             assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
 
-    def test_a_cursor_less_session_recovers_without_replaying_history(self):
+    def test_a_cursor_less_session_is_told_it_has_no_position_to_restore(self):
         """The never-acked path, pinned at the same strength as the acked one.
 
-        Asserting only that the recovery ack SUCCEEDS is the weak half - it
-        succeeded while silently rewinding to 0, which flipped the next resume
-        from tip-relative to a full-history replay. A peek-only drain never
-        persists a cursor, so this is the shape that hit it.
+        A peek-only drain never persists a cursor, and no concrete id is both
+        inert and lossless for it: "0" persists and flips the next resume from
+        tip-relative to a full-history replay, while the tip is read at ACK
+        time - so a publish between the peek and the refused ack makes
+        re-acking it commit events that were never surfaced. Both were shipped
+        and both were wrong, so this pins the race directly: events arrive in
+        the window, and following the documented recovery must still surface
+        them.
         """
-        for i in range(6):
-            publish_event(event_type="note", payload=f"old-{i}")
+        publish_event(event_type="note", payload="before-the-peek")
         sid = self._session("peek-only")
 
-        # A peek-only drain reads from the tip WITHOUT persisting it.
-        get_events(session_id=sid, resume=True, peek=True, min_level="actionable", order="asc")
+        # A peek-only drain reads the bus WITHOUT persisting a cursor.
+        peeked = get_events(session_id=sid, resume=True, peek=True, order="asc")
         assert server.storage.get_session(sid).last_cursor is None, "precondition: cursor-less"
 
+        # The window the tip-at-ack-time answer lost: published after the peek
+        # saw the bus, before the refusal names a position.
+        after = publish_event(event_type="note", payload="arrived-after-the-peek")
+        assert int(peeked["next_cursor"]) < after["event_id"]
+
         refusal = ack_events(session_id=sid, cursor="not-an-id")
-        assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
+        assert refusal["cursor"] is None, "no saved position - naming one freezes the tip early"
 
-        # Inert: still reading from the tip, not replaying what came before.
-        assert get_events(session_id=sid, resume=True, order="asc")["events"] == []
-
-        publish_event(event_type="note", payload="new")
-        assert [
+        # The documented recovery is the peek's own next_cursor, which the
+        # caller still holds. It commits exactly the surfaced window...
+        assert ack_events(session_id=sid, cursor=peeked["next_cursor"])["success"] is True
+        pending = [
             e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
-        ] == ["new"]
+        ]
+        # ...leaving the later arrival pending rather than consumed unseen.
+        assert pending == ["arrived-after-the-peek"]
 
     def test_a_deliberate_rewind_to_zero_still_replays(self):
         """The position fix must not disturb allow_rewind: acking 0 on purpose
