@@ -3,6 +3,8 @@
 import sqlite3
 from datetime import datetime, timedelta
 
+import pytest
+
 from agent_event_bus.storage import SCHEMA_VERSION, SESSION_TIMEOUT, Session, SQLiteStorage
 
 
@@ -742,7 +744,13 @@ class TestSchemaParity:
     """
 
     def _build_v1_db(self, db_path):
-        """A pre-display_id, pre-webhooks database, as v1 actually shipped."""
+        """A v1 database predating every column later code bolted on.
+
+        Deliberately omits sessions.last_cursor and events.channel - the two
+        that used to be added by inline try/except ALTERs in _init_db and are
+        now migration 5. Building the fixture WITH them would let that
+        migration rot unnoticed while this test stayed green.
+        """
         conn = sqlite3.connect(str(db_path))
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version VALUES (1)")
@@ -755,8 +763,7 @@ class TestSchemaParity:
                 repo TEXT NOT NULL,
                 registered_at TIMESTAMP NOT NULL,
                 last_heartbeat TIMESTAMP NOT NULL,
-                client_id TEXT,
-                last_cursor TEXT
+                client_id TEXT
             )
         """)
         conn.execute("""
@@ -765,8 +772,7 @@ class TestSchemaParity:
                 event_type TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 session_id TEXT NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                channel TEXT NOT NULL DEFAULT 'all'
+                timestamp TIMESTAMP NOT NULL
             )
         """)
         conn.commit()
@@ -856,21 +862,102 @@ class TestSoftDelete:
         assert row["deleted_at"] is not None, "deleted_at should be set"
 
 
-class TestDbLocationMigration:
-    """Tests for database location migration."""
+class TestLegacyDbLocation:
+    """A database left at a pre-rename path is reported, never moved.
 
-    def test_migrate_db_from_old_to_new_location(self, tmp_path, monkeypatch):
-        """Test database migration moves file from old to new location."""
+    The automatic move was removed: it relocated the user's only copy, on a
+    path this code has not written to since January, using a plain file move
+    that is unsafe for a WAL-era database. Reporting is what remains - and it
+    has to happen, or a stale old-path database would present as a brand-new
+    empty bus with the real history sitting unnoticed on disk.
+    """
+
+    def _legacy_paths(self, tmp_path, monkeypatch, *, which="old"):
         import agent_event_bus.storage as storage_module
 
         old_path = tmp_path / ".claude" / "event-bus.db"
+        contrib_path = tmp_path / ".claude" / "contrib" / "event-bus" / "data.db"
         new_path = tmp_path / ".claude" / "contrib" / "agent-event-bus" / "data.db"
 
-        # Create old-style DB with proper schema (v1 style)
+        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
+        monkeypatch.setattr(storage_module, "OLD_CONTRIB_DB_PATH", contrib_path)
+        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
+        return old_path, contrib_path, new_path
+
+    def test_legacy_db_is_left_in_place_and_reported(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        old_path, _, new_path = self._legacy_paths(tmp_path, monkeypatch)
         old_path.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(old_path))
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version VALUES (1)")
+        old_path.write_bytes(b"not really a database, and never opened")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            storage = SQLiteStorage(db_path=str(new_path))
+
+        assert old_path.exists(), "the legacy database must not be moved or removed"
+        assert old_path.read_bytes() == b"not really a database, and never opened"
+        assert new_path.exists()
+        assert storage.session_count() == 0
+
+        warning = "\n".join(r.message for r in caplog.records)
+        assert str(old_path) in warning
+        assert "EMPTY database" in warning
+        assert ".backup" in warning, "the hint must be the WAL-aware command, not cp"
+
+    def test_contrib_path_takes_precedence(self, tmp_path, monkeypatch, caplog):
+        """Both legacy paths present: name the newer one, and only it."""
+        import logging
+
+        old_path, contrib_path, new_path = self._legacy_paths(tmp_path, monkeypatch)
+        old_path.parent.mkdir(parents=True)
+        old_path.write_bytes(b"older")
+        contrib_path.parent.mkdir(parents=True)
+        contrib_path.write_bytes(b"newer")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            SQLiteStorage(db_path=str(new_path))
+
+        warning = "\n".join(r.message for r in caplog.records)
+        assert str(contrib_path) in warning
+        assert str(old_path) not in warning
+
+    def test_silent_when_no_legacy_db_exists(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        _, _, new_path = self._legacy_paths(tmp_path, monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            SQLiteStorage(db_path=str(new_path))
+
+        assert new_path.exists()
+        assert not [r for r in caplog.records if "pre-rename" in r.message]
+
+    def test_silent_when_current_db_already_exists(self, tmp_path, monkeypatch, caplog):
+        """The common case: nothing to say once the current path is populated."""
+        import logging
+
+        old_path, _, new_path = self._legacy_paths(tmp_path, monkeypatch)
+        old_path.parent.mkdir(parents=True)
+        old_path.write_bytes(b"stale")
+        SQLiteStorage(db_path=str(new_path))  # populate the current path first
+        caplog.clear()  # that first open legitimately warned; this one must not
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            SQLiteStorage(db_path=str(new_path))
+
+        assert not [r for r in caplog.records if "pre-rename" in r.message]
+
+
+class TestPrehistoricSchemaRefusal:
+    """A pid-based sessions table is refused, not silently dropped.
+
+    The old code ran an unconditional DROP TABLE sessions on this shape. Such
+    a database cannot realistically exist any more, but if one does, the
+    operator's rows are theirs to lose - not ours.
+    """
+
+    def _build_pid_schema_db(self, db_path):
+        conn = sqlite3.connect(str(db_path))
         conn.execute("""
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
@@ -880,118 +967,33 @@ class TestDbLocationMigration:
                 repo TEXT NOT NULL,
                 registered_at TIMESTAMP NOT NULL,
                 last_heartbeat TIMESTAMP NOT NULL,
-                client_id TEXT,
-                last_cursor TEXT
+                pid INTEGER
             )
         """)
         conn.execute("""
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                channel TEXT NOT NULL DEFAULT 'all'
-            )
+            INSERT INTO sessions VALUES
+            ('old-1', 'legacy', 'localhost', '/tmp', 'tmp', '2026-01-02', '2026-01-02', 4242)
         """)
+        conn.commit()
         conn.close()
 
-        # Monkeypatch the paths (including OLD_CONTRIB_DB_PATH to prevent real path interference)
-        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
-        monkeypatch.setattr(storage_module, "OLD_CONTRIB_DB_PATH", tmp_path / "nonexistent")
-        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
+    def test_refuses_and_preserves_the_rows(self, tmp_path):
+        db_path = tmp_path / "prehistoric.db"
+        self._build_pid_schema_db(db_path)
 
-        # Initialize storage with the new default path - should trigger migration
-        storage = SQLiteStorage(db_path=str(new_path))
+        with pytest.raises(RuntimeError, match="pid-based"):
+            SQLiteStorage(db_path=str(db_path))
 
-        # Verify migration occurred
-        assert new_path.exists(), "New DB should exist after migration"
-        assert not old_path.exists(), "Old DB should be moved (not exist)"
-
-        # Verify storage is functional after migration
-        assert storage.session_count() == 0, "Storage should work after migration"
-
-    def test_no_migration_when_old_db_missing(self, tmp_path, monkeypatch):
-        """Test that no migration occurs if old DB doesn't exist."""
-        import agent_event_bus.storage as storage_module
-
-        old_path = tmp_path / ".claude" / "event-bus.db"
-        new_path = tmp_path / ".claude" / "contrib" / "agent-event-bus" / "data.db"
-
-        # Don't create old DB
-        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
-        monkeypatch.setattr(storage_module, "OLD_CONTRIB_DB_PATH", tmp_path / "nonexistent")
-        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
-
-        # Initialize storage - should create fresh DB
-        SQLiteStorage(db_path=str(new_path))
-
-        assert new_path.exists(), "New DB should be created"
-        assert not old_path.exists(), "Old DB should still not exist"
-
-    def test_no_migration_when_new_db_already_exists(self, tmp_path, monkeypatch):
-        """Test that migration is skipped if new DB already exists."""
-        import agent_event_bus.storage as storage_module
-
-        old_path = tmp_path / ".claude" / "event-bus.db"
-        new_path = tmp_path / ".claude" / "contrib" / "agent-event-bus" / "data.db"
-
-        # Create old DB
-        old_path.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(old_path))
-        conn.execute("CREATE TABLE old_marker (id INTEGER)")
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT id FROM sessions").fetchall()
         conn.close()
+        assert rows == [("old-1",)], "the refusal must not have touched user rows"
 
-        # Create new DB with current schema (so SQLiteStorage doesn't fail)
-        new_path.parent.mkdir(parents=True)
-        conn = sqlite3.connect(str(new_path))
-        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
-        conn.execute("INSERT INTO schema_version VALUES (2)")
-        conn.execute("""
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY,
-                display_id TEXT,
-                name TEXT NOT NULL,
-                machine TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                repo TEXT NOT NULL,
-                registered_at TIMESTAMP NOT NULL,
-                last_heartbeat TIMESTAMP NOT NULL,
-                client_id TEXT,
-                last_cursor TEXT,
-                deleted_at TIMESTAMP
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                channel TEXT NOT NULL DEFAULT 'all'
-            )
-        """)
-        conn.close()
-
-        monkeypatch.setattr(storage_module, "OLD_DB_PATH", old_path)
-        monkeypatch.setattr(storage_module, "OLD_CONTRIB_DB_PATH", tmp_path / "nonexistent")
-        monkeypatch.setattr(storage_module, "DEFAULT_DB_PATH", new_path)
-
-        # Initialize storage - should NOT overwrite existing new DB
-        SQLiteStorage(db_path=str(new_path))
-
-        # Old DB should still exist (not moved because new already exists)
-        assert old_path.exists(), "Old DB should still exist when migration skipped"
-
-        # Verify new DB doesn't have old_marker table (wasn't overwritten)
-        conn = sqlite3.connect(str(new_path))
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='old_marker'"
-        )
-        row = cursor.fetchone()
-        conn.close()
-        assert row is None, "New DB should not have old_marker table (wasn't overwritten)"
+    def test_current_schema_is_unaffected(self, tmp_path):
+        """The guard keys on pid-without-client_id; a normal database opens."""
+        db_path = tmp_path / "normal.db"
+        SQLiteStorage(db_path=str(db_path))
+        SQLiteStorage(db_path=str(db_path))  # must not raise on reopen
 
 
 class TestNextCursorHighWater:
