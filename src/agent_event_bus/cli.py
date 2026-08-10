@@ -656,7 +656,11 @@ def main():
     p_ack = subparsers.add_parser(
         "ack", help="Advance the session cursor to an event id you already hold"
     )
-    p_ack.add_argument("--cursor", required=True, help="Event id to mark as seen")
+    p_ack.add_argument(
+        "--cursor",
+        required=True,
+        help="Event id to mark as seen - the next_cursor from an order=asc, unfiltered peek",
+    )
     p_ack.add_argument(
         "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
     )

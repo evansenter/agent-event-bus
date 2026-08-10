@@ -230,8 +230,10 @@ Refused, rather than silently honored:
   replay deliberately
 - an ack from a **deleted session** — same error shape as a poll, see below
 
-A refusal always tells you where you are, so recovery needs no branching on
-which refusal you got:
+Every refusal tells you where you are the same way, so recovery does not
+branch on *which* refusal you got — only on whether you have ever acked:
+re-ack `cursor` when it is set, and when it is `null` re-ack your own peek's
+`next_cursor` instead (see below).
 
 ```
 ack_events(session_id=sid, cursor="999999")

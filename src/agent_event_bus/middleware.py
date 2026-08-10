@@ -76,6 +76,9 @@ _TOOL_COLORS = {
     # Actions with side effects (yellow)
     "publish_event": _YELLOW,
     "notify": _YELLOW,
+    # A write, not a read: it moves the position a later poll starts from, so
+    # it belongs with publish_event rather than in the leftover bucket.
+    "ack_events": _YELLOW,
     # Read operations (blue)
     "get_events": _BLUE,
     # Default (green) for everything else

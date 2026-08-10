@@ -927,6 +927,8 @@ async def ack_events(session_id: str, cursor: str, allow_rewind: bool = False) -
     orderings or filters make next_cursor span events the peek never
     returned, and acking it discards them. Auto-refreshes heartbeat.
 
+    A deleted session_id is refused with the same shape get_events returns.
+
     Args:
         session_id: Your session ID
         cursor: Event id to mark as seen, e.g. next_cursor from a peek
