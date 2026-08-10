@@ -325,6 +325,26 @@ class TestFormatResult:
         assert "event #7" in result
         assert "deleted" not in result
 
+    def test_real_flagged_publish_result_renders_as_deleted(self):
+        """The other tests here hand-build the dict, so nothing ties this
+        renderer to the shape _publish_event_impl actually produces: rename a
+        key there and the server tests still pass (they assert on the
+        response), these still pass (they assert on a literal), and `make logs`
+        quietly falls back to rendering an orphaned publisher as a register.
+        This is the one assertion that spans both."""
+        from agent_event_bus import server
+
+        reg = server._register_session_impl(name="log-publish", client_id="log-publish-client")
+        server.storage.delete_session(reg["session_id"])
+
+        published = server._publish_event_impl(
+            event_type="note", payload="orphaned", session_id=reg["session_id"]
+        )
+
+        rendered = _format_result(published)
+        assert "from deleted" in rendered
+        assert reg["display_id"] in rendered
+
     def test_flagged_call_without_event_details_still_names_the_session(self):
         """The branch is keyed on session_deleted, not on session_deleted plus
         event_id: a flagging disposition carries no "error" to catch it, so

@@ -392,10 +392,20 @@ Events published after a deletion are also queryable directly:
 ```sql
 SELECT s.display_id, COUNT(e.id) AS events_after_deletion
 FROM sessions s
-JOIN events e ON e.session_id = s.id AND e.timestamp > s.deleted_at
+JOIN events e ON e.session_id = s.id
+             AND e.timestamp > s.deleted_at
+             AND e.event_type != 'session_unregistered'
 WHERE s.deleted_at IS NOT NULL
 GROUP BY s.display_id;
 ```
+
+The `session_unregistered` exclusion is what makes this query readable:
+`unregister_session` soft-deletes the session *first* and then writes its
+bookkeeping event under the same id, so without it every session that ever
+exited cleanly comes back with `events_after_deletion = 1` and the actual
+orphan is buried among them. (That event is written straight to storage, so it
+is never itself flagged.) Sessions swept by the heartbeat timeout write no
+event at all, and so appear here only for real post-deletion publishes.
 
 ## Structured Payload Fields
 
