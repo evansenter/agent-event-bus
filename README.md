@@ -129,7 +129,8 @@ register_webhook(url="https://...", event_types=["task_completed", "help_needed"
 register_webhook(url="https://...", secret="your-shared-secret")
 
 # List and manage
-list_webhooks()
+list_webhooks()                                  # active_only=False also shows paused
+set_webhook_active(webhook_id=1, active=False)   # pause, keeping the registration
 unregister_webhook(webhook_id=1)
 ```
 
@@ -140,10 +141,15 @@ unregister_webhook(webhook_id=1)
 agent-event-bus-cli webhook register --url https://your-server.com/events
 agent-event-bus-cli webhook register --url https://... --channel "session:" --secret "my-secret"
 
-# List
+# List (paused webhooks only show under --all)
 agent-event-bus-cli webhook list
+agent-event-bus-cli webhook list --all
 
-# Remove
+# Pause / resume - keeps the URL, filters, and secret
+agent-event-bus-cli webhook disable 1
+agent-event-bus-cli webhook enable 1
+
+# Remove (permanent)
 agent-event-bus-cli webhook unregister 1
 ```
 

@@ -364,6 +364,13 @@ class SQLiteStorage:
 
         A database in this shape cannot realistically exist. If one does,
         refusing is right: the operator keeps their rows and decides.
+
+        Runs before _init_db creates anything, so the refusal adds no tables
+        of its own - it only reads PRAGMA table_info. One caveat, since the
+        promise above should be exact: merely opening the file asserts
+        journal_mode=WAL (in _connect, before any statement here), which
+        rewrites the journal format. That is format, not content; no row is
+        read, written, or dropped.
         """
         cursor = conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -408,14 +415,15 @@ class SQLiteStorage:
         TestSchemaParity enforces that the two paths agree.
         """
         with self._connect() as conn:
-            # Create schema_version table first
+            # Before anything is created: a refusal should not leave its own
+            # scaffolding in the file it refused to touch.
+            self._reject_prehistoric_schema(conn)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY
                 )
             """)
-
-            self._reject_prehistoric_schema(conn)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (

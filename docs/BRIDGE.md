@@ -174,12 +174,15 @@ That lands with the supervision story.)
   the cooldown never engages - a spool line only becomes a wake when the
   drain hook acts on it, so loop prevention there is the consuming hook's
   job: bound how often you act on a drained spool, and dedupe on `event_id`.
-- Startup is idempotent: stale active webhooks at this bridge's URL (from
-  unclean exits) are removed before registering, so restarts never stack
-  duplicate deliveries. The sweep matches the URL being registered NOW -
-  after changing `--port` or `--hook-url`, drop the row at the old URL
-  yourself (`agent-event-bus-cli webhook list` / `webhook unregister`) or
-  the bus keeps dispatching to the dead address forever. Because that sweep
+- Startup is idempotent: stale webhooks at this bridge's URL (from unclean
+  exits) are removed before registering, so restarts never stack duplicate
+  deliveries. Paused rows are swept too - a row at this URL is stale whether
+  or not someone disabled it. The sweep matches the URL being registered
+  NOW - after changing `--port` or `--hook-url`, drop the row at the old URL
+  yourself (`agent-event-bus-cli webhook list --all` / `webhook unregister`)
+  or the bus keeps dispatching to the dead address forever. Use `--all`:
+  plain `webhook list` hides paused rows, so a disabled one at the old URL
+  would look like nothing to clean up. Because that sweep
   can't tell a stale row from a *live peer's*, the CLI takes two flock'd
   singletons at startup (both released on exit): one keyed on the **hook
   URL** (in a machine- and uid-scoped lock dir under `$XDG_RUNTIME_DIR`, else

@@ -92,6 +92,9 @@ src/agent_event_bus/
 ├── cli.py         # CLI wrapper for shell scripts
 ├── bridge.py      # Webhook→injection re-awakening bridge (RFC #122, experimental)
 └── guide.md       # Usage guide (agent-event-bus://guide resource)
+
+docs/BRIDGE.md     # Bridge operator docs - deliberately NOT in guide.md, which
+                   # is served as an MCP resource into every session that reads it
 ```
 
 ## MCP Tools
@@ -202,5 +205,6 @@ Notifications: Uses terminal-notifier if installed (`brew install terminal-notif
 ## See Also
 
 - **Usage patterns, event types, channels**: `agent-event-bus://guide` or `src/agent_event_bus/guide.md`
+- **Re-awakening bridge (operators)**: `docs/BRIDGE.md`
 - **CLI usage**: `agent-event-bus-cli --help`
 - **Installation**: `README.md`

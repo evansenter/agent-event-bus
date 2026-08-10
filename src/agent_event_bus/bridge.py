@@ -1433,9 +1433,9 @@ def unregister_from_bus(config: BridgeConfig, webhook_id: int) -> None:
     # Same accept-shape as the startup sweep: the bus reports logical
     # failure in-band (success-False dict), and already-gone is the goal
     # state. Shutdown stays best-effort, so a surprise is a warning here
-    # rather than the sweep's retryable BridgeRegistrationError - but the
-    # log must not
-    # assert a removal it never checked; the next startup sweep reclaims.
+    # rather than the sweep's retryable BridgeRegistrationError - but the log
+    # must not assert a removal it never checked; the next startup sweep
+    # reclaims.
     ok = isinstance(result, dict) and (
         result.get("success") or result.get("error") == "Webhook not found"
     )

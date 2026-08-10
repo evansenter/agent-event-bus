@@ -843,8 +843,28 @@ class TestSchemaParity:
                 f"Indexes diverged on '{table}' (name → CREATE statement)."
             )
 
+    def test_no_new_divergences_have_been_recorded(self):
+        """Watches the list GROWING. Deliberately a change-detector.
+
+        Silencing a real parity failure by adding its column here is the easy
+        wrong move, and nothing else would catch it: the parity test relaxes
+        for whatever is listed, and the staleness test below would confirm the
+        new entry genuinely diverges - which is precisely why someone added
+        it. Widening the guard's blind spot should cost a deliberate edit and
+        a written reason, not a one-word append.
+        """
+        assert KNOWN_CONSTRAINT_DIVERGENCES == {("sessions", "display_id")}, (
+            "KNOWN_CONSTRAINT_DIVERGENCES changed. Adding an entry widens a blind "
+            "spot in TestSchemaParity - do it only for a divergence that genuinely "
+            "cannot be migrated away, document why in the comment above the "
+            "constant, and update this test to match."
+        )
+
     def test_the_recorded_divergences_are_still_real(self, tmp_path):
-        """Every recorded allowance must still be earning its place.
+        """Watches the list going STALE - the opposite direction to the test
+        above, and the reason a change-detector alone is not enough here.
+
+        Every recorded allowance must still be earning its place.
 
         OBSERVES the divergence rather than asserting the constant against its
         own literal. The literal form would be a change-detector: a rebuild
@@ -869,6 +889,23 @@ class TestSchemaParity:
         migrated = _schema_snapshot(migrated_path)
 
         for table, column in KNOWN_CONSTRAINT_DIVERGENCES:
+            # Retirement has two shapes and both must reach the same
+            # conclusion. The constraint converging is handled below; the
+            # column or table going away is handled here, because a rebuild
+            # migration - the standard SQLite create-copy-drop-rename dance,
+            # and the likeliest way display_id ever gets fixed - would
+            # otherwise surface as a bare KeyError with the reasoning lost.
+            for label, snapshot in (("migrated", migrated), ("fresh", fresh)):
+                assert table in snapshot, (
+                    f"KNOWN_CONSTRAINT_DIVERGENCES names table '{table}', which no "
+                    f"longer exists in a {label} database - the entry is stale, delete it."
+                )
+                assert column in snapshot[table]["columns"], (
+                    f"KNOWN_CONSTRAINT_DIVERGENCES names '{table}.{column}', and that "
+                    f"column no longer exists in a {label} database - the entry is "
+                    f"stale, delete it."
+                )
+
             migrated_spec = migrated[table]["columns"][column]
             fresh_spec = fresh[table]["columns"][column]
             assert migrated_spec[1:] != fresh_spec[1:], (
