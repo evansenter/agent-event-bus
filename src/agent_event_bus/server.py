@@ -438,16 +438,6 @@ def _publish_event_impl(
     # Auto-refresh heartbeat when session publishes
     _auto_heartbeat(session_id)
 
-    # A soft-deleted publisher is flagged, not rejected (#144). Publish is the
-    # one path where failing closed destroys data: the common publishers are
-    # fire-and-forget hooks with no retry and no error handling, and a rejected
-    # publish loses the event where a rejected poll only costs an empty loop
-    # iteration. So the event still lands - under the dead session id, not
-    # re-attributed, because which dead session published is exactly the
-    # evidence an orphaned-client hunt starts from - and the response carries
-    # session_deleted so an attentive client can re-register.
-    deleted = _deleted_session_flag(_load_polling_session(session_id))
-
     # Validate channel format for known channel types
     if channel not in ["all"] and ":" in channel:
         channel_type, _, channel_value = channel.partition(":")
@@ -500,6 +490,21 @@ def _publish_event_impl(
     }
     if correlation_id:
         result["correlation_id"] = correlation_id
+
+    # A soft-deleted publisher is flagged, not rejected (#144). Publish is the
+    # one path where failing closed destroys data: the common publishers are
+    # fire-and-forget hooks with no retry and no error handling, and a rejected
+    # publish loses the event where a rejected poll only costs an empty loop
+    # iteration. So the event still lands - under the dead session id, not
+    # re-attributed, because which dead session published is exactly the
+    # evidence an orphaned-client hunt starts from - and the response carries
+    # session_deleted so an attentive client can re-register.
+    #
+    # Computed here rather than up by _auto_heartbeat: its side effect is the
+    # once-per-incident WARNING, which claims the event was stored, so it must
+    # not fire before add_event does. Warning first would burn the warn-once
+    # key on the one call that failed and silence every later one.
+    deleted = _deleted_session_flag(_load_polling_session(session_id))
     if deleted:
         # Merged last, and without an "error" key: the publish succeeded, and a
         # client that branches on "error" must not read this as a failed write.
@@ -614,7 +619,6 @@ def _deleted_session_notice(
     tool: str,
     *,
     rejected: bool,
-    hint: str,
 ) -> dict | None:
     """Warn once and describe `session` if it is soft-deleted (#140, #144).
 
@@ -622,6 +626,9 @@ def _deleted_session_notice(
     the contract applies: reads refuse (the `error` key) while publishes store
     and flag, so the fields a client branches on - `session_deleted` and the
     identity of the dead session - are shaped here once rather than twice.
+    The hint is derived from it rather than passed in, so there is no way to
+    hand a publisher "or stop polling" or tell a refused read its event was
+    stored.
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
@@ -662,7 +669,7 @@ def _deleted_session_notice(
         "session_id": session_id,
         "display_id": session.display_id,
         "deleted_at": deleted_at_str,
-        "hint": hint,
+        "hint": _READ_HINT if rejected else _PUBLISH_HINT,
     }
     # First key, so the refusal reads as an error before anything else - the
     # middleware and the CLI both branch on it.
@@ -676,7 +683,7 @@ def _deleted_session_error(session: Session | None, tool: str = "get_events") ->
     re-deriving the contract - a second copy would drift on the response shape
     clients branch on.
     """
-    return _deleted_session_notice(session, tool, rejected=True, hint=_READ_HINT)
+    return _deleted_session_notice(session, tool, rejected=True)
 
 
 def _deleted_session_flag(session: Session | None) -> dict | None:
@@ -688,7 +695,7 @@ def _deleted_session_flag(session: Session | None) -> dict | None:
     fire-and-forget hooks with neither retry nor error handling. Carries no
     `error` key for that reason - the write succeeded.
     """
-    return _deleted_session_notice(session, "publish_event", rejected=False, hint=_PUBLISH_HINT)
+    return _deleted_session_notice(session, "publish_event", rejected=False)
 
 
 def _event_to_dict(e: Event) -> dict:

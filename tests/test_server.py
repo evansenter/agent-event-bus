@@ -1537,6 +1537,10 @@ class TestDeletedSessionPolling:
         assert result["session_id"] == sid
         assert result["deleted_at"]
         assert "events" not in result
+        # The read half's hint, pinned by content: a publisher's "the event was
+        # stored anyway" reaching a refused poll would be a lie about a read
+        # that returned nothing
+        assert "stop polling" in result["hint"]
 
     def test_explicit_cursor_poll_reports_deletion(self):
         """The hole #140 was actually reported through: a client feeding
@@ -1675,7 +1679,12 @@ class TestDeletedSessionPublishing:
         assert result["session_id"] == sid
         assert result["display_id"] == reg["display_id"]
         assert result["deleted_at"]
-        assert result["hint"]
+        # Pinned by content, not truthiness: the hint is the one field that
+        # differs between the two halves and the one a human reads, so a
+        # truthy check would pass with the read hint's "or stop polling"
+        # handed to a publisher whose event was in fact stored
+        assert "stored" in result["hint"]
+        assert "register_session" in result["hint"]
 
     def test_flag_is_not_an_error(self):
         """A client branching on "error" must not read a stored event as a
