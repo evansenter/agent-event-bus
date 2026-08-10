@@ -47,6 +47,7 @@ class TestAsyncToolWrappers:
             "list_channels",
             "publish_event",
             "get_events",
+            "ack_events",
             "unregister_session",
             "notify",
             "register_webhook",

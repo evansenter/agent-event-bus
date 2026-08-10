@@ -6,6 +6,7 @@ Provides tools for cross-session Claude Code communication:
 - list_channels: See channels with subscriber counts
 - publish_event: Broadcast events (auto-refreshes heartbeat)
 - get_events: Poll for new events (auto-refreshes heartbeat)
+- ack_events: Advance a session's cursor to an id it already holds
 - unregister_session: Clean up on exit
 - notify: Send system notifications
 - register_webhook: Register HTTP endpoint for push notifications
@@ -578,8 +579,12 @@ def _load_polling_session(session_id: str | None) -> Session | None:
     return storage.get_session(session_id, include_deleted=True)
 
 
-def _deleted_session_error(session: Session | None) -> dict | None:
+def _deleted_session_error(session: Session | None, tool: str = "get_events") -> dict | None:
     """Return an error dict if `session` is soft-deleted (#140).
+
+    `tool` only names the caller in the warning. Every session-scoped read
+    shares this one implementation rather than re-deriving the contract - a
+    second copy would drift on the response shape clients branch on.
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
@@ -602,12 +607,12 @@ def _deleted_session_error(session: Session | None) -> dict | None:
     if warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
         logger.warning(
-            f"get_events: rejecting polls from deleted session {session.display_id} "
+            f"{tool}: rejecting calls from deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
             f"client is still polling. Further rejections are logged per-call by "
             f"the request middleware."
         )
-        _dev_notify("get_events", f"deleted session polled: {session.display_id}")
+        _dev_notify(tool, f"deleted session polled: {session.display_id}")
 
     return {
         "error": "Session deleted",
@@ -786,6 +791,86 @@ async def get_events(
         peek=peek,
         correlation_id=correlation_id,
         min_level=min_level,
+    )
+
+
+def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
+    """Sync implementation of ack_events (runs in a worker thread)."""
+    session = _load_polling_session(session_id)
+    deleted = _deleted_session_error(session, tool="ack_events")
+    if deleted:
+        return deleted
+    if session is None:
+        return {"error": "Session not found", "session_id": session_id}
+
+    try:
+        target = int(cursor)
+    except (TypeError, ValueError):
+        return {
+            "error": f"Invalid cursor {cursor!r}: expected an event id",
+            "session_id": session_id,
+        }
+    if target < 0:
+        return {
+            "error": f"Invalid cursor {cursor!r}: must not be negative",
+            "session_id": session_id,
+        }
+
+    # Refuse to ack past the newest event. next_cursor never exceeds the tip,
+    # so a cursor beyond it did not come from a read - and honoring it would
+    # silently mark events that do not exist yet as seen, which is this API's
+    # worst failure mode: consumed but never surfaced.
+    tip = storage.get_cursor()
+    if tip is not None and target > int(tip):
+        return {
+            "error": f"Cursor {cursor} is ahead of the newest event ({tip})",
+            "session_id": session_id,
+            "next_cursor": tip,
+        }
+
+    previous = session.last_cursor
+    if previous is not None and not allow_rewind:
+        try:
+            moving_backwards = target < int(previous)
+        except ValueError:
+            moving_backwards = False  # unparseable stored cursor: let the ack through
+        if moving_backwards:
+            return {
+                "error": (
+                    f"Cursor {cursor} is behind the session's current position "
+                    f"({previous}). Pass allow_rewind=true to replay deliberately."
+                ),
+                "session_id": session_id,
+                "cursor": previous,
+            }
+
+    storage.update_session_cursor(session_id, cursor)
+    # Acking is session activity, same as polling. A consumer that only acked
+    # would otherwise go stale and be swept out from under itself.
+    _auto_heartbeat(session_id)
+    _dev_notify("ack_events", f"{session.display_id} → {cursor}")
+    return {
+        "success": True,
+        "session_id": session_id,
+        "cursor": cursor,
+        "previous_cursor": previous,
+    }
+
+
+@mcp.tool()
+async def ack_events(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
+    """Advance a session's saved cursor to an event id it already holds.
+
+    Pairs with peek: peek (non-consuming) → act → ack the batch's next_cursor.
+    Auto-refreshes heartbeat.
+
+    Args:
+        session_id: Your session ID
+        cursor: Event id to mark as seen, e.g. next_cursor from a peek
+        allow_rewind: Permit moving the cursor backwards to replay (default: False)
+    """
+    return await _run_sync(
+        _ack_events_impl, session_id=session_id, cursor=cursor, allow_rewind=allow_rewind
     )
 
 

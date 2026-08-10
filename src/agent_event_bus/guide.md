@@ -18,6 +18,7 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 | `list_channels()` | See active channels |
 | `publish_event(type, payload, channel?, correlation_id?, ...)` | Send event |
 | `get_events(session_id?, resume?, order?, event_types?, min_level?)` | Poll for events |
+| `ack_events(session_id, cursor)` | Mark events seen up to an id you already hold |
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
 | `register_webhook(url, channel?, event_types?, secret?)` | Register HTTP endpoint for push notifications |
@@ -166,6 +167,41 @@ get_events(session_id=session_id, resume=True, peek=True)
 get_events(session_id=session_id, resume=True, order="asc")
 ```
 CLI: `agent-event-bus-cli events --session-id ID --resume --peek`
+
+### Acking (peek, act, then commit)
+
+`ack_events(session_id, cursor)` sets your saved cursor to an event id you
+already hold. It exists because **a bounded consume cannot bound anything
+under a server-side filter**: `min_level` filters the events you get back,
+but the cursor advances over the *raw* batch behind them. "Consume the N I
+just saw" therefore advances past a different window than the peek showed —
+which is how events get consumed but never surfaced.
+
+Peek and ack name the same window by construction, because the ack uses the
+cursor the peek returned:
+
+```
+# 1. Peek: see what's pending, cursor untouched
+pending = get_events(session_id=sid, resume=True, peek=True, min_level="actionable")
+
+# 2. Act on pending["events"] - surface them, wake something, whatever
+
+# 3. Ack exactly what step 1 covered
+ack_events(session_id=sid, cursor=pending["next_cursor"])
+→ {success: true, cursor: "55", previous_cursor: "42"}
+```
+
+Everything in the peek's raw window is now seen, filtered-out noise included
+— which is the point of a server-side noise policy.
+
+Refused, rather than silently honored:
+- a cursor **ahead of the newest event** — it would mark events that don't
+  exist yet as seen
+- a cursor **behind your current position** — pass `allow_rewind=True` to
+  replay deliberately
+- an ack from a **deleted session** — same error shape as a poll, see below
+
+CLI: `agent-event-bus-cli ack --session-id ID --cursor 55 [--allow-rewind]`
 
 ### Deleted sessions
 

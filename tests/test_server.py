@@ -17,6 +17,7 @@ register_session = server._register_session_impl
 list_sessions = server._list_sessions_impl
 publish_event = server._publish_event_impl
 get_events = server._get_events_impl
+ack_events = server._ack_events_impl
 unregister_session = server._unregister_session_impl
 
 
@@ -1637,3 +1638,120 @@ class TestDeletedSessionPolling:
         assert len(rejections) == 1
         # display_id is what an operator greps the request log for
         assert reg["display_id"] in rejections[0].message
+
+
+class TestAckEvents:
+    """ack_events: advance the cursor to an id the caller already holds (#134).
+
+    Exists because a bounded consume cannot bound anything under a server-side
+    filter: min_level filters the returned view while the cursor advances over
+    the raw batch, so "consume the N I just saw" advances past a different
+    window than the peek saw - events consumed but never surfaced. Peek and
+    ack name the same window by construction.
+    """
+
+    def _session(self, name="acker"):
+        return register_session(name=name, client_id=f"{name}-client")["session_id"]
+
+    def test_advances_the_saved_cursor(self):
+        sid = self._session()
+        published = publish_event(event_type="e", payload="one")
+
+        result = ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert result["success"] is True
+        assert result["cursor"] == str(published["event_id"])
+        assert server.storage.get_session(sid).last_cursor == str(published["event_id"])
+
+    def test_peek_then_ack_makes_progress_under_min_level(self):
+        """The whole point, end to end: a non-consuming filtered read followed
+        by an ack of its next_cursor leaves nothing unseen and nothing
+        re-served. This is the flow a drain hook cannot express today."""
+        sid = self._session("drain")
+        get_events(session_id=sid, resume=True, order="asc")  # establish cursor at tip
+        publish_event(event_type="session_registered", payload="noise")  # lifecycle
+        publish_event(event_type="help_needed", payload="signal")  # actionable
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, min_level="actionable", order="asc"
+        )
+        assert [e["payload"] for e in peeked["events"]] == ["signal"]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        # Everything the peek's RAW window covered is now seen - the lifecycle
+        # noise included, which is the point of a server-side noise policy.
+        assert get_events(session_id=sid, resume=True, order="asc")["events"] == []
+
+    def test_rejects_a_cursor_ahead_of_the_newest_event(self):
+        """Honoring it would mark events that do not exist yet as seen - the
+        consumed-but-never-surfaced failure this primitive exists to prevent."""
+        sid = self._session("ahead")
+        publish_event(event_type="e", payload="one")
+
+        result = ack_events(session_id=sid, cursor="999999")
+
+        assert "ahead of the newest event" in result["error"]
+        assert server.storage.get_session(sid).last_cursor != "999999"
+
+    def test_refuses_to_rewind_by_default(self):
+        sid = self._session("rewind")
+        first = publish_event(event_type="e", payload="one")
+        second = publish_event(event_type="e", payload="two")
+        ack_events(session_id=sid, cursor=str(second["event_id"]))
+
+        result = ack_events(session_id=sid, cursor=str(first["event_id"]))
+
+        assert "behind the session's current position" in result["error"]
+        assert server.storage.get_session(sid).last_cursor == str(second["event_id"])
+
+    def test_allow_rewind_replays_deliberately(self):
+        sid = self._session("replay")
+        first = publish_event(event_type="e", payload="one")
+        second = publish_event(event_type="e", payload="two")
+        ack_events(session_id=sid, cursor=str(second["event_id"]))
+
+        result = ack_events(session_id=sid, cursor=str(first["event_id"]), allow_rewind=True)
+
+        assert result["success"] is True
+        replayed = get_events(session_id=sid, resume=True, order="asc")
+        assert [e["payload"] for e in replayed["events"]] == ["two"]
+
+    def test_acking_refreshes_the_heartbeat(self):
+        """Acking is session activity. A consumer that only acks must not be
+        swept as stale out from under itself."""
+        from datetime import timedelta
+
+        sid = self._session("heartbeat")
+        published = publish_event(event_type="e", payload="one")
+        stale = datetime.now() - timedelta(hours=12)
+        server.storage.update_heartbeat(sid, stale)
+
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert server.storage.get_session(sid).last_heartbeat > stale
+
+    def test_rejects_a_non_numeric_cursor(self):
+        sid = self._session("garbage")
+        result = ack_events(session_id=sid, cursor="not-an-id")
+
+        assert "Invalid cursor" in result["error"]
+        assert server.storage.get_session(sid).last_cursor is None
+
+    def test_unknown_session_is_a_plain_not_found(self):
+        result = ack_events(session_id="never-registered", cursor="1")
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_deleted_session_is_rejected_like_a_poll(self):
+        """Shares get_events' deleted-session contract rather than inventing a
+        second one - a drain hook acking against a session that ended gets the
+        same shape, hint included, that its polls already get (#140)."""
+        sid = self._session("gone")
+        server.storage.delete_session(sid)
+
+        result = ack_events(session_id=sid, cursor="1")
+
+        assert result["session_deleted"] is True
+        assert result["error"] == "Session deleted"
+        assert "hint" in result and result["display_id"]

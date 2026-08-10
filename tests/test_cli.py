@@ -612,6 +612,80 @@ class TestCmdUnregisterErrorSurfacing:
         assert "Session not found" in captured.err
 
 
+def make_ack_args(**overrides):
+    """Namespace matching the ack subparser's output - keep in sync."""
+    defaults = dict(
+        cursor="42", session_id=None, allow_rewind=False, json=False, url=None, debug=False
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+class TestCmdAck:
+    """CLI wiring for ack_events (#134)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_passes_session_and_cursor(self, mock_call, capsys):
+        mock_call.return_value = {"success": True, "cursor": "42", "previous_cursor": "30"}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+
+        mock_call.assert_called_once_with(
+            "ack_events", {"session_id": "abc123", "cursor": "42"}, url=None
+        )
+        assert "30 \u2192 42" in capsys.readouterr().out
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_allow_rewind_is_only_sent_when_set(self, mock_call):
+        mock_call.return_value = {"success": True, "cursor": "42"}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+        assert "allow_rewind" not in mock_call.call_args[0][1]
+
+        mock_call.reset_mock()
+        cli.cmd_ack(make_ack_args(session_id="abc123", allow_rewind=True))
+        assert mock_call.call_args[0][1]["allow_rewind"] is True
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_falls_back_to_the_session_id_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session")
+        mock_call.return_value = {"success": True, "cursor": "42"}
+
+        cli.cmd_ack(make_ack_args(session_id=None))
+
+        assert mock_call.call_args[0][1]["session_id"] == "env-session"
+
+    def test_requires_a_session_id(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id=None))
+
+        assert exc.value.code == 1
+        assert "requires --session-id" in capsys.readouterr().err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_server_error_exits_nonzero(self, mock_call, capsys):
+        """A rejected ack must not look like a successful one - a drain hook
+        that ignores the exit code would re-serve or skip events."""
+        mock_call.return_value = {"error": "Cursor 999 is ahead of the newest event (5)"}
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id="abc123", cursor="999"))
+
+        assert exc.value.code == 1
+        assert "ahead of the newest event" in capsys.readouterr().err
+
+    def test_parser_wires_the_subcommand(self):
+        import sys
+
+        argv = ["cli", "ack", "--cursor", "77", "--session-id", "s1", "--allow-rewind"]
+        with patch.object(sys, "argv", argv):
+            with patch("agent_event_bus.cli.cmd_ack") as mock_cmd:
+                cli.main()
+                args = mock_cmd.call_args[0][0]
+
+        assert (args.cursor, args.session_id, args.allow_rewind) == ("77", "s1", True)
+
+
 class TestCmdNotify:
     """Tests for notify command."""
 

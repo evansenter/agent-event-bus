@@ -13,6 +13,7 @@ Usage:
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
                          [--channel CHANNEL] [--resume] [--peek] [--correlation-id ID]
                          [--min-level lifecycle|info|actionable]
+    agent-event-bus-cli ack --cursor N [--session-id ID] [--allow-rewind] [--json]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
     agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
     agent-event-bus-cli webhook list [--all]
@@ -65,6 +66,15 @@ Examples:
     # Thread a request to its responses with a correlation id
     agent-event-bus-cli publish --type task_request --payload "Review PR #42?" --correlation-id review-42
     agent-event-bus-cli events --correlation-id review-42 --order asc
+
+    # Drain safely under a server-side filter: peek, act, then ack what you saw.
+    # A bounded consume cannot do this - min-level filters the view while the
+    # cursor advances over the raw batch, so the counts refer to different
+    # windows. Peek and ack refer to the same window by construction.
+    OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
+            --min-level actionable --order asc --json)
+    echo "$OUT" | jq -r '.events[].payload'
+    agent-event-bus-cli ack --session-id "$SID" --cursor "$(echo "$OUT" | jq -r .next_cursor)"
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -385,6 +395,31 @@ def cmd_events(args):
             print(hint, file=sys.stderr)
 
 
+def cmd_ack(args):
+    """Advance the session cursor to an event id already held."""
+    session_id = args.session_id or _session_id_from_env()
+    if not session_id:
+        print("Error: ack requires --session-id (or $AGENT_EVENT_BUS_SESSION_ID)", file=sys.stderr)
+        sys.exit(1)
+
+    arguments = {"session_id": session_id, "cursor": args.cursor}
+    if args.allow_rewind:
+        arguments["allow_rewind"] = True
+
+    result = call_tool("ack_events", arguments, url=args.url)
+
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result))
+    else:
+        previous = result.get("previous_cursor")
+        moved = f"{previous} → {result['cursor']}" if previous else f"→ {result['cursor']}"
+        print(f"Cursor acked: {moved}")
+
+
 def cmd_notify(args):
     """Send a system notification."""
     arguments = {
@@ -596,6 +631,23 @@ def main():
         help="Drop events below this signal level (server-side; replaces client denylists)",
     )
     p_events.set_defaults(func=cmd_events)
+
+    # notify
+    # ack
+    p_ack = subparsers.add_parser(
+        "ack", help="Advance the session cursor to an event id you already hold"
+    )
+    p_ack.add_argument("--cursor", required=True, help="Event id to mark as seen")
+    p_ack.add_argument(
+        "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
+    )
+    p_ack.add_argument(
+        "--allow-rewind",
+        action="store_true",
+        help="Permit moving the cursor backwards to replay (refused by default)",
+    )
+    p_ack.add_argument("--json", action="store_true", help="Output the raw JSON result")
+    p_ack.set_defaults(func=cmd_ack)
 
     # notify
     p_notify = subparsers.add_parser("notify", help="Send system notification")
