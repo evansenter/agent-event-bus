@@ -168,3 +168,24 @@ def make_publish_args(**overrides):
     )
     defaults.update(overrides)
     return Namespace(**defaults)
+
+
+def registered_tools():
+    """Every @mcp.tool()-decorated function, taken from the registry.
+
+    Enumerated rather than hand-listed: a hand-list silently stops covering
+    the next tool someone adds, which is how set_webhook_active arrived
+    uncovered. The registry cannot fall behind the code.
+
+    Shared because the *how* is the load-bearing part and easy to get subtly
+    wrong: matched by TYPE, anchored on a known tool, rather than by
+    duck-typing on .fn/.name - the autouse fixtures above patch MagicMocks
+    into that module, and a MagicMock answers hasattr for every name. One
+    site, so a change in FastMCP's wrapper shape has one fix.
+    """
+    from agent_event_bus import server
+
+    tool_type = type(server.register_session)
+    tools = [v for v in vars(server).values() if isinstance(v, tool_type)]
+    assert tools, "found no registered tools - has FastMCP's tool wrapper changed shape?"
+    return tools

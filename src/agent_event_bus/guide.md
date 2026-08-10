@@ -224,6 +224,8 @@ Everything in the peek's raw window is now seen, filtered-out noise included
 > reads are non-consuming; `ack_events` hands that decision back to you.
 
 Refused, rather than silently honored:
+- a cursor that **isn't an event id** — the string `null`, empty, negative;
+  checked before any position check, and the one a `jq -r` artifact lands on
 - a cursor **ahead of the newest event** — it would mark events that don't
   exist yet as seen
 - a cursor **behind your current position** — pass `allow_rewind=True` to

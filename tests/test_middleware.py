@@ -157,17 +157,16 @@ class TestToolColorRoster:
     closes the same gap one layer down."""
 
     def test_every_colored_tool_is_a_registered_tool(self):
-        from agent_event_bus import server
+        """One direction only, deliberately. The reverse - every tool has a
+        color - is not the contract: most tools belong in the default bucket,
+        and only the category (write / read / everything else) decides. So
+        this cannot catch the omission that actually happened, ack_events
+        sitting in green until it was noticed by eye; nothing here should be
+        read as evidence the map is fully covered."""
         from agent_event_bus.middleware import _TOOL_COLORS
+        from conftest import registered_tools
 
-        # Matched by TYPE, anchored on a known tool: conftest's autouse
-        # fixture patches a MagicMock into this module, and a MagicMock
-        # answers hasattr for every name.
-        tool_type = type(server.register_session)
-        registered = {t.name for t in vars(server).values() if isinstance(t, tool_type)}
-        assert registered, "found no registered tools - has FastMCP's tool wrapper changed shape?"
-
-        unknown = set(_TOOL_COLORS) - registered
+        unknown = set(_TOOL_COLORS) - {t.name for t in registered_tools()}
         assert not unknown, f"_TOOL_COLORS names tools that do not exist: {sorted(unknown)}"
 
 

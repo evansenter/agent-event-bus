@@ -863,8 +863,9 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
             "session_id": session_id,
             # `cursor` is ALWAYS the session's saved position, on every
             # refusal - never the tip. It has one meaning ("where you are"),
-            # and re-acking it is always a safe no-op. Handing back the tip
-            # here would make the one key a caller is told to read
+            # and re-acking it is safe whenever it is set; it is null for a
+            # session that has never acked, which is the block above.
+            # Handing back the tip here would make the one key a caller reads
             # unconditionally a loaded gun: acking it commits the whole
             # unsurfaced backlog, which is the exact loss this primitive
             # exists to prevent.
