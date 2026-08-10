@@ -390,13 +390,13 @@ publishes, after a restart.
 Events published after a deletion are also queryable directly:
 
 ```sql
-SELECT s.display_id, COUNT(e.id) AS events_after_deletion
+SELECT s.id, s.display_id, COUNT(e.id) AS events_after_deletion
 FROM sessions s
 JOIN events e ON e.session_id = s.id
              AND e.timestamp > s.deleted_at
              AND e.event_type != 'session_unregistered'
 WHERE s.deleted_at IS NOT NULL
-GROUP BY s.display_id;
+GROUP BY s.id;
 ```
 
 The `session_unregistered` exclusion is what makes this query readable:
@@ -405,7 +405,16 @@ bookkeeping event under the same id, so without it every session that ever
 exited cleanly comes back with `events_after_deletion = 1` and the actual
 orphan is buried among them. (That event is written straight to storage, so it
 is never itself flagged.) Sessions swept by the heartbeat timeout write no
-event at all, and so appear here only for real post-deletion publishes.
+event at all, and so appear here only for real post-deletion publishes. The
+exclusion is keyed on `event_type`, so a genuine post-deletion publish that
+happens to *be* a `session_unregistered` event hides here too — the right
+trade for a detection query, but worth knowing before the output surprises you.
+
+Group by `s.id`, not `display_id`: display names are drawn at random with no
+uniqueness constraint, so two sessions on a long-lived host can share one
+(~50% odds by the sixtieth session). Grouping on the name would sum their
+counts into a single row and leave you unable to tell one orphan publishing
+three times from three sessions publishing once.
 
 ## Structured Payload Fields
 
