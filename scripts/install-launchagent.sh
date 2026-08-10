@@ -8,6 +8,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 PLIST_TEMPLATE="$SCRIPT_DIR/com.evansenter.agent-event-bus.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/com.evansenter.agent-event-bus.plist"
+# Anchored at end-of-line everywhere it is matched: launchctl list prints the
+# label last, and com.evansenter.agent-event-bus-bridge is a SUPERSTRING of
+# this one, so an unanchored probe reports the bus healthy whenever only the
+# bridge is loaded.
 LABEL="com.evansenter.agent-event-bus"
 
 # Resolve paths (respect env var overrides, fall back to canonical defaults)
@@ -26,7 +30,7 @@ mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p "$HOME/.claude"
 
 # Stop existing service if running
-if launchctl list | grep -q "$LABEL"; then
+if launchctl list | grep -q "$LABEL$"; then
     echo "Stopping existing service..."
     launchctl unload "$PLIST_DEST" 2>/dev/null || true
 fi
@@ -46,7 +50,7 @@ launchctl load "$PLIST_DEST"
 
 # Verify it's running
 sleep 1
-if launchctl list | grep -q "$LABEL"; then
+if launchctl list | grep -q "$LABEL$"; then
     echo ""
     echo "Agent Event Bus installed and running!"
     echo "  Logs: $LOG_FILE"

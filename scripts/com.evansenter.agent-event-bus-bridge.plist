@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.evansenter.agent-event-bus-bridge</string>
+
+    <!-- Runs as a module, matching the bus unit. bridge.py has the __main__
+         guard, so this is equivalent to the agent-event-bus-bridge console
+         script without depending on the venv's bin/ being on PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VENV_PYTHON__</string>
+        <string>-m</string>
+        <string>agent_event_bus.bridge</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT_DIR__/src</string>
+        <!-- Pinned rather than inherited. launchd does not run a shell, so a
+             profile that exports a different backend cannot reach this
+             process - but being explicit means the unit describes what runs
+             instead of leaving it to whatever the default happens to be.
+             tmux would additionally need wake/panes.json maintained by
+             something session-side; spool has no such dependency. -->
+        <key>AGENT_EVENT_BUS_BRIDGE_BACKEND</key>
+        <string>spool</string>
+        <!-- AGENT_EVENT_BUS_URL is deliberately NOT set: unset means the
+             bridge's own default (http://127.0.0.1:8080/mcp), which is
+             correct on the machine hosting the bus. Set it here only if the
+             bus moves off this box - and then the hook URL stops being
+             loopback, which makes AGENT_EVENT_BUS_BRIDGE_SECRET mandatory
+             (validate_config refuses an exposed listener without one). -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash. Safe with the singleton lock: flock is released
+         when the dead process's fd closes, so the replacement acquires it
+         cleanly rather than refusing to start. The startup sweep also
+         reclaims the webhook row the dead instance left registered. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- launchd's default respawn throttle, stated explicitly because it is
+         load-bearing here: it bounds how fast a crash loop rewrites the log
+         below, and how fast a failing bridge re-registers against the bus. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- The bridge logs via logging.basicConfig, which is stderr-only, so
+         this file IS the bridge's log - there is no separate append-mode
+         file logger like the bus has. launchd TRUNCATES these on every
+         process start, so a crash loop overwrites the evidence of earlier
+         iterations; ThrottleInterval above is what keeps the surviving
+         window useful. Giving the bridge its own append-mode file handler
+         is the follow-up that removes this caveat. -->
+    <key>StandardOutPath</key>
+    <string>__BRIDGE_LOG_FILE__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__BRIDGE_ERR_FILE__</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

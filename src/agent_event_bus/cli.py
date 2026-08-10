@@ -240,13 +240,12 @@ def _session_id_from_env() -> str | None:
     tends not to be.
 
     The fallback exists because setting the explicit var from a shell profile
-    is not reliable: the dotfiles that map one to the other live in ~/.exports,
-    which is sourced from ~/.zshrc - and zsh reads .zshrc for INTERACTIVE
-    shells only. Tool-spawned subprocesses are non-interactive, so the mapping
-    never runs there and publishes landed as "anonymous" (`zsh -i -c` sees it,
-    `zsh -c` does not). That is a property of shell startup, not of any OS -
-    it reproduces on Linux - so the fix belongs here, where it holds for every
-    shell, spawner, and machine, rather than in one shell's rc plumbing.
+    cannot be relied on: rc files are read for INTERACTIVE shells only, and a
+    tool-spawned subprocess is not interactive, so any profile-based mapping
+    is simply absent there and publishes land as "anonymous" (`zsh -i -c`
+    sees such a mapping, `zsh -c` does not). That is shell startup semantics
+    rather than a property of any OS or any particular dotfile layout, so the
+    fix belongs here, where it holds for every shell, spawner, and machine.
 
     The two ids are the same value by construction: the SessionStart hook
     registers on the bus with client_id = the Claude Code session id, which the

@@ -10,9 +10,9 @@ SERVICE_WAS_RUNNING=false
 
 # Stop service if running (to free port 8080)
 if [[ "$(uname)" == "Darwin" ]]; then
-    LABEL="com.evansenter.agent-event-bus"
+    LABEL="com.evansenter.agent-event-bus"  # matched anchored: the bridge label is a superstring
     PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-    if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+    if launchctl list 2>/dev/null | grep -q "$LABEL$"; then
         echo "Stopping LaunchAgent for dev mode..."
         launchctl unload "$PLIST" 2>/dev/null
         SERVICE_WAS_RUNNING=true
