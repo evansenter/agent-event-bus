@@ -1956,21 +1956,43 @@ class TestAckRejectionShape:
     def _session(self, name):
         return register_session(name=name, client_id=f"{name}-c")["session_id"]
 
-    def test_both_cursor_refusals_answer_under_one_key(self):
-        """Ahead-of-tip and rewind both answer "the position to use instead".
-        Reporting them under different keys would make a client branch on
-        which refusal it got just to recover."""
+    def test_cursor_on_a_refusal_is_always_the_session_position(self):
+        """`cursor` must mean one thing on every refusal: where you are.
+
+        The earlier version returned the TIP on the ahead-of-tip refusal, and
+        a caller following "read cursor unconditionally to recover" would ack
+        it and commit the entire unsurfaced backlog. This test deliberately
+        leaves the position BEHIND the tip - with them equal (the shape the
+        first version of this test had) the divergence is invisible.
+        """
         sid = self._session("shape")
-        first = publish_event(event_type="e", payload="one")
-        second = publish_event(event_type="e", payload="two")
-        ack_events(session_id=sid, cursor=str(second["event_id"]))
+        ids = [publish_event(event_type="e", payload=f"e{i}")["event_id"] for i in range(5)]
+        ack_events(session_id=sid, cursor=str(ids[0]))
+        position, tip = str(ids[0]), str(ids[-1])
+        assert position != tip, "precondition: the two candidate values must differ"
 
         ahead = ack_events(session_id=sid, cursor="999999")
-        behind = ack_events(session_id=sid, cursor=str(first["event_id"]))
+        behind = ack_events(session_id=sid, cursor="0")
 
-        assert ahead["cursor"] == str(second["event_id"]), "the tip: the highest ackable id"
-        assert behind["cursor"] == str(second["event_id"]), "the session's current position"
-        assert "next_cursor" not in ahead, "one key, matching the success shape"
+        assert ahead["cursor"] == position, "not the tip - acking that loses e1..e4"
+        assert behind["cursor"] == position
+        assert ahead["tip"] == tip, "the ceiling is available, under its own name"
+        assert "next_cursor" not in ahead
+
+    def test_recovering_by_the_documented_key_loses_nothing(self):
+        """The property the key exists for: a client that re-acks `cursor`
+        after any refusal is exactly where it started."""
+        sid = self._session("recover")
+        ids = [publish_event(event_type="e", payload=f"e{i}")["event_id"] for i in range(5)]
+        ack_events(session_id=sid, cursor=str(ids[0]))
+
+        refusal = ack_events(session_id=sid, cursor="999999")
+        ack_events(session_id=sid, cursor=refusal["cursor"])
+
+        still_pending = [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ]
+        assert still_pending == ["e1", "e2", "e3", "e4"], "recovery must not consume anything"
 
     def test_each_tool_warns_once_for_the_same_dead_session(self, caplog):
         """A drain hook both polls and acks. Keyed without `tool`, whichever

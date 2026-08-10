@@ -227,7 +227,26 @@ Refused, rather than silently honored:
   replay deliberately
 - an ack from a **deleted session** — same error shape as a poll, see below
 
-CLI: `agent-event-bus-cli ack --session-id ID --cursor 55 [--allow-rewind]`
+A refusal always tells you where you are, so recovery needs no branching on
+which refusal you got:
+
+```
+ack_events(session_id=sid, cursor="999999")
+→ {
+    error: "Cursor 999999 is ahead of the newest event (55)",
+    session_id: "my-id",
+    cursor: "42",     # YOUR position - re-acking it is always a safe no-op
+    tip: "55"         # ahead-of-tip only: the ceiling, if you mean to clamp
+  }
+```
+
+`cursor` means the same thing on every refusal: your current position, never
+the tip. Clamping to `tip` is only safe if you have actually surfaced
+everything up to it. A deleted-session refusal adds `session_deleted: true`
+and a `hint` (see below).
+
+CLI: `agent-event-bus-cli ack --session-id ID --cursor 55 [--allow-rewind]`.
+Refusals exit non-zero; `--json` prints the error object above to stdout.
 
 ### Deleted sessions
 

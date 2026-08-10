@@ -831,6 +831,8 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # so a cursor beyond it did not come from a read - and honoring it would
     # silently mark events that do not exist yet as seen, which is this API's
     # worst failure mode: consumed but never surfaced.
+    previous = session.last_cursor
+
     # A bus with no events yet has no tip, and the only ackable position is 0.
     # Treating "no tip" as "no ceiling" would let a fresh session ack past
     # events that have not been published yet - the same loss, earlier.
@@ -842,13 +844,19 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                 f"({tip if tip else 'none published yet'})"
             ),
             "session_id": session_id,
-            # `cursor` on both rejections, matching the success shape, so a
-            # caller reads "the position to use instead" from one key rather
-            # than branching on which refusal it got. Here that is the tip.
-            "cursor": tip,
+            # `cursor` is ALWAYS the session's current position, on every
+            # refusal - never the tip. It has one meaning ("where you are"),
+            # and re-acking it is always a safe no-op. Handing back the tip
+            # here would make the one key a caller is told to read
+            # unconditionally a loaded gun: acking it commits the whole
+            # unsurfaced backlog, which is the exact loss this primitive
+            # exists to prevent.
+            "cursor": previous,
+            # The ceiling, under its own name, for a caller that wants to
+            # clamp deliberately. Clamping is only safe if it has actually
+            # surfaced everything up to here.
+            "tip": tip,
         }
-
-    previous = session.last_cursor
     if previous is not None and not allow_rewind:
         try:
             moving_backwards = target < int(previous)
