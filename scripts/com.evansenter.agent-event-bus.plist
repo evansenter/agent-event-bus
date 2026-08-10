@@ -38,7 +38,8 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- Note: launchd truncates on restart; Python logger handles append to .log file -->
+    <!-- launchd APPENDS to these across restarts (verified empirically);
+         the Python logger also appends to its own .log file. -->
     <key>StandardOutPath</key>
     <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.stdout</string>
 
