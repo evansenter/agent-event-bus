@@ -560,11 +560,11 @@ def _event_wire_dict(event: Event, *, id_key: str) -> dict:
     return d
 
 
-# (session_id, deleted_at) pairs already warned about, so an orphaned poller
+# (session_id, deleted_at, tool) triples already warned about, so an orphaned poller
 # hammering the bus every 5s contributes one WARNING rather than 100k of them.
 # Keyed on deleted_at too: a session that is revived and later deleted again is
 # a fresh incident and warns again. Bounded by the sessions table.
-_warned_deleted_sessions: set[tuple[str, str]] = set()
+_warned_deleted_sessions: set[tuple[str, str, str]] = set()
 
 
 def _load_polling_session(session_id: str | None) -> Session | None:
@@ -603,7 +603,12 @@ def _deleted_session_error(session: Session | None, tool: str = "get_events") ->
     deleted_at = session.deleted_at
     deleted_at_str = deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at)
 
-    warn_key = (session_id, deleted_at_str)
+    # `tool` is part of the key: a drain hook both polls and acks, and without
+    # it whichever call loses the race is silenced forever - the operator sees
+    # one get_events line and never learns the acks are failing too. Still
+    # bounded (sessions x deletions x tools), still not the 100k-line problem
+    # the set exists to prevent.
+    warn_key = (session_id, deleted_at_str, tool)
     if warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
         logger.warning(
@@ -837,7 +842,10 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                 f"({tip if tip else 'none published yet'})"
             ),
             "session_id": session_id,
-            "next_cursor": tip,
+            # `cursor` on both rejections, matching the success shape, so a
+            # caller reads "the position to use instead" from one key rather
+            # than branching on which refusal it got. Here that is the tip.
+            "cursor": tip,
         }
 
     previous = session.last_cursor
@@ -883,8 +891,10 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
 async def ack_events(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
     """Advance a session's saved cursor to an event id it already holds.
 
-    Pairs with peek: peek the batch with order="asc", act, then ack its
-    next_cursor. Auto-refreshes heartbeat.
+    Pairs with peek: peek with order="asc" and NO channel/event_types/
+    correlation_id filter, act, then ack that batch's next_cursor. Other
+    orderings or filters make next_cursor span events the peek never
+    returned, and acking it discards them. Auto-refreshes heartbeat.
 
     Args:
         session_id: Your session ID

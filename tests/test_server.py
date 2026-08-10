@@ -1947,3 +1947,48 @@ class TestAckNarrowingHazard:
 
         assert [e["payload"] for e in peeked["events"]] == ["e0"]
         assert peeked["next_cursor"] == tip, "spans the raw batch, not the filtered view"
+
+
+class TestAckRejectionShape:
+    """Round-4 polish: what a caller can read off a refusal, and what an
+    operator can read off the log."""
+
+    def _session(self, name):
+        return register_session(name=name, client_id=f"{name}-c")["session_id"]
+
+    def test_both_cursor_refusals_answer_under_one_key(self):
+        """Ahead-of-tip and rewind both answer "the position to use instead".
+        Reporting them under different keys would make a client branch on
+        which refusal it got just to recover."""
+        sid = self._session("shape")
+        first = publish_event(event_type="e", payload="one")
+        second = publish_event(event_type="e", payload="two")
+        ack_events(session_id=sid, cursor=str(second["event_id"]))
+
+        ahead = ack_events(session_id=sid, cursor="999999")
+        behind = ack_events(session_id=sid, cursor=str(first["event_id"]))
+
+        assert ahead["cursor"] == str(second["event_id"]), "the tip: the highest ackable id"
+        assert behind["cursor"] == str(second["event_id"]), "the session's current position"
+        assert "next_cursor" not in ahead, "one key, matching the success shape"
+
+    def test_each_tool_warns_once_for_the_same_dead_session(self, caplog):
+        """A drain hook both polls and acks. Keyed without `tool`, whichever
+        call warned first would silence the other forever, and the operator
+        would never learn the acks are failing too."""
+        import logging
+
+        sid = self._session("both")
+        server.storage.delete_session(sid)
+        server._warned_deleted_sessions.clear()
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            get_events(session_id=sid, resume=True, order="asc")
+            get_events(session_id=sid, resume=True, order="asc")  # deduped
+            ack_events(session_id=sid, cursor="1")
+            ack_events(session_id=sid, cursor="1")  # deduped
+
+        warned = [r.message for r in caplog.records if "rejecting calls" in r.message]
+        assert len(warned) == 2, f"one line per tool, deduped within each: {warned}"
+        assert any(m.startswith("get_events:") for m in warned)
+        assert any(m.startswith("ack_events:") for m in warned)
