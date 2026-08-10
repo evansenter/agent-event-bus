@@ -56,12 +56,12 @@ bridge can start before the bus is listening. `register_with_retry` backs off
 does. That is also why the installer's `registered: false` is a status line
 and not an error.
 
-**The bridge log is launchd's stdout/stderr capture** and launchd
-**truncates it on every restart** - the bridge logs via `basicConfig`
-(stderr) and has no append-mode file logger like the bus does. A crash loop
-therefore overwrites earlier iterations; `ThrottleInterval` (10s) is what
-keeps the surviving window useful. Giving the bridge its own file handler is
-the follow-up that removes this caveat.
+**The bridge log is launchd's stdout/stderr capture**, and launchd
+**appends** across restarts - verified on the bus host: after a `kill -9`
+respawn the `.err` still held the prior PID's startup lines. So a crash loop
+accumulates rather than overwrites, and the bridge needs no append-mode file
+handler of its own. The split follows from `basicConfig` being stderr-only:
+bridge records land in `.err`, while `.log` collects uvicorn's access lines.
 
 ## Verifying supervision
 
@@ -74,9 +74,15 @@ them check claims the unit's own comments make:
    the startup sweep reclaims the dead instance's webhook row instead of
    leaving a duplicate: `agent-event-bus-cli webhook list --all` should show
    one.
-2. **Boot order** - unload the bus, load the bridge: `/health` shows
-   `registered: false`. Load the bus; within ~30s it flips to `true` with no
-   intervention. This is `register_with_retry`'s backoff doing its job.
+2. **Boot order** - unload the bus, then **restart the bridge** so it starts
+   bus-less: `/health` shows `registered: false`. Load the bus; within ~30s
+   it flips to `true` with no intervention. This is `register_with_retry`'s
+   backoff doing its job. The restart is the step that makes this
+   reproducible - `registered` is the *startup* result and is never
+   re-verified, so unloading the bus under a bridge that `install-bridge`
+   just left registered leaves `/health` still reporting `true`. Corollary:
+   `/health` is not a bus-liveness probe. It answers "did I register at
+   startup", not "am I registered now".
 3. **Reboot** - the actual requirement. `RunAtLoad` plus login.
 4. **Clean unload** - `make uninstall-bridge`, then confirm the webhook row
    is gone and port 8082 is free.
