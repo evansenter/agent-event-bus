@@ -75,6 +75,10 @@ Examples:
     # false to clear a backlog in one hook run. The peek belongs INSIDE the
     # loop - the ack moves the cursor, so the next pass is a fresh window.
     while :; do
+        # A session deleted or timed out mid-drain FAILS this poll rather than
+        # returning an empty batch, and `events` exits non-zero on it - so
+        # under `set -e` the hook aborts here, loudly. Without it, .has_more
+        # reads null on the error object and the loop breaks instead.
         OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
                 --min-level actionable --order asc --json)
         echo "$OUT" | jq -r '.events[].payload'
@@ -87,6 +91,9 @@ Examples:
         if [ -n "$CUR" ]; then
             agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
         fi
+        # has_more, NOT the event count: it counts the RAW batch, before
+        # --min-level filters it, so a pass of 50 lifecycle events prints
+        # nothing and still has more to drain.
         [ "$(echo "$OUT" | jq -r '.has_more')" = "true" ] || break
     done
 

@@ -190,15 +190,26 @@ while True:
     pending = get_events(session_id=sid, resume=True, peek=True,
                          min_level="actionable", order="asc")
 
-    # 2. Act on pending["events"] - surface them, wake something, whatever
+    # 2. Bail on a refusal before indexing anything else. A session deleted
+    #    or timed out mid-drain FAILS the poll rather than returning an empty
+    #    batch (see below), and looping holds that window open for the whole
+    #    backlog rather than just one pass.
+    if "error" in pending:
+        break
 
-    # 3. Ack exactly what step 1 covered - but only if there was anything.
+    # 3. Act on pending["events"] - surface them, wake something, whatever
+
+    # 4. Ack exactly what step 1 covered - but only if there was anything.
     #    On a bus with no events at all next_cursor is null, and acking null
     #    is an error, not a no-op.
     if pending["next_cursor"]:
         ack_events(session_id=sid, cursor=pending["next_cursor"])
         → {success: true, cursor: "55", previous_cursor: "42"}
 
+    # 5. has_more, NOT pending["events"]. has_more counts the RAW batch, before
+    #    min_level filters it, so a pass of 50 lifecycle events returns
+    #    events: [] with has_more: true. Breaking on "nothing surfaced" would
+    #    exit with that noise un-acked and re-peek the same window next run.
     if not pending["has_more"]:
         break
 ```
