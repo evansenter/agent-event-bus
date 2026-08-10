@@ -801,8 +801,14 @@ class SQLiteStorage:
             secret=row["secret"],
         )
 
-    def list_webhooks(self, active_only: bool = False) -> list[Webhook]:
-        """List all webhooks, optionally filtering to active only."""
+    def list_webhooks(self, active_only: bool = True) -> list[Webhook]:
+        """List webhooks, active ones only unless active_only=False.
+
+        Defaults to active-only to match the MCP tool, and because the unsafe
+        direction is asymmetric: a caller that forgets the argument while
+        deciding whom to deliver to would otherwise wake every webhook its
+        owner had deliberately paused.
+        """
         with self._connect() as conn:
             if active_only:
                 rows = conn.execute(

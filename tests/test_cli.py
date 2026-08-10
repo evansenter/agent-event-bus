@@ -967,6 +967,21 @@ class TestWebhookCommands:
         assert calls[0]["arguments"] == {"webhook_id": 7}
         assert calls[0]["posted_to"] == cli.DEFAULT_URL
 
+    def test_disable_posts_active_false(self, monkeypatch):
+        calls = self._run_main(["webhook", "disable", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "set_webhook_active"
+        assert calls[0]["arguments"] == {"webhook_id": 7, "active": False}
+        assert calls[0]["posted_to"] == cli.DEFAULT_URL
+
+    def test_enable_posts_active_true(self, monkeypatch):
+        """The two verbs share one handler, so the mapping is the thing that
+        can silently invert - pin both directions, not just one."""
+        calls = self._run_main(["webhook", "enable", "7"], monkeypatch)
+
+        assert calls[0]["tool"] == "set_webhook_active"
+        assert calls[0]["arguments"] == {"webhook_id": 7, "active": True}
+
 
 class TestCmdEventsPeek:
     """CLI-level tests for events --peek (issue #131)."""

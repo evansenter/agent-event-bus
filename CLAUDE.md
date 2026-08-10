@@ -96,7 +96,7 @@ src/agent_event_bus/
 
 ## MCP Tools
 
-`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`, `register_webhook`, `list_webhooks`, `unregister_webhook`
+`register_session`, `list_sessions`, `list_channels`, `publish_event`, `get_events`, `unregister_session`, `notify`, `register_webhook`, `list_webhooks`, `set_webhook_active`, `unregister_webhook`
 
 **Usage guide**: `agent-event-bus://guide` resource. Keep it updated when changing APIs.
 

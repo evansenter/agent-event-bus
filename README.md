@@ -70,6 +70,7 @@ Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 | `notify` | System notification |
 | `register_webhook` | Register HTTP endpoint for push notifications |
 | `list_webhooks` | List registered webhooks |
+| `set_webhook_active` | Pause/resume a webhook without unregistering |
 | `unregister_webhook` | Remove a webhook |
 
 ## Channels
@@ -110,8 +111,7 @@ Push events to HTTP endpoints instead of polling. Webhooks are called asynchrono
 mechanism: a daemon that wakes idle sessions when an actionable DM arrives
 (RFC #122). Run it as `uv run agent-event-bus-bridge` from the checkout -
 unlike the CLI, nothing symlinks it onto PATH until the supervision story
-lands. See the "Re-awakening Bridge" section of the usage guide
-(`agent-event-bus://guide`).
+lands. See [`docs/BRIDGE.md`](docs/BRIDGE.md).
 
 ### MCP
 

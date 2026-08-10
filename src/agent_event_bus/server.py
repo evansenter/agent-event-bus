@@ -10,6 +10,7 @@ Provides tools for cross-session Claude Code communication:
 - notify: Send system notifications
 - register_webhook: Register HTTP endpoint for push notifications
 - list_webhooks: List registered webhooks
+- set_webhook_active: Pause/resume a webhook without unregistering it
 - unregister_webhook: Remove a webhook
 """
 
@@ -1045,6 +1046,26 @@ async def list_webhooks(active_only: bool = True) -> list[dict]:
         active_only: If True, only return active webhooks (default: True)
     """
     return await _run_sync(_list_webhooks_impl, active_only=active_only)
+
+
+def _set_webhook_active_impl(webhook_id: int, active: bool) -> dict:
+    """Sync implementation of set_webhook_active (runs in a worker thread)."""
+    if not storage.set_webhook_active(webhook_id, active):
+        return {"success": False, "error": "Webhook not found", "webhook_id": webhook_id}
+
+    _dev_notify("set_webhook_active", f"#{webhook_id} {'enabled' if active else 'disabled'}")
+    return {"success": True, "webhook_id": webhook_id, "active": active}
+
+
+@mcp.tool()
+async def set_webhook_active(webhook_id: int, active: bool) -> dict:
+    """Pause or resume a webhook without unregistering it.
+
+    Args:
+        webhook_id: ID of the webhook
+        active: False stops deliveries and keeps the registration; True resumes
+    """
+    return await _run_sync(_set_webhook_active_impl, webhook_id=webhook_id, active=active)
 
 
 def _unregister_webhook_impl(webhook_id: int) -> dict:

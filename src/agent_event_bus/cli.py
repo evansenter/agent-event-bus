@@ -16,6 +16,8 @@ Usage:
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
     agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
     agent-event-bus-cli webhook list [--all]
+    agent-event-bus-cli webhook disable WEBHOOK_ID
+    agent-event-bus-cli webhook enable WEBHOOK_ID
     agent-event-bus-cli webhook unregister WEBHOOK_ID
 
 Examples:
@@ -415,6 +417,23 @@ def cmd_webhook_list(args):
         print()
 
 
+def cmd_webhook_set_active(args):
+    """Pause or resume a webhook, keeping its registration."""
+    # One handler behind two subcommands - the verb the user typed IS the
+    # desired state, so there is no flag to get backwards.
+    active = args.webhook_command == "enable"
+    result = call_tool(
+        "set_webhook_active",
+        {"webhook_id": args.webhook_id, "active": active},
+        url=args.url,
+    )
+    if result.get("success"):
+        print(f"Webhook #{args.webhook_id} {'enabled' if active else 'disabled'}")
+    else:
+        print(f"Failed: {result.get('error', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_webhook_unregister(args):
     """Unregister a webhook."""
     result = call_tool("unregister_webhook", {"webhook_id": args.webhook_id}, url=args.url)
@@ -577,6 +596,14 @@ def main():
     p_wh_list = webhook_subparsers.add_parser("list", help="List webhooks")
     p_wh_list.add_argument("--all", action="store_true", help="Include inactive webhooks")
     p_wh_list.set_defaults(func=cmd_webhook_list)
+
+    # webhook disable / enable - pause deliveries without losing the registration
+    for verb, effect in (("disable", "Pause"), ("enable", "Resume")):
+        p_wh_active = webhook_subparsers.add_parser(
+            verb, help=f"{effect} deliveries, keeping the registration"
+        )
+        p_wh_active.add_argument("webhook_id", type=int, help=f"Webhook ID to {verb}")
+        p_wh_active.set_defaults(func=cmd_webhook_set_active)
 
     # webhook unregister
     p_wh_unregister = webhook_subparsers.add_parser("unregister", help="Remove a webhook")
