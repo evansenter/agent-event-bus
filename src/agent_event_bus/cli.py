@@ -434,9 +434,10 @@ def cmd_ack(args):
     if args.json:
         print(json.dumps(result))
     else:
-        previous = result.get("previous_cursor")
-        moved = f"{previous} → {result['cursor']}" if previous else f"→ {result['cursor']}"
-        print(f"Cursor acked: {moved}")
+        # "start", not a dangling arrow, and the same word `make logs` uses
+        # for this case - one event should not read two ways.
+        previous = result.get("previous_cursor") or "start"
+        print(f"Cursor acked: {previous} → {result['cursor']}")
 
 
 def cmd_notify(args):

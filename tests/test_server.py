@@ -2017,17 +2017,48 @@ class TestAckRejectionShape:
             # ...and the reported position is genuinely re-ackable
             assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
 
-    def test_a_session_with_no_saved_cursor_reports_a_usable_position(self):
-        """`previous` is None until something advances the cursor, and acking
-        None fails - so the one session that most needs the recovery path
-        would have been the one it did not work for."""
-        sid = self._session("never-acked")
-        assert server.storage.get_session(sid).last_cursor is None
+    def test_a_cursor_less_session_recovers_without_replaying_history(self):
+        """The never-acked path, pinned at the same strength as the acked one.
 
-        refusal = ack_events(session_id=sid, cursor="999999")
+        Asserting only that the recovery ack SUCCEEDS is the weak half - it
+        succeeded while silently rewinding to 0, which flipped the next resume
+        from tip-relative to a full-history replay. A peek-only drain never
+        persists a cursor, so this is the shape that hit it.
+        """
+        for i in range(6):
+            publish_event(event_type="note", payload=f"old-{i}")
+        sid = self._session("peek-only")
 
-        assert refusal["cursor"] == "0"
+        # A peek-only drain reads from the tip WITHOUT persisting it.
+        get_events(session_id=sid, resume=True, peek=True, min_level="actionable", order="asc")
+        assert server.storage.get_session(sid).last_cursor is None, "precondition: cursor-less"
+
+        refusal = ack_events(session_id=sid, cursor="not-an-id")
         assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
+
+        # Inert: still reading from the tip, not replaying what came before.
+        assert get_events(session_id=sid, resume=True, order="asc")["events"] == []
+
+        publish_event(event_type="note", payload="new")
+        assert [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ] == ["new"]
+
+    def test_a_deliberate_rewind_to_zero_still_replays(self):
+        """The position fix must not disturb allow_rewind: acking 0 on purpose
+        is the documented way to replay from the beginning."""
+        sid = self._session("deliberate")
+        published = publish_event(event_type="note", payload="history")
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        ack_events(session_id=sid, cursor="0", allow_rewind=True)
+
+        assert server.storage.get_session(sid).last_cursor == "0"
+        # Reading from the beginning again, not from the acked position. Asserted
+        # by id rather than payload: the suite shares one events table, so the
+        # replay's first page starts well before this test's own events.
+        replayed = get_events(session_id=sid, resume=True, order="asc")["events"]
+        assert replayed and replayed[0]["id"] < published["event_id"]
 
     def test_each_tool_warns_once_for_the_same_dead_session(self, caplog):
         """A drain hook both polls and acks. Keyed without `tool`, whichever

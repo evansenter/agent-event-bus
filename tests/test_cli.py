@@ -636,6 +636,15 @@ class TestCmdAck:
         assert "30 \u2192 42" in capsys.readouterr().out
 
     @patch("agent_event_bus.cli.call_tool")
+    def test_first_ack_reads_as_start_not_a_dangling_arrow(self, mock_call, capsys):
+        """Same word `make logs` uses for this case - one event, one wording."""
+        mock_call.return_value = {"success": True, "cursor": "7", "previous_cursor": None}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+
+        assert "start \u2192 7" in capsys.readouterr().out
+
+    @patch("agent_event_bus.cli.call_tool")
     def test_allow_rewind_is_only_sent_when_set(self, mock_call):
         mock_call.return_value = {"success": True, "cursor": "42"}
 

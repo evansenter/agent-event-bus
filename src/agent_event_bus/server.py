@@ -815,11 +815,24 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     _auto_heartbeat(session_id)
 
     previous = session.last_cursor
-    # What every refusal reports as `cursor`. A session that has never saved
-    # one is at 0 - the same place a null cursor reads from - and "0" can be
-    # re-acked where None cannot, so the documented recovery ("re-acking it is
-    # always a safe no-op") holds without a special case.
-    position = previous if previous is not None else "0"
+    tip = storage.get_cursor()
+
+    # What every refusal reports as `cursor`, and it has to be genuinely
+    # INERT to re-ack, not merely accepted.
+    #
+    # A session that has never saved a cursor is not at 0 - every resume
+    # branch reads a cursor-less session from the TIP (it persists the tip, or
+    # reads from it without persisting). Reporting "0" made the ack succeed
+    # and persist 0, which flips the next resume from tip-relative to a full
+    # history replay: a peek-only drain that hit one refusal would re-read the
+    # entire bus.
+    #
+    # Handing back the tip is right HERE and was wrong on the ahead-of-tip
+    # refusal (see below) for the same reason in both cases: report where the
+    # session actually is. For a cursor-less session that IS the tip, so
+    # nothing sits behind it to lose; for a session with a saved cursor the
+    # tip is somewhere ahead of it, and acking it would bury the gap.
+    position = previous if previous is not None else (tip or "0")
 
     try:
         target = int(cursor)
@@ -843,7 +856,6 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # A bus with no events yet has no tip, and the only ackable position is 0.
     # Treating "no tip" as "no ceiling" would let a fresh session ack past
     # events that have not been published yet - the same loss, earlier.
-    tip = storage.get_cursor()
     if target > (int(tip) if tip else 0):
         return {
             "error": (
