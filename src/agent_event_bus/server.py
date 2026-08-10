@@ -803,6 +803,12 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     if session is None:
         return {"error": "Session not found", "session_id": session_id}
 
+    # Refreshed here, before the validation below, so "auto-refreshes
+    # heartbeat" holds for every call from a live session - the same point in
+    # the flow _get_events_impl refreshes at. An ack the server refuses is
+    # still the session saying it is alive.
+    _auto_heartbeat(session_id)
+
     try:
         target = int(cursor)
     except (TypeError, ValueError):
@@ -850,7 +856,12 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
                 "cursor": previous,
             }
 
-    if not storage.update_session_cursor(session_id, cursor):
+    # str(target), not the raw cursor: int() accepts " 42 ", "+42" and "4_2",
+    # and the stored string is what surfaces again in previous_cursor, in
+    # list_sessions, and in the rewind rejection message. Persist the
+    # canonical form so those never read back as the caller's typing.
+    canonical = str(target)
+    if not storage.update_session_cursor(session_id, canonical):
         # Lost a race with deletion between the load above and this write
         # (the UPDATE is guarded by deleted_at IS NULL). Re-read so the caller
         # gets the same shape a rejected poll gets, rather than a success the
@@ -859,14 +870,11 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
         raced = _deleted_session_error(_load_polling_session(session_id), tool="ack_events")
         return raced or {"error": "Session not found", "session_id": session_id}
 
-    # Acking is session activity, same as polling. A consumer that only acked
-    # would otherwise go stale and be swept out from under itself.
-    _auto_heartbeat(session_id)
-    _dev_notify("ack_events", f"{session.display_id} → {cursor}")
+    _dev_notify("ack_events", f"{session.display_id} → {canonical}")
     return {
         "success": True,
         "session_id": session_id,
-        "cursor": cursor,
+        "cursor": canonical,
         "previous_cursor": previous,
     }
 
@@ -875,8 +883,8 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
 async def ack_events(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
     """Advance a session's saved cursor to an event id it already holds.
 
-    Pairs with peek: peek (non-consuming) → act → ack the batch's next_cursor.
-    Auto-refreshes heartbeat.
+    Pairs with peek: peek the batch with order="asc", act, then ack its
+    next_cursor. Auto-refreshes heartbeat.
 
     Args:
         session_id: Your session ID

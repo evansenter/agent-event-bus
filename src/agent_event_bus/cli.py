@@ -74,7 +74,10 @@ Examples:
     OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
             --min-level actionable --order asc --json)
     echo "$OUT" | jq -r '.events[].payload'
-    agent-event-bus-cli ack --session-id "$SID" --cursor "$(echo "$OUT" | jq -r .next_cursor)"
+    # `// empty` + the test: on a bus with no events at all next_cursor is
+    # null, and `jq -r` would print the string "null" for an ack to reject.
+    CUR=$(echo "$OUT" | jq -r '.next_cursor // empty')
+    [ -n "$CUR" ] && agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -409,7 +412,14 @@ def cmd_ack(args):
     result = call_tool("ack_events", arguments, url=args.url)
 
     if "error" in result:
-        print(f"Error: {result['error']}", file=sys.stderr)
+        message = f"Error: {result['error']}"
+        # Same as cmd_events: the hint carries the actionable half ("re-register
+        # or stop polling"). Dropping it here would leave an operator debugging
+        # a swept drain hook with an exit code and no next step - and would make
+        # this path the one place the shared #140 contract is not actually shared.
+        if result.get("hint"):
+            message += f"\n{result['hint']}"
+        print(message, file=sys.stderr)
         sys.exit(1)
 
     if args.json:

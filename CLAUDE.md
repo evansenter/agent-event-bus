@@ -159,7 +159,8 @@ CLI and MCP expose the same functionality:
 - **Polling over push**: MCP is request/response; sessions poll with `get_events(cursor)`
 - **Broadcast model**: All sessions see all events; channels are metadata, not filters
 - **Session cleanup**: 24-hour timeout + PID liveness checks for local sessions
-- **Auto-heartbeat**: `publish_event` and `get_events` refresh heartbeat
+- **Auto-heartbeat**: `publish_event`, `get_events` and `ack_events` refresh heartbeat (a consumer that only acks would otherwise be swept as stale out from under itself)
+- **Peek/ack pairing (#134)**: a bounded consume cannot bound anything under a server-side filter - `min_level` filters the returned view while the cursor advances over the RAW batch behind it, so "consume the N I just saw" advances past a different window than the peek showed. `ack_events(session_id, cursor)` commits an id the caller already holds, so peek and ack name one window by construction. **Peek with `order="asc"`**: under `desc` the batch is the newest slice while `next_cursor` is the tip, so acking it discards the older, never-surfaced backlog
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
 - **Non-consuming narrowed reads**: `channel`/`event_types`/`correlation_id` filters never advance the session cursor (their SQL-filtered max would mark non-matching events as seen); `min_level` filters post-bookkeeping and does
 - **High-water cursors**: `next_cursor` is the batch MAX id in both orders; feeding it back never re-serves events

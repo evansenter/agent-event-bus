@@ -1853,3 +1853,44 @@ class TestAckOrderingHazard:
             ack_events(session_id=sid, cursor=peeked["next_cursor"])
 
         assert surfaced == [f"event-{i}" for i in range(1, 21)], "nothing lost, nothing repeated"
+
+
+class TestAckNormalizesAndReportsConsistently:
+    """Round-2 polish, pinned: what gets stored and what gets promised."""
+
+    def _session(self, name):
+        return register_session(name=name, client_id=f"{name}-client")["session_id"]
+
+    def test_persists_the_canonical_cursor_not_the_caller_typing(self):
+        """int() accepts " 42 ", "+42" and "4_2". The stored string surfaces
+        again in previous_cursor, list_sessions, and the rewind rejection
+        message, so it must not read back as whatever the caller typed."""
+        sid = self._session("canonical")
+        publish_event(event_type="e", payload="one")
+        published = publish_event(event_type="e", payload="two")
+        target = published["event_id"]
+
+        result = ack_events(session_id=sid, cursor=f" +{target} ")
+
+        assert result["cursor"] == str(target)
+        assert server.storage.get_session(sid).last_cursor == str(target)
+
+        # ...and the rewind message quotes the canonical form back
+        rewound = ack_events(session_id=sid, cursor=str(target - 1))
+        assert f"({target})" in rewound["error"]
+
+    def test_heartbeat_refreshes_even_when_the_ack_is_refused(self):
+        """The docstring promises "auto-refreshes heartbeat" unqualified, and
+        _get_events_impl refreshes before its own checks. A refused ack is
+        still the session saying it is alive."""
+        from datetime import timedelta
+
+        sid = self._session("refused-hb")
+        publish_event(event_type="e", payload="one")
+        stale = datetime.now() - timedelta(hours=12)
+        server.storage.update_heartbeat(sid, stale)
+
+        refused = ack_events(session_id=sid, cursor="999999")
+
+        assert "error" in refused
+        assert server.storage.get_session(sid).last_heartbeat > stale

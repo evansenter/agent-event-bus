@@ -674,6 +674,25 @@ class TestCmdAck:
         assert exc.value.code == 1
         assert "ahead of the newest event" in capsys.readouterr().err
 
+    @patch("agent_event_bus.cli.call_tool")
+    def test_deleted_session_rejection_keeps_the_hint(self, mock_call, capsys):
+        """cmd_events prints the hint for this same #140 shape; dropping it
+        here would leave an operator debugging a swept drain hook with an exit
+        code and no next step - and make this the one place the shared
+        contract is not actually shared."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "hint": "This session was unregistered ... Call register_session or stop polling.",
+        }
+
+        with pytest.raises(SystemExit):
+            cli.cmd_ack(make_ack_args(session_id="gone"))
+
+        err = capsys.readouterr().err
+        assert "Session deleted" in err
+        assert "Call register_session or stop polling." in err
+
     def test_parser_wires_the_subcommand(self):
         import sys
 
