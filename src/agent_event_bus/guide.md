@@ -195,6 +195,9 @@ while True:
     #    batch (see below), and looping holds that window open for the whole
     #    backlog rather than just one pass.
     if "error" in pending:
+        # Say so - breaking silently reads exactly like a clean drain, and
+        # `hint` is the actionable half ("re-register or stop polling").
+        log(pending["error"], pending.get("hint"))
         break
 
     # 3. Act on pending["events"] - surface them, wake something, whatever
