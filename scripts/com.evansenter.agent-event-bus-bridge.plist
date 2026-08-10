@@ -50,19 +50,21 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- launchd's default respawn throttle, stated explicitly because it is
-         load-bearing here: it bounds how fast a crash loop rewrites the log
-         below, and how fast a failing bridge re-registers against the bus. -->
+    <!-- launchd's default respawn throttle, stated explicitly so the unit
+         describes its own restart cadence: it bounds how fast a failing
+         bridge re-registers against the bus.
+         install-bridge-launchagent.sh sleeps this out (12s = this + margin)
+         on a re-install so /health answers from the NEW instance - raise
+         this and raise that sleep too, or the gate under-waits. -->
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
     <!-- The bridge logs via logging.basicConfig, which is stderr-only, so
-         this file IS the bridge's log - there is no separate append-mode
-         file logger like the bus has. launchd TRUNCATES these on every
-         process start, so a crash loop overwrites the evidence of earlier
-         iterations; ThrottleInterval above is what keeps the surviving
-         window useful. Giving the bridge its own append-mode file handler
-         is the follow-up that removes this caveat. -->
+         the .err file IS the bridge's log; the .log file receives uvicorn's
+         access lines. launchd APPENDS to both across restarts (verified on
+         the bus host: after a kill -9 respawn the .err still held the prior
+         PID's startup lines), so history survives a crash loop and the
+         bridge needs no file handler of its own. -->
     <key>StandardOutPath</key>
     <string>__BRIDGE_LOG_FILE__</string>
 

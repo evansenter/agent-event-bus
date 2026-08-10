@@ -26,8 +26,9 @@ a spool line only becomes a wake when the drain hook acts on it, so bounding
 that belongs to the drain hook.
 
 Run:  uv run agent-event-bus-bridge [--backend tmux] [--port 8082] ...
-(from the repo checkout - the console script lives in the project venv;
-nothing puts it on PATH yet, that lands with the supervision story)
+(from the repo checkout - the console script lives in the project venv and
+nothing puts it on PATH; on macOS `make install-bridge` supervises it as a
+LaunchAgent instead)
 The bridge registers its own webhook on the bus at startup (HMAC-signed when
 AGENT_EVENT_BUS_BRIDGE_SECRET is set) and unregisters it on clean shutdown.
 """
