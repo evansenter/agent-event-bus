@@ -829,7 +829,9 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # honest answer is that such a session has no position to restore: null.
     # The resume path resolves a cursor-less session lazily (it initializes
     # from the tip at resume time), and only leaving the field null preserves
-    # that. See guide.md - a null `cursor` means "don't ack, just resume".
+    # that. See guide.md - a null `cursor` means "re-ack the next_cursor your
+    # peek returned", NOT "fall back to a bare resume": a cursor-less resume
+    # initializes from the tip at resume time and would skip the same window.
     position = previous
 
     try:

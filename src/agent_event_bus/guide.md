@@ -242,7 +242,7 @@ ack_events(session_id=sid, cursor="999999")
 → {
     error: "Cursor 999999 is ahead of the newest event (55)",
     session_id: "my-id",
-    cursor: "42",     # YOUR position - re-acking it is always a safe no-op
+    cursor: "42",     # YOUR position - safe to re-ack whenever it is set
     tip: "55"         # ahead-of-tip only: the ceiling, if you mean to clamp
   }
 ```
