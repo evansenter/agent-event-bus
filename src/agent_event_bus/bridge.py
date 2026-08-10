@@ -10,22 +10,30 @@ sits unread until its human happens to prompt. This daemon closes the loop:
         -> inject a wake-up for session X
 
 Injection backends:
-  spool  (default) append the event as a JSON line to
-         <wake_dir>/<session_id>.jsonl - portable; a Stop/UserPromptSubmit
-         hook can drain the spool at its next opportunity
-  tmux   `tmux send-keys` a wake prompt into the session's pane, then fall
-         back to spool when no pane mapping exists. Pane mappings are read
-         from <wake_dir>/panes.json ({session_id: pane_id}), which something
-         session-side (e.g. a SessionStart hook publishing $TMUX_PANE) must
-         maintain.
+  spool  append the event as a JSON line to <wake_dir>/<session_id>.jsonl -
+         portable; a Stop/UserPromptSubmit hook can drain the spool at its
+         next opportunity. This path is always on, in every backend.
+  mux    additionally type a wake prompt into the session's terminal pane
+         (tmux `send-keys`, zellij `action write-chars`), falling back to
+         spool when no pane mapping exists. Mappings live in
+         <wake_dir>/panes.json and are written by `agent-event-bus-cli panes
+         set` from a SessionStart hook. `tmux` is accepted as an alias for
+         this backend's original, tmux-only name.
 
-Loop prevention: in the tmux backend a per-session cooldown (default 30s)
+Idle gate: the mux backend injects only into a session that is BETWEEN turns.
+A <wake_dir>/<session_id>.busy marker (written by `agent-event-bus-cli
+wake-state`, from UserPromptSubmit and Stop hooks) means a turn is in flight,
+and the event is spooled instead. This costs no coverage - a Stop hook already
+surfaces directed events at end-of-turn - and it keeps injected keystrokes away
+from the one window where a permission dialog can be on screen to consume them.
+
+Loop prevention: in the mux backend a per-session cooldown (default 30s)
 bounds injections; an event that arrives during cooldown is spooled instead,
 so nothing is lost. In the default spool backend the cooldown never engages -
 a spool line only becomes a wake when the drain hook acts on it, so bounding
 that belongs to the drain hook.
 
-Run:  uv run agent-event-bus-bridge [--backend tmux] [--port 8082] ...
+Run:  uv run agent-event-bus-bridge [--backend mux] [--port 8082] ...
 (from the repo checkout - the console script lives in the project venv and
 nothing puts it on PATH; on macOS `make install-bridge` supervises it as a
 LaunchAgent instead)
@@ -76,11 +84,24 @@ from agent_event_bus.cli import DEFAULT_URL, BusUnreachableError, call_tool
 # (see test_bridge_import_does_not_pull_in_the_bus_server).
 from agent_event_bus.helpers import SIGNATURE_HEADER, WEBHOOK_CONTENT_TYPE
 
+# The wake-dir contract - pane mapping shape, turn-state markers, and the
+# validation both sides run. The writer (`agent-event-bus-cli panes`) is built
+# on the same module, so a change that breaks this reader breaks a test here
+# rather than silently producing wakes that never happen.
+from agent_event_bus.wake import (
+    DEFAULT_WAKE_DIR,
+    PANES_FILENAME,
+    SUPPORTED_MUXES,
+    InvalidTargetError,
+    MuxTarget,
+    is_busy,
+    parse_target,
+)
+
 logger = logging.getLogger("agent-event-bus-bridge")
 
 DEFAULT_BRIDGE_PORT = 8082
 DEFAULT_COOLDOWN_SECONDS = 30.0
-DEFAULT_WAKE_DIR = Path.home() / ".claude" / "contrib" / "agent-event-bus" / "wake"
 # Home for the hook-URL singleton lock. MACHINE-scoped and uid-scoped, NOT
 # HOME-anchored: the webhook row it guards is global to the bus, so the lock
 # must contend for every process on this machine that could register the
@@ -99,13 +120,26 @@ DEFAULT_LOCK_DIR = (
     / f"agent-event-bus-bridge-{os.getuid()}"
 )
 
-# tmux send-keys is bounded like the notifier subprocesses in helpers.py -
-# a hung tmux must not wedge the bridge. Sized under the bus's
-# WEBHOOK_TIMEOUT (5s per attempt, server.py): the bus's clock starts
+# The injection subprocesses are bounded like the notifier subprocesses in
+# helpers.py - a hung multiplexer must not wedge the bridge. Sized under the
+# bus's WEBHOOK_TIMEOUT (5s per attempt, server.py): the bus's clock starts
 # before ours, so a bound at or above its timeout means the bus never
 # sees the response this bound exists to produce - just a timeout plus
 # retries (and a duplicate spool line per retry).
-TMUX_TIMEOUT = 2.0
+# A TOTAL budget for the injection, not a per-call one. zellij needs two
+# calls (type, then submit), and a per-call bound would make the worst case
+# 2 x this - which at 2.0 puts spool_deadline + injection at 6.0, over the
+# bus's 5s and straight into the timeout-plus-retry this constant exists to
+# prevent. _mux_wake spends it against a monotonic deadline instead, so the
+# invariant stays "spool deadline + MUX_TIMEOUT < WEBHOOK_TIMEOUT"
+# regardless of how many calls a backend needs.
+MUX_TIMEOUT = 2.0
+
+# Floor for the per-call slice of that budget. A slice that has decayed to
+# ~0 would make the LAST call (zellij's submit) time out instantly on a
+# merely-slow host, leaving text typed into a pane and never submitted -
+# strictly worse than not having injected at all.
+MUX_CALL_MIN_TIMEOUT = 0.25
 
 # Bound on joining the registration thread at shutdown. register_with_bus
 # makes 2 + N sequential call_tool requests (list, one unregister per
@@ -161,7 +195,7 @@ class BridgeConfig:
 
     bus_url: str = DEFAULT_URL
     port: int = DEFAULT_BRIDGE_PORT
-    backend: str = "spool"  # "spool" | "tmux"
+    backend: str = "spool"  # "spool" | "mux" ("tmux" is a legacy alias)
     secret: str | None = None
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
     wake_dir: Path = field(default_factory=lambda: DEFAULT_WAKE_DIR)
@@ -185,6 +219,19 @@ class BridgeConfig:
     # nothing else adds under the derived wildcard bind - so a reverse-proxy
     # deployment must list that value here or every dispatch is 421'd.
     allowed_hosts: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        # Normalize the legacy backend spelling HERE, not in validate_config,
+        # so it holds for every construction path. An embedder building a
+        # BridgeConfig directly - and every test that does - skips validation
+        # entirely, and there `backend="tmux"` would fall through deliver()'s
+        # `!= "mux"` check and silently behave as the spool backend: no error,
+        # no log line, just a bridge that never injects. That is the exact
+        # failure shape this whole change exists to remove, so the alias has
+        # to be resolved at the type's boundary rather than on one path into
+        # it.
+        if self.backend == "tmux":
+            self.backend = "mux"
 
 
 class BridgeConfigError(ValueError):
@@ -379,22 +426,24 @@ class Injector:
             ) from None
 
     def deliver(self, session_id: str, event: dict) -> str:
-        """Wake session_id for event. Returns the action taken: "tmux",
+        """Wake session_id for event. Returns the action taken: "tmux" or
+        "zellij" (wake injected via that multiplexer),
         "spool" (spool backend working as designed), "spool-cooldown",
-        "spool-unmapped" (tmux backend, no usable pane mapping - normally
-        because the session lives on another machine, since webhooks have
-        no machine scoping, but also when panes.json is missing,
-        unreadable, malformed, or its entry is not a pane id; the
-        misconfiguration shapes warn, so check the log), or
-        "spool-tmux-failed" (tmux backend, the send-keys
-        attempt itself failed - the arm that means tmux on this box is
+        "spool-busy" (mux backend, a turn is in flight - see the idle gate
+        below), "spool-unmapped" (mux backend, no usable pane mapping -
+        normally because the session lives on another machine, since
+        webhooks have no machine scoping, but also when panes.json is
+        missing, unreadable, malformed, or its entry is not a usable
+        target; the misconfiguration shapes warn, so check the log), or
+        "spool-mux-failed" (mux backend, the injection attempt itself
+        failed - the arm that means the multiplexer on this box is
         broken). The action value is in-band for a direct caller of /hook
         only - the bus discards the response body - so operator-facing
         visibility is this module's log: failed wakes at warning, the quiet
         arms at debug under DEV_MODE.
 
         The cooldown bounds successful injections only: spool writes are
-        durable bookkeeping, not wakes, and a failed tmux attempt must not
+        durable bookkeeping, not wakes, and a failed injection must not
         burn the window - the next event should retry (e.g. after a
         SessionStart hook repairs the pane mapping).
         """
@@ -405,7 +454,7 @@ class Injector:
         # would stall every session's delivery
         self._spool(session_id, event)
 
-        if self.config.backend != "tmux":
+        if self.config.backend != "mux":
             # The happy-path breadcrumb: without it the spool backend's
             # terminal shows the registration line and then permanent
             # silence, indistinguishable from a bus that stopped
@@ -428,12 +477,23 @@ class Injector:
         # the unmapped arm is the normal outcome, not a failure, so there is
         # no reservation to take or roll back. Debug, not info: per-event
         # INFO on an arm every foreign-machine DM lands on is permanent
-        # noise - matches the below-actionable filter arm and _tmux_pane's
+        # noise - matches the below-actionable filter arm and _mux_target's
         # silent missing-file case.
-        pane = self._tmux_pane(session_id)
-        if pane is None:
-            logger.debug(f"No tmux pane mapping for {session_id[:8]}...; spooled only")
+        target = self._mux_target(session_id)
+        if target is None:
+            logger.debug(f"No pane mapping for {session_id[:8]}...; spooled only")
             return "spool-unmapped"
+
+        # The idle gate, and it comes before the cooldown for the same reason
+        # the pane lookup does: a busy session is the normal mid-turn state,
+        # not a failure, so it must not consume the cooldown window that a
+        # later - genuinely idle - delivery needs. Injecting mid-turn is
+        # redundant anyway (a Stop hook surfaces directed events at
+        # end-of-turn) and it is the one window where a permission dialog can
+        # be on screen to swallow the keystrokes.
+        if is_busy(self.config.wake_dir, session_id):
+            logger.debug(f"Turn in flight for {session_id[:8]}...; spooled only")
+            return "spool-busy"
 
         with self._lock:
             now = _now()
@@ -459,12 +519,12 @@ class Injector:
             logger.debug(f"Cooldown active for {session_id[:8]}...; spooled only")
             return "spool-cooldown"
 
-        # tmux runs outside the lock (bounded at TMUX_TIMEOUT, but other
-        # sessions' deliveries shouldn't wait on it). The pane can go stale
-        # between the lookup above and here - send-keys just fails, which is
-        # the arm below.
-        if self._tmux_wake(session_id, pane):
-            return "tmux"
+        # The multiplexer runs outside the lock (bounded at MUX_TIMEOUT, but
+        # other sessions' deliveries shouldn't wait on it). The pane can go
+        # stale between the lookup above and here - the injection just fails,
+        # which is the arm below.
+        if self._mux_wake(session_id, target):
+            return target.mux
         with self._lock:
             # Roll back the reservation so the failure doesn't burn the
             # window - unless a later delivery already re-claimed it. There
@@ -472,7 +532,7 @@ class Injector:
             # prune returned spool-cooldown above.
             if self._last_wake.get(session_id) == now:
                 del self._last_wake[session_id]
-        return "spool-tmux-failed"
+        return "spool-mux-failed"
 
     def _spool(self, session_id: str, event: dict) -> None:
         """Always-on durable path: one JSON line per event, per session.
@@ -626,8 +686,8 @@ class Injector:
             self.config.wake_dir.chmod(0o700)
             _append()
 
-    def _tmux_pane(self, session_id: str) -> str | None:
-        """Look up the session's tmux pane from <wake_dir>/panes.json.
+    def _mux_target(self, session_id: str) -> MuxTarget | None:
+        """Look up the session's injection target from <wake_dir>/panes.json.
 
         The mapping is maintained by an external session-side component, so
         every failure shape - unreadable file, non-UTF-8 bytes from a torn
@@ -635,7 +695,7 @@ class Injector:
         an exception escaping here would 500 the webhook and make the bus
         retry an already-spooled event.
         """
-        panes_file = self.config.wake_dir / "panes.json"
+        panes_file = self.config.wake_dir / PANES_FILENAME
         try:
             # os.open with O_NOFOLLOW + O_NONBLOCK, not read_text():
             #  - O_NOFOLLOW: panes.json shares the wake dir's history (may have
@@ -736,28 +796,34 @@ class Injector:
             # different session's warning and oscillate the bound
             self._warned_panes_keys.discard(entry_key)
             return None
-        pane = panes[session_id]
-        if not (isinstance(pane, str) and pane and pane.isprintable()):
-            # Present but wrong-shaped (0 instead of "%0", "", null, or a
+        try:
+            # parse_target is the SHARED validator - literally the call the
+            # writer (`agent-event-bus-cli panes set`) runs - so what this
+            # reader accepts and what the session hook writes cannot drift
+            # apart. That drift has no loud failure mode here: it is wakes
+            # that quietly never happen.
+            target = parse_target(panes[session_id])
+        except InvalidTargetError as e:
+            # Present but wrong-shaped (0 instead of "%0", "", null, a zellij
+            # entry carrying no session name, or a
             # control character - JSON encodes NUL as \u0000): a
             # misconfiguration whose repair is nothing like "the mapping is
             # absent", so it must not fold into the unmapped debug line.
             # isprintable() is load-bearing, not cosmetic: an argv element
             # with an embedded NUL makes subprocess.run raise ValueError
-            # BEFORE check or timeout - a class _tmux_wake's post-spool arms
+            # BEFORE check or timeout - a class _mux_wake's post-spool arms
             # don't catch - so it must be rejected here, where the warning
             # names the entry to repair, and never reach argv. Real pane ids
-            # ("%0", "%12") are printable ASCII throughout.
+            # ("%0", "%12" for tmux, "0" for zellij) are printable ASCII.
             # Keyed per session: the condition is per entry, unlike the
             # file-level failures above.
             self._warn_panes_once(
                 entry_key,
-                f"panes.json entry for {session_id[:8]}... is not a pane id "
-                f"({pane!r}); treating as unmapped",
+                f"panes.json entry for {session_id[:8]}... is unusable ({e}); treating as unmapped",
             )
             return None
         self._warned_panes_keys.discard(entry_key)  # healthy entry re-arms it
-        return pane
+        return target
 
     _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object", "unexpected"})
     # The subset a successful read+parse clears regardless of the shape it
@@ -796,16 +862,53 @@ class Injector:
             self._warned_panes_keys.add(key)
             logger.warning(message)
 
-    def _tmux_wake(self, session_id: str, pane: str) -> bool:
+    @staticmethod
+    def _wake_argv(target: MuxTarget) -> list[list[str]]:
+        """The command(s) that type the wake prompt into target's pane.
+
+        A LIST of argvs because the two multiplexers differ in whether
+        submitting is separable from typing:
+
+        - tmux takes text and key names in one send-keys, so WAKE_PROMPT is
+          one argument followed by "Enter". Passing it WITHOUT -l is why
+          WAKE_PROMPT must stay a fixed multi-word constant - a value that
+          happened to match a key name (Enter, C-c, Escape) would be sent as
+          that keystroke instead of typed.
+        - zellij has no equivalent: `write-chars` types and never submits, so
+          the carriage return is a second call (`write 13`). Dropping it would
+          leave the prompt sitting in the input box - a wake that wakes
+          nobody while every status here stays green.
+
+        Neither form interpolates the event payload. The prompt is fixed, so
+        publisher-authored text cannot reach a terminal as keystrokes; the
+        payload is available to the woken session through the bus and the
+        spool, as quoted data it can judge.
+        """
+        if target.mux == "zellij":
+            base = ["zellij", "--session", target.session, "action"]
+            return [
+                [*base, "write-chars", "-p", target.pane, WAKE_PROMPT],
+                # 13 = carriage return. `write` takes decimal bytes.
+                [*base, "write", "-p", target.pane, "13"],
+            ]
+        return [["tmux", "send-keys", "-t", target.pane, WAKE_PROMPT, "Enter"]]
+
+    def _mux_wake(self, session_id: str, target: MuxTarget) -> bool:
         """Type the wake prompt into the given pane. False on failure."""
         try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", pane, WAKE_PROMPT, "Enter"],
-                check=True,
-                capture_output=True,
-                timeout=TMUX_TIMEOUT,
-            )
-            logger.info(f"Woke {session_id[:8]}... via tmux pane {pane}")
+            # time.monotonic directly, NOT the _now() seam: that seam exists
+            # for the cooldown's benefit and tests freeze it, which would turn
+            # this bound into an infinite one in exactly the tests most likely
+            # to exercise a hanging multiplexer.
+            deadline = time.monotonic() + MUX_TIMEOUT
+            for argv in self._wake_argv(target):
+                subprocess.run(
+                    argv,
+                    check=True,
+                    capture_output=True,
+                    timeout=max(MUX_CALL_MIN_TIMEOUT, deadline - time.monotonic()),
+                )
+            logger.info(f"Woke {session_id[:8]}... via {target.describe()}")
             # A working wake re-arms THIS session's failure conditions only -
             # clearing globally would oscillate a broken session's warning
             # under interleaved healthy deliveries.
@@ -820,15 +923,25 @@ class Injector:
             return True
         except (subprocess.SubprocessError, OSError) as e:
             # SubprocessError covers CalledProcessError/TimeoutExpired;
-            # OSError covers a missing or non-executable tmux binary. An
+            # OSError covers a missing or non-executable multiplexer binary
+            # (which is now per-entry rather than fatal at startup, since the
+            # preflight only requires that SOME supported mux exists). An
             # exception escaping here would 500 the webhook and make the bus
             # retry an event that is already durably spooled (duplicate
             # lines). Bounded like the panes guard - keyed per (session,
             # exception type): a persistent condition warns once per session
             # and then debugs, a different failure type warns fresh, and a
             # second broken session is never silenced by the first's key.
+            #
+            # Known partial-failure shape, zellij only: if write-chars
+            # succeeds and the following `write 13` does not, the prompt is
+            # left typed-but-unsubmitted in the pane, and the retry after the
+            # cooldown rollback types it a second time. Not repaired here on
+            # purpose - the repair would be a third call (`write 21`, kill
+            # line) issued under precisely the conditions that just proved
+            # calls are failing. Named in docs/BRIDGE.md instead.
             key = f"{session_id}:{type(e).__name__}"
-            message = f"tmux wake failed for {session_id[:8]}... ({e}); spooled only"
+            message = f"Wake injection failed for {session_id[:8]}... ({e}); spooled only"
             # Same lock as the success-arm comprehension: an unsynchronized
             # add would race its iteration. Logging stays outside the hold.
             with self._lock:
@@ -1508,16 +1621,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["spool", "tmux"],
+        # "tmux" is kept as an accepted spelling of "mux": it was this
+        # backend's name when tmux was the only multiplexer it drove, and it
+        # is baked into installed plists. config_from_args normalizes it.
+        choices=["spool", "mux", "tmux"],
         default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BACKEND") or "spool",
-        help="Wake mechanism: spool file only, or tmux send-keys + spool",
+        help="Wake mechanism: spool file only, or terminal injection "
+        "(tmux/zellij) + spool. 'tmux' is a legacy alias for 'mux'",
     )
     parser.add_argument(
         "--cooldown",
         # Raw string default, cast in config_from_args - see _to_number
         default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_COOLDOWN") or str(DEFAULT_COOLDOWN_SECONDS),
-        help="Minimum seconds between tmux wakes per session (tmux backend "
-        "only; the spool backend's loop prevention belongs to the drain hook)",
+        help="Minimum seconds between wake injections per session (mux "
+        "backend only; the spool backend's loop prevention belongs to the "
+        "drain hook)",
     )
     parser.add_argument(
         "--wake-dir",
@@ -1668,13 +1786,15 @@ def validate_config(config: BridgeConfig) -> None:
         canonical_hosts.append(canonical)
     config.allowed_hosts = tuple(canonical_hosts)
 
+    # The legacy "tmux" spelling is already normalized to "mux" by
+    # BridgeConfig.__post_init__, so it cannot reach this check.
     # argparse `choices` only guards command-line values, and an embedder
     # skips argparse entirely - an unknown backend would silently mean
-    # "spool" (deliver only tests != "tmux")
-    if config.backend not in ("spool", "tmux"):
+    # "spool" (deliver only tests != "mux")
+    if config.backend not in ("spool", "mux"):
         raise BridgeConfigError(
             f"Invalid backend {config.backend!r} (check AGENT_EVENT_BUS_BRIDGE_BACKEND): "
-            "expected 'spool' or 'tmux'"
+            "expected 'spool' or 'mux'"
         )
     # Range checks cover CLI and env alike: an out-of-range port would be a
     # uvicorn traceback naming neither, and a negative cooldown would
@@ -1835,18 +1955,30 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         validate_config(config)
     except BridgeConfigError as e:
         raise SystemExit(str(e)) from None
-    # Preflight the binary (CLI path only - embedders manage their own
-    # runtime env): a tmux backend on a box without tmux would degrade
-    # every wake to spool-tmux-failed for the daemon's lifetime - one
+    # Preflight the binaries (CLI path only - embedders manage their own
+    # runtime env): a mux backend on a box with NO multiplexer would degrade
+    # every wake to spool-mux-failed for the daemon's lifetime - one
     # startup message beats discovering it per-DM, and the check is
-    # PATH-sensitive, so it names the fix. A tmux that breaks LATER is
+    # PATH-sensitive, so it names the fix. A mux that breaks LATER is
     # still handled (and bounded) by the wake-failure guard.
-    if config.backend == "tmux" and shutil.which("tmux") is None:
-        raise SystemExit(
-            "Backend is tmux but no tmux binary is on PATH of THIS process "
-            "(a supervisor's minimal PATH can hide a tmux your shell sees; "
-            "check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
-        )
+    #
+    # ANY supported mux satisfies it, not all of them: which one a given
+    # delivery needs is a property of that session's panes.json entry, not of
+    # the daemon, so a tmux-only host must not be refused for lacking zellij.
+    # A mapping naming an absent binary is a per-entry OSError on the
+    # wake-failure arm.
+    if config.backend == "mux":
+        available = [mux for mux in SUPPORTED_MUXES if shutil.which(mux) is not None]
+        if not available:
+            raise SystemExit(
+                f"Backend is mux but none of {', '.join(SUPPORTED_MUXES)} is on PATH "
+                "of THIS process (a supervisor's minimal PATH can hide a binary "
+                "your shell sees; check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
+            )
+        # Which ones are present is the first thing to check when wakes fail
+        # for one mux and not the other, and PATH differences between a
+        # supervisor and a shell are exactly why that happens.
+        logger.info(f"Wake injection available via: {', '.join(available)}")
     # One derivation for the warning block below - the refusals above
     # already validated both URLs, so these cannot raise
     hook = bridge_hook_url(config)

@@ -1448,3 +1448,100 @@ class TestCmdEventsStructuredDisplay:
         assert "[42] help_needed (all) [actionable]" in out
         assert "corr:rev-1" in out
         assert "tags:review,urgent" in out
+
+
+def panes_args(command, tmp_path, **overrides):
+    args = {
+        "panes_command": command,
+        "session_id": "sid-1",
+        "wake_dir": str(tmp_path),
+        "json": True,
+    }
+    if command == "set":
+        args.update({"mux": None, "pane": None, "mux_session": None})
+    else:
+        args["keep_pane_entries"] = False
+    args.update(overrides)
+    return Namespace(**args)
+
+
+class TestCmdPanes:
+    """`panes set` is what makes the bridge able to wake anything. Its
+    failure mode is silence on both sides, so these pin the shapes that would
+    otherwise degrade quietly."""
+
+    def test_set_writes_the_detected_target(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("ZELLIJ_PANE_ID", "0")
+        monkeypatch.setenv("ZELLIJ_SESSION_NAME", "tenacious-lemur")
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+
+        cli.cmd_panes(panes_args("set", tmp_path))
+
+        entry = json.loads(capsys.readouterr().out)["entry"]
+        assert entry == {"mux": "zellij", "pane": "0", "session": "tenacious-lemur"}
+
+    def test_set_outside_a_multiplexer_omits_the_entry(self, tmp_path, monkeypatch, capsys):
+        """The contract says OMIT, not null and not "". An omitted entry takes
+        the bridge's quiet absent path; a placeholder warns and asks an
+        operator to repair a session that simply has no pane. It must also
+        exit 0 - a hook that failed here would be noise on every non-terminal
+        session."""
+        for var in ("TMUX_PANE", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME"):
+            monkeypatch.delenv(var, raising=False)
+
+        cli.cmd_panes(panes_args("set", tmp_path))
+
+        assert "skipped" in json.loads(capsys.readouterr().out)
+        assert not (tmp_path / "panes.json").exists()
+
+    def test_explicit_target_is_validated(self, tmp_path):
+        """An explicit --mux zellij with no session name must fail HERE, where
+        the operator sees it, rather than being written and then silently
+        degraded to unmapped by the bridge."""
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_panes(panes_args("set", tmp_path, mux="zellij", pane="0"))
+        assert exc.value.code == 2
+
+    def test_clear_removes_the_entry(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("TMUX_PANE", "%1")
+        cli.cmd_panes(panes_args("set", tmp_path))
+        capsys.readouterr()
+
+        cli.cmd_panes(panes_args("clear", tmp_path))
+
+        assert json.loads(capsys.readouterr().out)["removed"] == ["sid-1"]
+        assert json.loads((tmp_path / "panes.json").read_text()) == {}
+
+    def test_missing_session_id_exits_2(self, tmp_path, monkeypatch):
+        """Exit 2, not 1: "you didn't tell me which session" is a wiring bug a
+        hook should surface, and needs a different fix from a bus or
+        filesystem failure."""
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_panes(panes_args("set", tmp_path, session_id=None))
+        assert exc.value.code == 2
+
+    def test_session_id_falls_back_to_the_claude_code_variable(self, tmp_path, monkeypatch, capsys):
+        """Same fallback as publish (#137), and it matters more here: the
+        hooks that call this run as non-interactive subprocesses, where a
+        profile-based mapping of the explicit variable is simply absent."""
+        monkeypatch.delenv("AGENT_EVENT_BUS_SESSION_ID", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
+        monkeypatch.setenv("TMUX_PANE", "%1")
+
+        cli.cmd_panes(panes_args("set", tmp_path, session_id=None))
+
+        assert json.loads(capsys.readouterr().out)["session_id"] == "cc-session"
+
+
+class TestCmdWakeState:
+    def test_busy_then_idle(self, tmp_path):
+        from agent_event_bus import wake
+
+        args = Namespace(state="busy", session_id="sid-1", wake_dir=str(tmp_path), json=False)
+        cli.cmd_wake_state(args)
+        assert wake.is_busy(tmp_path, "sid-1") is True
+
+        cli.cmd_wake_state(Namespace(**{**vars(args), "state": "idle"}))
+        assert wake.is_busy(tmp_path, "sid-1") is False

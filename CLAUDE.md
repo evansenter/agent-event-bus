@@ -24,7 +24,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Log files | Bus: `agent-event-bus.log` (the Python `FileHandler`, the one `_LOG` moves), `agent-event-bus.err`, plus `agent-event-bus.stdout` - launchd's stdout capture, hardcoded in the plist and therefore the one file no env var relocates. Bridge: `agent-event-bus-bridge.log`, `agent-event-bus-bridge.err` (both launchd captures; launchd APPENDS across restarts, so no file handler of its own is needed. Bridge records go to `.err` - it logs to stderr - while `.log` gets uvicorn access lines) |
 | LaunchAgent | `com.evansenter.agent-event-bus.plist`; bridge: `com.evansenter.agent-event-bus-bridge.plist` (separate unit - a bus host need not run a bridge) |
 | systemd service | `agent-event-bus.service` |
-| Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
+| Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json`/`panes.lock` + `<sid>.busy` turn-state markers + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
 | Bridge hook-lock dir | `$XDG_RUNTIME_DIR/agent-event-bus-bridge-<uid>/`, else the system temp dir (`$TMPDIR`, or `/tmp` when unset; macOS: per-user `/var/folders/.../T`) - zero-byte, uid-scoped `hook.<hash>.lock` files, machine-scoped so a same-URL double-start refuses regardless of `$HOME`. Create-and-verified private (not adopted). Safe to remove when no bridge is running |
 
 **Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`, `_LOG_PEER`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_WAKE_DIR`; and `_BRIDGE_LOG` / `_BRIDGE_ERR`, which -
@@ -137,6 +137,10 @@ src/agent_event_bus/
 ├── middleware.py  # Request logging → ~/.claude/contrib/agent-event-bus/agent-event-bus.log
 ├── session_ids.py # Dinosaur-themed display_id generation
 ├── cli.py         # CLI wrapper for shell scripts
+├── wake.py        # Wake-dir contract: pane mapping + turn-state markers.
+│                  # Imported by BOTH bridge.py (reader) and cli.py (writer)
+│                  # on purpose - a drift between them produces no error,
+│                  # only wakes that never happen
 ├── bridge.py      # Webhook→injection re-awakening bridge (RFC #122, experimental)
 └── guide.md       # Usage guide (agent-event-bus://guide resource)
 
@@ -194,6 +198,11 @@ CLI and MCP expose the same functionality:
 | `sessions` | `list_sessions` | Noun vs verb_noun |
 | `events` | `get_events` | Noun vs verb_noun |
 | `ack` | `ack_events` | Short vs descriptive |
+| `panes set/clear`, `wake-state` | *(none)* | Local filesystem only - see below |
+
+`panes` and `wake-state` are deliberately CLI-only: they write the bridge's
+wake dir on the local machine, and an MCP tool for them would let any session
+on the bus retarget where another machine's keystrokes get typed.
 
 - CLI: kebab-case args (`--session-id`), short commands
 - MCP: snake_case params, descriptive `verb_noun` pattern

@@ -30,9 +30,15 @@ bus-side validation lands.
 ## Running it
 
 ```
-uv run agent-event-bus-bridge                    # spool backend (default)
-uv run agent-event-bus-bridge --backend tmux     # also types a wake prompt into tmux
+uv run agent-event-bus-bridge                  # spool backend (default)
+uv run agent-event-bus-bridge --backend mux    # also types a wake prompt into the session's pane
 ```
+
+(`--backend tmux` is still accepted, as an alias for `mux` - it was this
+backend's name when tmux was the only multiplexer it drove, and it is baked
+into already-installed plists. It is normalized on every construction path,
+including an embedder's direct `BridgeConfig(backend="tmux")`, because an
+un-normalized value would fall through to the spool path silently.)
 
 (`uv run` from the repo checkout: the console script lives in the project
 venv - unlike `agent-event-bus-cli`, nothing symlinks it onto PATH.)
@@ -46,8 +52,18 @@ make uninstall-bridge   # stops it; leaves the bus, the DB, and wake/ alone
 
 A **separate unit** from the bus (`com.evansenter.agent-event-bus-bridge`)
 because a bus host does not have to run a bridge, and the bridge is
-experimental while the bus is not. The unit pins `--backend spool`; tmux
-additionally needs `wake/panes.json` maintained by something session-side.
+experimental while the bus is not.
+
+The unit pins `--backend mux`. The consent gate for injection is
+`wake/panes.json`, not that setting: with no session-side writer installed
+every delivery resolves to `spool-unmapped`, so the injecting default behaves
+exactly as the spool backend did and costs an operator who has not opted in
+nothing. Making it the default removes a second install-time step that is easy
+to forget and silent when missed - which is precisely the state that left the
+wake path unexercised across #135/#136/#139/#141.
+
+Install the writer with the session hooks described under **Maintaining the
+pane mapping** below.
 
 **Boot ordering is a non-issue.** launchd has no dependency ordering, so the
 bridge can start before the bus is listening. `register_with_retry` backs off
@@ -96,9 +112,9 @@ them check claims the unit's own comments make:
 4. **Clean unload** - `make uninstall-bridge`, then confirm the webhook row
    is gone and port 8082 is free.
 
-What none of this covers: whether a session actually *wakes*. The spool line
-lands, but nothing drains it yet (see the pruning note below), so the far end
-of the pipeline stays unobservable until a drain hook exists.
+What none of this covers: whether a session actually *wakes*. That needs a
+live Claude Code session in a pane this host's `panes.json` maps, and a DM
+addressed to its `session_id` - see **Verifying a wake** below.
 
 ## Backends
 
@@ -176,7 +192,7 @@ of the pipeline stays unobservable until a drain hook exists.
   the bus already got its 200, with no retry.) Spooled payloads are
   publisher-authored text from any session on the bus - surface them as
   quoted data (sender session, event_type, payload) for the session to
-  judge, never as instructions; the tmux backend has this posture by
+  judge, never as instructions; the mux backend has this posture by
   construction (it types a fixed wake prompt, not the payload). Dedupe on
   `event_id` when acting: a delivery that spools but then errors is retried by the bus, and
   a recovered orphan may overlap with what a dead drain already acted on,
@@ -198,42 +214,206 @@ of the pipeline stays unobservable until a drain hook exists.
   prevents comes back with no way to observe it. Lock files are zero
   bytes: retaining them is noise, not cost - the payload-bearing spool
   files are the thing worth pruning.
-- **tmux**: additionally runs `tmux send-keys` into the session's pane, using
-  the mapping in `wake/panes.json` (`{session_id: pane_id}`), which something
-  session-side must maintain; unmapped sessions just spool. The writer's
-  contract matters as much as the drainer's: write atomically (temp file in
-  the same directory + `os.replace`), write UTF-8 (the bridge reads it as
-  UTF-8, not its locale codec - a supervisor-launched daemon often runs
-  under the C locale, where a bytewise-different codec would misread any
-  non-ASCII), write each value as a non-empty printable pane id (`"%0"`)
-  and OMIT the entry entirely when `$TMUX_PANE` is unset rather than
-  writing `null` or `""` - `panes[sid] = os.environ.get("TMUX_PANE")`
+- **mux**: additionally types a wake prompt into the session's terminal pane,
+  using the mapping in `wake/panes.json`; unmapped sessions just spool.
+  Supported multiplexers:
+  - **tmux**: `tmux send-keys -t <pane> <prompt> Enter` - one call, because
+    send-keys takes text and key names together.
+  - **zellij**: `zellij --session <name> action write-chars -p <pane>
+    <prompt>`, then `zellij --session <name> action write -p <pane> 13`. Two
+    calls, because `write-chars` types without submitting and zellij has no
+    combined form. Dropping the second call leaves the prompt sitting in the
+    input box - a wake that wakes nobody while the action, the log line and
+    the bus response all report success.
+
+  Neither form interpolates the event payload; the prompt is a fixed
+  constant, so publisher-authored text cannot reach a terminal as keystrokes.
+  The woken session reads the actual event from the bus (or the spool), as
+  quoted data it can judge.
+
+  Requires **at least one** supported multiplexer on the daemon's PATH at
+  startup - the bridge REFUSES TO START with none, and logs which it found.
+  It does not require *all* of them: which one a delivery needs is a property
+  of that session's `panes.json` entry, not of the daemon, so a tmux-only
+  host is not refused for lacking zellij (a mapping naming an absent binary
+  degrades per-wake instead). The check is PATH-sensitive: a supervisor's
+  minimal PATH (launchd defaults to `/usr/bin:/bin:/usr/sbin:/sbin`) can hide
+  a Homebrew binary your shell sees, so put it on the *daemon's* PATH, not
+  just yours. A multiplexer that breaks *later* degrades per-wake to spool.
+
+  **Known partial-failure shape (zellij only):** if `write-chars` succeeds and
+  the following `write 13` does not, the prompt is left typed-but-unsubmitted,
+  and the retry after the cooldown rollback types it a second time. Not
+  repaired automatically on purpose - the repair would be a third call (`write
+  21`, kill line) issued under exactly the conditions that just proved calls
+  are failing.
+
+  A stale mapping types the wake prompt into whatever now owns the pane
+  (usually a shell after the session exits). `panes clear` removes entries at
+  SessionEnd, and `panes set` additionally evicts any entry on the pane it is
+  claiming - so a session killed without its SessionEnd hook running is
+  cleaned up by the next session to occupy that pane.
+
+## Maintaining the pane mapping
+
+`wake/panes.json` maps bus `session_id` to a terminal pane. Without it the mux
+backend resolves every delivery to `spool-unmapped`, so this file is what makes
+the backend able to wake anything.
+
+Write it with the CLI rather than by hand - `agent-event-bus-cli` implements the
+contract below and is tested against the bridge's reader in one suite, so the
+two cannot drift:
+
+```bash
+# SessionStart: map this session to its pane (silently does nothing outside
+# a multiplexer, which is the correct behaviour, not a failure)
+agent-event-bus-cli panes set --session-id "$SESSION_ID"
+
+# SessionEnd
+agent-event-bus-cli panes clear --session-id "$SESSION_ID"
+
+# UserPromptSubmit / Stop: the idle gate (see below)
+agent-event-bus-cli wake-state busy --session-id "$SESSION_ID"
+agent-event-bus-cli wake-state idle --session-id "$SESSION_ID"
+```
+
+`--session-id` falls back to `AGENT_EVENT_BUS_SESSION_ID` then
+`CLAUDE_CODE_SESSION_ID`. Claude Code's session id *is* the bus session id: the
+SessionStart hook registers with `client_id` = that value, and the bus adopts a
+`client_id` as its `session_id` verbatim.
+
+### The file format
+
+```json
+{
+  "9f3c…": {"mux": "tmux",   "pane": "%3"},
+  "1be4…": {"mux": "zellij", "pane": "0", "session": "tenacious-lemur"}
+}
+```
+
+A bare string value is also accepted and means tmux (`{"mux": "tmux", "pane":
+<value>}`) - the shape this contract carried before zellij support.
+
+The value is an **object** rather than a delimited string for a specific
+reason: zellij session names are auto-generated per session and may contain
+`:`, so `"zellij:<session>:<pane>"` cannot be split unambiguously. zellij needs
+its session name because `--session X action ... -p N` is the only way to
+address a pane from outside; tmux does not, because tmux pane ids are unique
+per server.
+
+### The writer's contract
+
+It matters as much as the drain contract, and unlike the drain contract a
+violation of it never surfaces as an error - only as wakes that quietly never
+happen.
+
+- **Write atomically**: temp file **in the same directory** + `os.replace`.
+  The same directory is load-bearing - `os.replace` is atomic only within a
+  filesystem, so a temp file in `$TMPDIR` (a different volume from `$HOME` on
+  macOS) silently degrades to a copy the bridge can observe half-written.
+- **Write UTF-8**, not the locale codec: the bridge decodes as UTF-8, and a
+  supervisor-launched daemon often runs under the C locale where a
+  bytewise-different codec would misread any non-ASCII. The CLI goes further
+  and escapes non-ASCII to `\uXXXX`, so the bytes on disk are pure ASCII.
+- **Each value must be a non-empty printable target.** A value carrying a
+  control character (an embedded NUL, say) is rejected before it can reach
+  argv, where it would make `subprocess.run` raise *before* `check` or
+  `timeout` - a class the post-spool handlers do not catch.
+- **OMIT the entry entirely** when the process is not in a multiplexer, rather
+  than writing `null` or `""`. `panes[sid] = os.environ.get("TMUX_PANE")`
   emits `null` outside tmux, which the bridge treats as a *present-but-bad*
-  value (it warns and names the entry to fix), a different diagnosis and
-  repair than the quiet *absent* path an omitted entry takes; a value with
-  a control character (e.g. an embedded NUL) is rejected the same way
-  before it can reach the `send-keys` argv - and serialize the
-  read-modify-write
-  under an flock on a sibling `panes.lock` - concurrent SessionStart hooks
-  otherwise silently lose entries (the loser reads as absent, the
-  documented *normal* outcome, so nothing errors on either side), and a
-  non-atomic in-place write produces the torn read the bridge degrades on.
-  A broken writer never surfaces as an error - only as wakes that quietly
-  never happen. Requires a tmux
-  binary on the daemon's PATH at startup - the bridge REFUSES TO START
-  otherwise, and the check is PATH-sensitive: a supervisor's minimal PATH
-  (launchd defaults to `/usr/bin:/bin:/usr/sbin:/sbin`) can hide a Homebrew
-  tmux your shell sees, so put tmux on the daemon's PATH, not just yours.
-  A tmux that breaks *later* degrades per-wake to spool instead. A stale mapping
-  types the wake prompt into whatever now owns the pane (usually a shell
-  after the session exits), so the maintainer of `panes.json` should prune
-  entries when sessions end.
+  value: it warns and names the entry to fix, a different diagnosis and repair
+  from the quiet *absent* path an omitted entry takes.
+- **Serialize the read-modify-write** under an flock on the sibling
+  `panes.lock`. Concurrent SessionStart hooks otherwise silently lose entries -
+  the loser reads as absent later, which is the documented *normal* outcome for
+  a session on another machine, so nothing errors on either side. The lock is a
+  sibling and not `panes.json` itself because flock binds to an inode and the
+  file is replaced by rename: locking the replaced file hands each writer a
+  lock on a different inode, excluding nobody while looking correct.
+- **Note for shell implementations:** macOS ships no `flock(1)`. This is the
+  main reason the writer lives in the CLI instead of in the hook.
+
+## The idle gate
+
+The mux backend injects only into a session that is **between turns**. A
+`wake/<session_id>.busy` marker means a turn is in flight and the event is
+spooled instead (`spool-busy`).
+
+This costs no coverage. While a session is busy, injection is *redundant* - a
+Stop hook that peeks the bus surfaces directed events at end-of-turn anyway -
+and the busy window is exactly when a permission dialog can be on screen for
+injected text plus a newline to answer it.
+
+The marker has **no staleness window**, deliberately. It outlives its session
+only when SessionEnd never ran (hard kill, crash, reboot), and then the session
+is gone, so declining to inject is correct rather than a bug - the alternative
+is typing into whatever now owns the pane. A resumed session clears it at
+SessionStart; a Stop hook that timed out and orphaned one on a live session has
+it cleared by the next turn's Stop. Both self-heal, so a TTL would buy nothing
+and would open a mid-turn injection window on any turn that ran longer than it.
+
+**Failure modes this does not solve**, stated rather than papered over:
+
+- A human **mid-typing at an idle prompt** gets their draft submitted with the
+  wake text appended. Unsolvable without TUI introspection. Scraping the pane
+  (`capture-pane` / `dump-screen`) to detect an empty input box was considered
+  and rejected as version-fragile.
+- The **Stop-block continuation window** reads idle while the session is
+  actually working, because a blocking Stop hook restarts the turn without a
+  UserPromptSubmit. Benign - the TUI queues typed text mid-turn.
+- **A host with no multiplexer cannot wake an idle session at all.** No
+  hook-shaped mechanism can: a Stop hook does not fire on a session that is
+  already idle. This is why there is no spool-drain hook - it would fire at the
+  same boundary as the existing bus peek, on a subset of what the bus already
+  holds.
+
+## Verifying a wake
+
+Unverifiable from a dev container (no launchd, no multiplexer, no session on
+the bus), so this is a checklist for the bus host rather than a claim:
+
+1. Confirm the daemon found a multiplexer: the startup line
+   `Wake injection available via: ...` in the bridge's `.err`. If it names
+   fewer than you expect, that is the supervisor's PATH, not your shell's.
+2. Start a session and confirm it mapped:
+   `jq . ~/.claude/contrib/agent-event-bus/wake/panes.json` should hold its
+   `session_id` with a plausible pane.
+3. Confirm the pane id is real *before* blaming the bridge - `tmux display -t
+   <pane> -p '#{pane_id}'`, or for zellij
+   `zellij --session <name> action dump-screen -p <pane>`.
+4. Leave that session idle and DM it by **`session_id`** (not `display_id` -
+   `session:<display-id>` spools into a file nothing reads):
+   `agent-event-bus-cli publish --type help_needed --payload "wake test"
+   --channel "session:<session_id>"`.
+5. The session should surface a fixed wake prompt within a second. If it does
+   not, `DEV_MODE=1` on the bridge names the arm: `spool-unmapped` (mapping),
+   `spool-busy` (the session was mid-turn - the gate working), `spool-cooldown`
+   (within 30s of a previous wake), `spool-mux-failed` (the multiplexer).
+
+**Injection fidelity depends on what is receiving, not on the bridge.**
+Measured on this host with zellij: injecting the wake prompt into a pane
+running an interactive **zsh** dropped exactly one space per injection, at a
+varying position (`Check theevent bus`), reproducibly. Injecting the same
+string into `cat` in the same pane arrived byte-exact every time. So
+`write-chars` transmits faithfully and the lost keystroke is the shell's line
+editor - autosuggestion-class ZLE widgets dropping input at paste speed.
+
+Two consequences. First, a garbled wake in a *shell* pane is the
+stale-mapping symptom, not a bridge fault - it means the session that owned
+that pane exited without clearing its entry. Second, whether a given TUI has
+its own version of this is a property of that TUI: it is **unverified** for
+Claude Code's input handling, which is not zsh ZLE. Worth checking on the
+first real wake, though the failure is cosmetic - a prompt missing a space
+still reads.
 
 ## Loop prevention and single-instance
 
-- Per-session cooldown (default 30s, `--cooldown`) bounds *successful tmux
-  injections*; events during cooldown are spooled, never dropped, and a
-  failed tmux attempt doesn't burn the window. In the default spool backend
+- Per-session cooldown (default 30s, `--cooldown`) bounds *successful
+  injections*; events during cooldown are spooled, never dropped, and neither
+  a failed injection nor a `spool-busy` burns the window (a busy session is
+  the normal mid-turn state - if it consumed the window, the first delivery
+  after the turn ended would be suppressed as a repeat). In the spool backend
   the cooldown never engages - a spool line only becomes a wake when the
   drain hook acts on it, so loop prevention there is the consuming hook's
   job: bound how often you act on a drained spool, and dedupe on `event_id`.
@@ -324,13 +504,15 @@ of the pipeline stays unobservable until a drain hook exists.
 ## Delivery outcomes
 
 - Each delivered `200` carries an `action` field naming what happened:
-  `spool` (spool backend, working as designed), `tmux` (wake injected),
-  `spool-cooldown` (within the per-session window), `spool-unmapped` (tmux
-  backend, no usable pane mapping - *normally* because the session lives
-  on another machine, but also when `panes.json` is missing, unreadable,
-  malformed, or its entry is not a pane id; the misconfiguration shapes
-  warn, so check the log), or `spool-tmux-failed` (the `send-keys` attempt itself
-  failed). Only the last one means tmux is broken on this host. The bus
+  `spool` (spool backend, working as designed), `tmux` / `zellij` (wake
+  injected via that multiplexer), `spool-cooldown` (within the per-session
+  window), `spool-busy` (mux backend, a turn is in flight - see the idle
+  gate), `spool-unmapped` (mux backend, no usable pane mapping - *normally*
+  because the session lives on another machine, but also when `panes.json` is
+  missing, unreadable, malformed, or its entry is not a usable target; the
+  misconfiguration shapes warn, so check the log), or `spool-mux-failed` (the
+  injection attempt itself
+  failed). Only the last one means the multiplexer is broken on this host. The bus
   discards the response body (it logs just the status code, at debug), so
   `action` is visible only to a direct caller of `/hook` - the bridge's own
   log is the operator-facing surface: failed wakes at warning, the quiet
@@ -371,7 +553,7 @@ is intentionally unauthenticated (readiness probes shouldn't need the
 secret); it exposes only `status`/`service`/`registered`, but on a
 non-loopback bind anyone who can reach the port can read it. Keep `--port` and the port in `--hook-url` in agreement
 unless a proxy genuinely forwards between them (a mismatch is logged). Note webhooks have no machine scoping - every bridge receives
-every `session:` DM; tmux wakes only work for sessions on the bridge's own
+every `session:` DM; injected wakes only work for sessions on the bridge's own
 machine, and spool files for foreign sessions accumulate until the pruning
 follow-up lands. That accumulation is unbounded in the adversarial case:
 `deliver` spools before any existence check and the id is only

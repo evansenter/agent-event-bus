@@ -28,10 +28,21 @@
              profile that exports a different backend cannot reach this
              process - but being explicit means the unit describes what runs
              instead of leaving it to whatever the default happens to be.
-             tmux would additionally need wake/panes.json maintained by
-             something session-side; spool has no such dependency. -->
+
+             `mux` rather than `spool` because the CONSENT GATE is
+             wake/panes.json, not this line: with no session-side writer
+             installed, every delivery resolves to spool-unmapped and this
+             unit behaves exactly as the spool backend did. So the injecting
+             default costs an operator who has not opted in nothing, while
+             removing a second install-time step that is easy to forget and
+             silent when missed - which is the state that left RFC #122's
+             wake path unexercised across four merged PRs.
+
+             Injection is additionally gated on the session being between
+             turns (a <session_id>.busy marker), so a wake never lands
+             mid-turn where a permission dialog could consume it. -->
         <key>AGENT_EVENT_BUS_BRIDGE_BACKEND</key>
-        <string>spool</string>
+        <string>mux</string>
         <!-- AGENT_EVENT_BUS_URL is deliberately NOT set: unset means the
              bridge's own default (http://127.0.0.1:8080/mcp), which is
              correct on the machine hosting the bus. Set it here only if the
