@@ -179,19 +179,18 @@ That lands with the supervision story.)
   deliveries. Paused rows are swept too - a row at this URL is stale whether
   or not someone disabled it. The sweep matches the URL being registered
   NOW - after changing `--port` or `--hook-url`, drop the row at the old URL
-  yourself (`agent-event-bus-cli webhook list --all` / `webhook unregister`)
-  or the bus keeps dispatching to the dead address forever. Use `--all`:
-  plain `webhook list` hides paused rows, so a disabled one at the old URL
-  would look like nothing to clean up. Because that sweep
-  can't tell a stale row from a *live peer's*, the CLI takes two flock'd
-  singletons at startup (both released on exit): one keyed on the **hook
-  URL** (in a machine- and uid-scoped lock dir under `$XDG_RUNTIME_DIR`, else
-  the system temp dir - `$TMPDIR`, or `/tmp` when unset; the dir is
-  create-and-verified private, not adopted - HOME-independent so a second
-  instance registering the same URL refuses *regardless of wake dir or
-  `$HOME`* - the URL is what the sweep contends on), and one on the **wake
-  dir** (`bridge.singleton.lock` there -
-  two bridges would otherwise interleave the same spool files). To run two
+  yourself (`agent-event-bus-cli webhook list --all` / `webhook unregister`;
+  `--all` because plain `list` hides paused rows) or the bus keeps
+  dispatching to the dead address forever.
+- Because that sweep can't tell a stale row from a *live peer's*, the CLI
+  takes two flock'd singletons at startup (both released on exit): one keyed
+  on the **hook URL** (in a machine- and uid-scoped lock dir under
+  `$XDG_RUNTIME_DIR`, else the system temp dir - `$TMPDIR`, or `/tmp` when
+  unset; the dir is create-and-verified private, not adopted -
+  HOME-independent so a second instance registering the same URL refuses
+  *regardless of wake dir or `$HOME`* - the URL is what the sweep contends
+  on), and one on the **wake dir** (`bridge.singleton.lock` there - two
+  bridges would otherwise interleave the same spool files). To run two
   bridges at once they need BOTH a distinct hook URL (a different `--port`
   *and* `--hook-url`) and a distinct `--wake-dir`; changing only
   `--wake-dir` leaves the hook URL colliding, and changing only the port

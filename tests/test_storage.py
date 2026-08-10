@@ -1125,8 +1125,21 @@ class TestPrehistoricSchemaRefusal:
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute("SELECT id FROM sessions").fetchall()
+        tables = {
+            r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = ?", ("table",))
+        }
         conn.close()
+
         assert rows == [("old-1",)], "the refusal must not have touched user rows"
+        # Pins the ORDER of the check inside _init_db, which its docstring
+        # promises ("runs before _init_db creates anything") and which the row
+        # assertion above cannot see - rows survived under the old ordering
+        # too. Move the call back below the schema_version CREATE and this is
+        # the assertion that fails.
+        assert tables == {"sessions"}, (
+            f"the refusal created scaffolding of its own: {sorted(tables)}. Only "
+            f"journal_mode=WAL may change on a refused database - format, not content."
+        )
 
     def test_current_schema_is_unaffected(self, tmp_path):
         """The guard keys on pid-without-client_id; a normal database opens."""
