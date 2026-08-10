@@ -188,7 +188,12 @@ AGENT_EVENT_BUS_ICON=/path/to/icon.png agent-event-bus
 # Disable Tailscale auth (for testing/local dev)
 AGENT_EVENT_BUS_AUTH_DISABLED=1 agent-event-bus
 
-# CLI session attribution (used by hooks)
+# CLI session attribution (used by hooks). When --session-id is omitted, the
+# CLI reads AGENT_EVENT_BUS_SESSION_ID, then falls back to
+# CLAUDE_CODE_SESSION_ID (which Claude Code injects into every subprocess it
+# spawns). The fallback matters because shell-profile mappings of one to the
+# other typically live in an rc file that only INTERACTIVE shells read, so a
+# tool-spawned subprocess never runs them and publishes land as "anonymous".
 AGENT_EVENT_BUS_SESSION_ID=abc123 agent-event-bus-cli publish ...
 ```
 

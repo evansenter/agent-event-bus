@@ -9,6 +9,19 @@ import pytest
 from agent_event_bus import cli
 from conftest import make_events_args, make_publish_args
 
+# Both names the CLI consults when --session-id is omitted. CLAUDE_CODE_SESSION_ID
+# is injected by Claude Code into every subprocess it spawns - including the one
+# running this suite - so without the scrub below an ambient value would silently
+# satisfy assertions that expect NO attribution, and the suite would pass on a
+# developer's machine while failing in CI (or the reverse).
+SESSION_ID_ENV = ("AGENT_EVENT_BUS_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+
+
+@pytest.fixture(autouse=True)
+def clean_session_id_env(monkeypatch):
+    for name in SESSION_ID_ENV:
+        monkeypatch.delenv(name, raising=False)
+
 
 class TestCallTool:
     """Tests for call_tool function."""
@@ -294,6 +307,37 @@ class TestCmdPublish:
 
         call_args = mock_call.call_args[0][1]
         assert call_args["session_id"] == "explicit-123"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_falls_back_to_claude_code_session_id(self, mock_call, monkeypatch):
+        """publish shares the events precedence chain - it is the surface that
+        was actually landing as "anonymous" from tool-spawned subprocesses."""
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+        mock_call.return_value = {"event_id": 1}
+
+        cli.cmd_publish(make_publish_args())
+
+        assert mock_call.call_args[0][1]["session_id"] == "cc-session-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_explicit_env_beats_claude_code_fallback(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-123")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+        mock_call.return_value = {"event_id": 1}
+
+        cli.cmd_publish(make_publish_args())
+
+        assert mock_call.call_args[0][1]["session_id"] == "env-session-123"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_omits_session_id_when_neither_is_set(self, mock_call):
+        """The autouse scrub removes both, so this pins that an unattributed
+        publish stays unattributed rather than picking up an ambient id."""
+        mock_call.return_value = {"event_id": 1}
+
+        cli.cmd_publish(make_publish_args())
+
+        assert "session_id" not in mock_call.call_args[0][1]
 
 
 class TestCmdEvents:
@@ -1058,6 +1102,54 @@ class TestCmdEventsEnvAttribution:
 
         call_args = mock_call.call_args[0][1]
         assert "session_id" not in call_args
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_claude_code_session_id_is_the_fallback(self, mock_call, monkeypatch):
+        """THE reason this fallback exists. The dotfiles that map
+        CLAUDE_CODE_SESSION_ID -> AGENT_EVENT_BUS_SESSION_ID live in ~/.exports,
+        sourced from ~/.zshrc - and zsh reads .zshrc for INTERACTIVE shells
+        only, so a tool-spawned (non-interactive) subprocess never runs the
+        mapping and publishes landed as "anonymous". Claude Code injects
+        CLAUDE_CODE_SESSION_ID into that subprocess regardless, so reading it
+        here fixes the attribution for every shell and machine at once."""
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+
+        cli.cmd_events(make_events_args())
+
+        assert mock_call.call_args[0][1]["session_id"] == "cc-session-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_explicit_env_var_beats_the_claude_code_fallback(self, mock_call, monkeypatch):
+        """AGENT_EVENT_BUS_SESSION_ID is the tool-agnostic knob, so it wins -
+        an operator who sets it deliberately is not overridden by the ambient
+        one Claude Code happens to inject."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+
+        cli.cmd_events(make_events_args())
+
+        assert mock_call.call_args[0][1]["session_id"] == "env-session-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_flag_beats_both_env_vars(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session-id")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+
+        cli.cmd_events(make_events_args(session_id="explicit-id"))
+
+        assert mock_call.call_args[0][1]["session_id"] == "explicit-id"
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_resume_satisfied_by_claude_code_session_id(self, mock_call, monkeypatch):
+        """--resume needs a session id from somewhere; the fallback supplies
+        one, so a drain hook running in a non-interactive shell no longer
+        exits 1 with 'requires --session-id'."""
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session-id")
+        mock_call.return_value = {"events": [], "next_cursor": None}
+
+        cli.cmd_events(make_events_args(resume=True))
+
+        assert mock_call.call_args[0][1]["session_id"] == "cc-session-id"
 
     @patch("agent_event_bus.cli.call_tool")
     def test_resume_satisfied_by_env_session_id(self, mock_call, monkeypatch):
