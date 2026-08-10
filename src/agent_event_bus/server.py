@@ -880,6 +880,17 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
     # nothing is behind, and a low ack only makes the bus RE-SERVE the events
     # above it. That is a replay, the safe direction; the guard exists to stop
     # loss, not to stop repetition (which allow_rewind exists to ask for).
+    #
+    # Advisory under concurrency, deliberately: `previous` is read outside the
+    # UPDATE, so two overlapping acks can both clear this on the same stale
+    # read and the lower one can land last. Left as is because the outcome is
+    # a re-serve rather than a drop - the ceiling above, which is the guard
+    # that prevents loss, cannot go the other way, since a concurrent publish
+    # only RAISES the tip and a stale tip read is therefore stricter, never
+    # looser. Making this atomic means folding it into update_session_cursor's
+    # WHERE, which would collapse "refused a rewind" and "lost the deletion
+    # race" into one False; worth doing only if a consumer ever acks the same
+    # session from two places at once.
     if previous is not None and not allow_rewind:
         try:
             moving_backwards = target < int(previous)

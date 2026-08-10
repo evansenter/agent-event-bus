@@ -150,6 +150,27 @@ class TestAckLogsTheCursorMove:
         assert out.startswith("ERROR:")
 
 
+class TestToolColorRoster:
+    """The color map is keyed by tool name, so a rename silently drops a tool
+    into the default green - a log-legibility regression no test would catch.
+    The MCP registry itself is pinned this way in test_hardening.py; this
+    closes the same gap one layer down."""
+
+    def test_every_colored_tool_is_a_registered_tool(self):
+        from agent_event_bus import server
+        from agent_event_bus.middleware import _TOOL_COLORS
+
+        # Matched by TYPE, anchored on a known tool: conftest's autouse
+        # fixture patches a MagicMock into this module, and a MagicMock
+        # answers hasattr for every name.
+        tool_type = type(server.register_session)
+        registered = {t.name for t in vars(server).values() if isinstance(t, tool_type)}
+        assert registered, "found no registered tools - has FastMCP's tool wrapper changed shape?"
+
+        unknown = set(_TOOL_COLORS) - registered
+        assert not unknown, f"_TOOL_COLORS names tools that do not exist: {sorted(unknown)}"
+
+
 class TestFormatResult:
     """Tests for _format_result function."""
 
