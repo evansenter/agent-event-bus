@@ -7,7 +7,7 @@ set -e
 PLIST_DEST="$HOME/Library/LaunchAgents/com.evansenter.agent-event-bus-bridge.plist"
 LABEL="com.evansenter.agent-event-bus-bridge"
 
-if launchctl list | grep -q "$LABEL"; then
+if launchctl list | grep -q "$LABEL$"; then
     echo "Stopping bridge..."
     # SIGTERM via unload, so the shutdown path runs: the lifespan's shielded
     # stop-join-unregister removes the webhook row rather than leaving the bus

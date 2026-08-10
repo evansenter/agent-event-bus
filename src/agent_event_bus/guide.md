@@ -657,11 +657,10 @@ case; the real fix is the `list_sessions`-based scoping tracked for v2,
 which drops unknown ids before they reach the filesystem. Machine-scoped
 delivery is a v2 item.
 
-Supervision is deliberately out of scope for the v1 prototype: there is no
-`make install-bridge`, launchd plist, or systemd unit yet - run the bridge in
-a terminal (or your own supervisor) while experimenting. Startup ordering is
-already safe for a future supervisor (registration retries until the bus is
-up); unit files land once the prototype proves out (RFC #122).
+Supervision exists on macOS only: `make install-bridge` installs a LaunchAgent
+(see "Running it supervised" above). There is no systemd unit yet - on Linux,
+run the bridge under your own supervisor. Startup ordering is safe either way,
+since registration retries until the bus is up.
 
 ## Best Practices
 

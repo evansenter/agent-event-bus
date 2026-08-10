@@ -121,6 +121,11 @@ uninstall-bridge:
 uninstall:
 	@echo "Uninstalling..."
 	@if [ "$$(uname)" = "Darwin" ]; then \
+		if [ -f "$$HOME/Library/LaunchAgents/com.evansenter.agent-event-bus-bridge.plist" ]; then \
+			echo "Removing bridge LaunchAgent first (KeepAlive would respawn it against a bus that is gone)..."; \
+			./scripts/uninstall-bridge-launchagent.sh; \
+			echo ""; \
+		fi; \
 		./scripts/uninstall-launchagent.sh; \
 	else \
 		./scripts/uninstall-systemd.sh; \
@@ -146,7 +151,7 @@ restart:
 			launchctl unload "$$PLIST" 2>/dev/null || true; \
 			launchctl load "$$PLIST"; \
 			sleep 1; \
-			if launchctl list | grep -q "com.evansenter.agent-event-bus"; then \
+			if launchctl list | grep -q "com.evansenter.agent-event-bus$$"; then \
 				echo "Service restarted successfully"; \
 			else \
 				echo "Error: Service failed to start. Check $(ERR_FILE)"; \
