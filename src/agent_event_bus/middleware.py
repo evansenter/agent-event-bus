@@ -198,7 +198,13 @@ def _format_result(result) -> str:
         s = str(result)
         return s[:60] + "..." if len(s) > 60 else s
 
-    # Handle common result patterns with colors
+    # Handle common result patterns with colors.
+    # Errors are checked first: they carry the same keys as success results
+    # (an error about a session still has "session_id"), so a later branch
+    # would render them as if nothing were wrong - which is how #140's
+    # deleted-session polling stayed invisible in the log for months.
+    if "error" in result:
+        return f"{_RED}ERROR:{_RESET} {result['error']}"
     if "session_id" in result:
         # For session results, prefer display_id if available, otherwise look it up
         sid = result["session_id"]
@@ -284,8 +290,6 @@ def _format_result(result) -> str:
         return f"{_CYAN}{len(result['channels'])} channels{_RESET}"
     if "success" in result:
         return f"{_GREEN}OK{_RESET}" if result["success"] else f"{_RED}FAILED{_RESET}"
-    if "error" in result:
-        return f"{_RED}ERROR:{_RESET} {result['error']}"
 
     # Fallback: show keys
     keys = ", ".join(result.keys()) if result else "{}"

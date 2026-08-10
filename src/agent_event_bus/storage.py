@@ -505,16 +505,20 @@ class SQLiteStorage:
             deleted_at=row["deleted_at"] if "deleted_at" in row.keys() else None,
         )
 
-    def get_session(self, session_id: str) -> Session | None:
-        """Get an active session by ID.
+    def get_session(self, session_id: str, include_deleted: bool = False) -> Session | None:
+        """Get a session by ID.
 
-        Only returns active (non-deleted) sessions.
+        Args:
+            include_deleted: If True, also return soft-deleted sessions (check
+                `session.deleted_at` to tell them apart). Callers that need to
+                distinguish "never registered" from "registered then deleted"
+                need this - the default hides both behind None (#140).
         """
+        query = "SELECT * FROM sessions WHERE id = ?"
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM sessions WHERE id = ? AND deleted_at IS NULL",
-                (session_id,),
-            ).fetchone()
+            row = conn.execute(query, (session_id,)).fetchone()
             if row:
                 return self._row_to_session(row)
             return None

@@ -159,6 +159,7 @@ CLI and MCP expose the same functionality:
 - **Cursor auto-tracking**: `get_events(session_id=X)` persists cursor; `resume=True` uses it
 - **Non-consuming narrowed reads**: `channel`/`event_types`/`correlation_id` filters never advance the session cursor (their SQL-filtered max would mark non-matching events as seen); `min_level` filters post-bookkeeping and does
 - **High-water cursors**: `next_cursor` is the batch MAX id in both orders; feeding it back never re-serves events
+- **Deleted sessions fail loudly (#140)**: `get_events` with a soft-deleted `session_id` returns `{"error": "Session deleted", "session_deleted": true, ...}` on *every* read path, not just `resume`. A deleted session's cursor and heartbeat are both frozen, so an empty batch is indistinguishable from "up to date" while the session is also absent from `list_sessions` - the failure was silent on every axis. Ids never registered here stay silent (foreign session ids are a supported way to read the bus)
 - **UUID session IDs**: `session_id` is UUID; `display_id` is human-readable ("brave-trex")
 - **Client deduplication**: `(machine, client_id)` enables session resumption
 - **Structured payload (RFC #121)**: `payload` stays free-form; optional `title`/`tags`/`correlation_id`/`signal_level` ride alongside (soft validation - warn, never reject)

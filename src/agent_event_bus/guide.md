@@ -44,6 +44,8 @@ get_events(session_id="my-unique-id", resume=True, order="asc")
 ```
 - `resume=True` picks up where you left off (cursor auto-tracked)
 - `order="asc"` returns events chronologically
+- An empty `events` list means "you are up to date" — a *deleted* session gets
+  an error instead, never an empty batch (see [Deleted sessions](#deleted-sessions))
 
 ### 3. Publish to coordinate
 ```
@@ -163,6 +165,48 @@ get_events(session_id=session_id, resume=True, peek=True)
 get_events(session_id=session_id, resume=True, order="asc")
 ```
 CLI: `agent-event-bus-cli events --session-id ID --resume --peek`
+
+### Deleted sessions
+
+Polling as a session that has been unregistered — or soft-deleted by the
+24-hour heartbeat timeout — is an **error**, not an empty result:
+
+```
+get_events(session_id="stale-id", resume=True)
+→ {
+    error: "Session deleted",
+    session_deleted: true,
+    session_id: "stale-id",
+    display_id: "grand-bison",
+    deleted_at: "2026-03-21T11:04:00",
+    hint: "..."
+  }
+```
+
+Every read path is checked (`resume`, an explicit `cursor`, `peek`, and
+narrowed reads), because a deleted session's cursor and heartbeat are both
+frozen: it can never advance, never appears in `list_sessions`, and would
+otherwise poll forever getting batches indistinguishable from "up to date".
+
+**Handling it**: call `register_session` with the same `client_id` to revive
+the session (it keeps its `display_id` and `last_cursor`), or stop polling.
+Do not retry the same `session_id` — the result will not change on its own.
+The CLI exits non-zero and prints the hint to stderr.
+
+Session ids that were *never* registered here stay silent — foreign ids (like
+Claude Code's own UUIDs) are a supported way to read the bus. Only ids the bus
+knows it deleted are an error. The one exception predates this: `resume=True`
+with an unknown id returns `{"error": "Session not found"}`, since there is no
+cursor to resume from.
+
+**Finding orphaned pollers** on a bus host:
+
+```sql
+SELECT display_id, last_cursor, deleted_at FROM sessions WHERE deleted_at IS NOT NULL;
+```
+
+Then grep the server log for those `display_id`s — recent hits render as
+`ERROR: Session deleted`.
 
 ## Structured Payload Fields
 

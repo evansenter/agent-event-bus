@@ -564,6 +564,27 @@ class TestCmdEventsErrorSurfacing:
         captured = capsys.readouterr()
         assert "Session not found" in captured.err
 
+    @patch("agent_event_bus.cli.call_tool")
+    def test_events_deleted_session_prints_hint(self, mock_call, capsys):
+        """#140: the hint is the actionable half - re-register or stop polling."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "session_id": "stale-id",
+            "display_id": "grand-bison",
+            "hint": "Call register_session to get a live session, or stop polling.",
+        }
+
+        args = make_events_args(session_id="stale-id", resume=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_events(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Session deleted" in captured.err
+        assert "register_session" in captured.err
+
 
 class TestCmdUnregisterErrorSurfacing:
     """Tests for CLI surfacing server-side errors in unregister command."""

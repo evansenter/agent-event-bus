@@ -217,6 +217,21 @@ class TestFormatResult:
         assert "ERROR:" in result
         assert "Something went wrong" in result
 
+    def test_error_wins_over_session_id(self):
+        """An error about a session still carries session_id; rendering it as
+        a plain session result is how #140 hid in the log for four months."""
+        result = _format_result(
+            {
+                "error": "Session deleted",
+                "session_deleted": True,
+                "session_id": "tender-hawk",
+                "display_id": "tender-hawk",
+            }
+        )
+        assert "ERROR:" in result
+        assert "Session deleted" in result
+        assert "session=" not in result
+
     def test_structured_content_unwrapping(self):
         """FastMCP structuredContent wrapper is unwrapped."""
         wrapped = {

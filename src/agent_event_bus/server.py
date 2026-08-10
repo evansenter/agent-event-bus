@@ -538,6 +538,59 @@ def _get_implicit_channels(session_id: str | None) -> list[str] | None:
     return None
 
 
+# (session_id, deleted_at) pairs already warned about, so an orphaned poller
+# hammering the bus every 5s contributes one WARNING rather than 100k of them.
+# Keyed on deleted_at too: a session that is revived and later deleted again is
+# a fresh incident and warns again. Bounded by the sessions table.
+_warned_deleted_sessions: set[tuple[str, str]] = set()
+
+
+def _deleted_session_error(session_id: str | None) -> dict | None:
+    """Return an error dict if `session_id` names a soft-deleted session (#140).
+
+    A deleted session's cursor and heartbeat are both frozen (every write is
+    guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
+    same position forever and gets an empty batch that is indistinguishable
+    from "you are up to date" - while staying invisible in `list_sessions`.
+    Failing the read loudly is the only thing either side can notice.
+
+    Unregistered ids stay silent: callers legitimately pass foreign session
+    ids (Claude Code's own UUIDs) that were never registered here. Only an id
+    we know we deleted is an error.
+    """
+    if not session_id or session_id == "anonymous":
+        return None
+    session = storage.get_session(session_id, include_deleted=True)
+    if session is None or session.deleted_at is None:
+        return None
+
+    deleted_at = session.deleted_at
+    deleted_at_str = deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at)
+
+    warn_key = (session_id, deleted_at_str)
+    if warn_key not in _warned_deleted_sessions:
+        _warned_deleted_sessions.add(warn_key)
+        logger.warning(
+            f"get_events: rejecting polls from deleted session {session.display_id} "
+            f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
+            f"client is still polling. Further rejections are logged per-call by "
+            f"the request middleware."
+        )
+        _dev_notify("get_events", f"deleted session polled: {session.display_id}")
+
+    return {
+        "error": "Session deleted",
+        "session_deleted": True,
+        "session_id": session_id,
+        "display_id": session.display_id,
+        "deleted_at": deleted_at_str,
+        "hint": (
+            "This session was unregistered or timed out, and its cursor is frozen. "
+            "Call register_session to get a live session, or stop polling."
+        ),
+    }
+
+
 def _event_to_dict(e: Event) -> dict:
     """Convert an Event to its wire representation."""
     d = {
@@ -571,6 +624,13 @@ def _get_events_impl(
     min_level: Literal["lifecycle", "info", "actionable"] | None = None,
 ) -> dict:
     """Sync implementation of get_events (runs in a worker thread)."""
+    # Fail loudly for soft-deleted sessions (#140) - checked on every read
+    # path, not just resume: a client feeding next_cursor back by hand never
+    # touches the resume branch and would otherwise poll forever unnoticed.
+    deleted = _deleted_session_error(session_id)
+    if deleted:
+        return deleted
+
     # Auto-refresh heartbeat when session polls
     _auto_heartbeat(session_id)
 
@@ -599,7 +659,7 @@ def _get_events_impl(
                 "has_more": False,
             }
         else:
-            # Session doesn't exist
+            # Session was never registered (deleted ones are rejected above)
             logger.debug(
                 f"get_events: resume failed, session not found session_id={session_id[:8]}..."
             )
@@ -683,7 +743,9 @@ async def get_events(
     """Get events. Auto-refreshes heartbeat. Returns events list and next_cursor for pagination.
 
     Narrowed reads (channel/event_types/correlation_id) never advance the
-    session cursor; min_level does.
+    session cursor; min_level does. A deleted session_id returns
+    {"error": ..., "session_deleted": true} instead of an empty batch -
+    re-register or stop polling.
 
     Args:
         cursor: Position from register_session or previous call
