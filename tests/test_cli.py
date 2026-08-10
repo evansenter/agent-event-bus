@@ -326,6 +326,36 @@ class TestCmdPublish:
 
         assert "session_id" not in mock_call.call_args[0][1]
 
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_from_deleted_session_warns_without_failing(self, mock_call, capsys):
+        """#144: the event landed, so stdout and the exit code are unchanged -
+        a hook that publishes and moves on keeps working. The hint goes to
+        stderr, which is where a hook's log shows it; stdout is usually piped
+        to /dev/null."""
+        mock_call.return_value = {
+            "event_id": 7,
+            "session_deleted": True,
+            "session_id": "stale-id",
+            "display_id": "grand-bison",
+            "hint": "Call register_session to publish as a live session.",
+        }
+
+        cli.cmd_publish(make_publish_args(session_id="stale-id"))
+
+        captured = capsys.readouterr()
+        assert "grand-bison" in captured.err
+        assert "register_session" in captured.err
+        # The event id still reaches stdout unchanged
+        assert json.loads(captured.out)["event_id"] == 7
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_from_a_live_session_says_nothing(self, mock_call, capsys):
+        mock_call.return_value = {"event_id": 8}
+
+        cli.cmd_publish(make_publish_args(session_id="live-id"))
+
+        assert capsys.readouterr().err == ""
+
 
 class TestCmdEvents:
     """Tests for events command."""

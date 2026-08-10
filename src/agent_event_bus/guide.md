@@ -332,27 +332,68 @@ registered without one cannot be revived, and re-registering mints a fresh
 `session_id`: the result will not change on its own. The CLI exits non-zero
 and prints the hint to stderr.
 
-Session ids that were *never* registered here stay silent — foreign ids (like
-Claude Code's own UUIDs) are a supported way to read the bus. Only ids the bus
-knows it deleted are an error. The one exception predates this: `resume=True`
-with an unknown id returns `{"error": "Session not found"}`, since there is no
-cursor to resume from.
+`ack_events` refuses the same way, so a drain hook gets one answer from both
+halves of its loop. `unregister_session` reports it too — there is nothing
+left to clean up — but it is not an orphan warning: winding down is the one
+call from a dead session that is supposed to happen.
 
-**Finding orphaned pollers** on a bus host:
+**Publishing is different: it is flagged, not refused.** The event is stored,
+under its real `session_id`, and the response carries the same fields
+alongside the normal ones — with no `error` key, because nothing failed:
 
-```sql
-SELECT display_id, last_cursor, deleted_at FROM sessions WHERE deleted_at IS NOT NULL;
+```
+publish_event("task_completed", "done", session_id="stale-id")
+→ {
+    event_id: 812,
+    event_type: "task_completed",
+    channel: "all",
+    signal_level: "info",
+    session_deleted: true,
+    display_id: "grand-bison",
+    deleted_at: "2026-03-21T11:04:00",
+    hint: "..."
+  }
 ```
 
+A refused read costs you one wasted poll; a refused publish would *lose the
+event*, and the publishers that most often outlive their session are
+fire-and-forget hooks with no retry. So the event lands and the flag tells
+you to re-register. Branch on `session_deleted`, not on `error`. The CLI
+prints the hint to stderr and still exits 0.
+
+Session ids that were *never* registered here stay silent — foreign ids (like
+Claude Code's own UUIDs) are a supported way to read *and* write the bus, as
+is publishing with no `session_id` at all (stored as `anonymous`). Only ids
+the bus knows it deleted are reported. The one exception predates this:
+`resume=True` with an unknown id returns `{"error": "Session not found"}`,
+since there is no cursor to resume from.
+
+**Finding orphaned sessions** on a bus host:
+
+```sql
+-- still polling or publishing under a session that is gone
+SELECT display_id, last_cursor, deleted_at FROM sessions WHERE deleted_at IS NOT NULL;
+
+-- events written after their session was deleted
+SELECT s.display_id, COUNT(e.id) AS events_after_deletion
+FROM sessions s JOIN events e ON e.session_id = s.id AND e.timestamp > s.deleted_at
+WHERE s.deleted_at IS NOT NULL GROUP BY s.display_id;
+```
+
+The second query works precisely because a flagged publish keeps its real
+attribution rather than being rewritten to `anonymous`.
+
 Then grep the server log for those `display_id`s. The request log prefixes
-every call with the caller's name, so an orphaned poller's rejections read:
+every call with the caller's name, so an orphan's calls read:
 
 ```
 [grand-bison] get_events(order=asc, limit=20, resume=true) → ERROR: Session deleted
+[grand-bison] publish_event(channel="all") → event #812 from deleted session grand-bison
 ```
 
-Recent hits mean the poller is still running. The server also logs one
-`WARNING` naming the session the first time it is rejected after a restart.
+Recent hits mean the client is still running. The server also logs one
+`WARNING` naming the session the first time it polls, and one the first time
+it publishes, after a restart.
 
 ## Structured Payload Fields
 

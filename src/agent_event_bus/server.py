@@ -435,6 +435,22 @@ def _publish_event_impl(
     signal_level: str | None = None,
 ) -> dict:
     """Sync implementation of publish_event (runs in a worker thread)."""
+    # Load the publisher so a soft-deleted one can be TOLD (#144). This is a
+    # SELECT the publish path did not previously make, and it is worth it:
+    # it is a primary-key lookup beside an INSERT, a possible DM lookup and a
+    # webhook dispatch that already dominate the call, and it is the only way
+    # to tell "deleted" from "never registered" - _auto_heartbeat's UPDATE is
+    # a no-op for both, which is exactly why the failure was invisible. The
+    # common fire-and-forget hook publish (no session_id, or "anonymous")
+    # returns from the loader without touching SQLite, so it pays nothing.
+    publisher = _load_calling_session(session_id)
+    publisher_deleted = _deleted_session_notice(
+        publisher,
+        tool="publish_event",
+        hint=_DELETED_PUBLISH_HINT,
+        action="storing events from",
+    )
+
     # Auto-refresh heartbeat when session publishes
     _auto_heartbeat(session_id)
 
@@ -490,6 +506,21 @@ def _publish_event_impl(
     }
     if correlation_id:
         result["correlation_id"] = correlation_id
+    if publisher_deleted:
+        # Flagged, not refused (#144), and the only write path that differs
+        # from the reads this way. Reads cost a client one wasted loop
+        # iteration; a refused publish LOSES the event, and the publishers
+        # that most often outlive their session are fire-and-forget hooks
+        # with no retry and no error handling. Trading a bad attribution for
+        # a dropped event is the wrong trade on a bus whose job is delivery.
+        #
+        # The event also keeps its real session_id rather than being
+        # rewritten to "anonymous": the sessions row survives soft-deletion
+        # (that is what makes it soft), so events still join to sessions
+        # downstream, and the attribution is the only thing that makes an
+        # orphaned publisher findable - in the join in #144, in the request
+        # log, and in the red `from:` names #142 added.
+        result.update(publisher_deleted)
     return result
 
 
@@ -505,6 +536,8 @@ async def publish_event(
     signal_level: str | None = None,
 ) -> dict:
     """Publish an event. Auto-refreshes heartbeat. Returns event_id.
+
+    A deleted session_id still publishes; the result adds session_deleted.
 
     Args:
         event_type: e.g., 'task_completed', 'help_needed'
@@ -567,34 +600,58 @@ def _event_wire_dict(event: Event, *, id_key: str) -> dict:
 _warned_deleted_sessions: set[tuple[str, str, str]] = set()
 
 
-def _load_polling_session(session_id: str | None) -> Session | None:
-    """Load the session behind a read, soft-deleted ones included (#140).
+def _load_calling_session(session_id: str | None) -> Session | None:
+    """Load the session behind a call, soft-deleted ones included (#140).
 
-    One lookup serves both the deleted-session check and the resume branch's
-    cursor read - `get_events` is the highest-frequency call on the bus, and
-    an orphaned poller is exactly the load this change exists to surface.
+    On reads one lookup serves both the deleted-session check and the resume
+    branch's cursor read - `get_events` is the highest-frequency call on the
+    bus, and an orphaned poller is exactly the load this change exists to
+    surface. `publish_event` uses it too (#144); see the note there on why
+    that path accepts a SELECT it did not previously make.
+
+    Anonymous and absent ids never reach SQLite: "anonymous" is the bus's
+    own name for an unattributed publish, not a session id.
     """
     if not session_id or session_id == "anonymous":
         return None
     return storage.get_session(session_id, include_deleted=True)
 
 
-def _deleted_session_error(session: Session | None, tool: str = "get_events") -> dict | None:
-    """Return an error dict if `session` is soft-deleted (#140).
+_DELETED_READ_HINT = (
+    "This session was unregistered or timed out, and its cursor is frozen. "
+    "Call register_session to get a live session, or stop polling."
+)
 
-    `tool` only names the caller in the warning. Every session-scoped read
-    shares this one implementation rather than re-deriving the contract - a
-    second copy would drift on the response shape clients branch on.
+_DELETED_PUBLISH_HINT = (
+    "This session was unregistered or timed out. The event was stored, but it "
+    "is attributed to a session that no longer appears in list_sessions. Call "
+    "register_session to publish as a live session."
+)
+
+
+def _deleted_session_notice(
+    session: Session | None,
+    tool: str,
+    hint: str,
+    action: str = "rejecting calls from",
+    warn: bool = True,
+) -> dict | None:
+    """Return the deleted-session fields if `session` is soft-deleted (#140).
+
+    The shared body of the contract. `tool` and `action` only phrase the
+    warning; `hint` is the caller's actionable half. Every session-scoped
+    tool goes through this one implementation rather than re-deriving the
+    contract - a second copy would drift on the keys clients branch on.
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
     same position forever and gets an empty batch that is indistinguishable
     from "you are up to date" - while staying invisible in `list_sessions`.
-    Failing the read loudly is the only thing either side can notice.
+    Saying so is the only thing either side can notice.
 
     Unregistered ids stay silent: callers legitimately pass foreign session
     ids (Claude Code's own UUIDs) that were never registered here. Only an id
-    we know we deleted is an error.
+    we know we deleted is worth reporting.
     """
     if session is None or session.deleted_at is None:
         return None
@@ -609,27 +666,37 @@ def _deleted_session_error(session: Session | None, tool: str = "get_events") ->
     # bounded (sessions x deletions x tools), still not the 100k-line problem
     # the set exists to prevent.
     warn_key = (session_id, deleted_at_str, tool)
-    if warn_key not in _warned_deleted_sessions:
+    if warn and warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
         logger.warning(
-            f"{tool}: rejecting calls from deleted session {session.display_id} "
+            f"{tool}: {action} deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
-            f"client is still calling the bus. Further rejections are logged "
+            f"client is still calling the bus. Further calls are logged "
             f"per-call by the request middleware."
         )
         _dev_notify(tool, f"deleted session call: {session.display_id}")
 
     return {
-        "error": "Session deleted",
         "session_deleted": True,
         "session_id": session_id,
         "display_id": session.display_id,
         "deleted_at": deleted_at_str,
-        "hint": (
-            "This session was unregistered or timed out, and its cursor is frozen. "
-            "Call register_session to get a live session, or stop polling."
-        ),
+        "hint": hint,
     }
+
+
+def _deleted_session_error(session: Session | None, tool: str = "get_events") -> dict | None:
+    """Return an error dict if `session` is soft-deleted (#140).
+
+    For the paths that refuse the call outright - every session-scoped READ.
+    Writes flag instead of refusing (see `_publish_event_impl`), so they take
+    the notice without the `error` key: a caller branching on `error` must
+    not read a stored event as a failed one.
+    """
+    notice = _deleted_session_notice(session, tool=tool, hint=_DELETED_READ_HINT)
+    if notice is None:
+        return None
+    return {"error": "Session deleted", **notice}
 
 
 def _event_to_dict(e: Event) -> dict:
@@ -653,7 +720,7 @@ def _get_events_impl(
     # Fail loudly for soft-deleted sessions (#140) - checked on every read
     # path, not just resume: a client feeding next_cursor back by hand never
     # touches the resume branch and would otherwise poll forever unnoticed.
-    session = _load_polling_session(session_id)
+    session = _load_calling_session(session_id)
     deleted = _deleted_session_error(session)
     if deleted:
         return deleted
@@ -801,7 +868,7 @@ async def get_events(
 
 def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
     """Sync implementation of ack_events (runs in a worker thread)."""
-    session = _load_polling_session(session_id)
+    session = _load_calling_session(session_id)
     deleted = _deleted_session_error(session, tool="ack_events")
     if deleted:
         return deleted
@@ -920,7 +987,7 @@ def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -
         # gets the same shape a rejected poll gets, rather than a success the
         # bus did not actually perform - cmd_ack exits non-zero on error
         # precisely so a drain hook cannot mistake one for the other.
-        raced = _deleted_session_error(_load_polling_session(session_id), tool="ack_events")
+        raced = _deleted_session_error(_load_calling_session(session_id), tool="ack_events")
         return raced or {"error": "Session not found", "session_id": session_id}
 
     _dev_notify("ack_events", f"{session.display_id} → {canonical}")
@@ -968,7 +1035,31 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
         _dev_notify("unregister_session", "no identifier provided")
         return {"error": "Must provide either session_id or client_id"}
 
-    session = storage.get_session(session_id)
+    session = _load_calling_session(session_id)
+    if session and session.deleted_at is not None:
+        # Already gone. This was reported as "Session not found", which is
+        # the one thing it is not - the row exists, we deleted it - and it is
+        # the id a client re-sends after the 24h sweep already took its
+        # session. Named accurately via the shared contract (#144), with the
+        # same keys the reads use, so a client branching on session_deleted
+        # gets one answer from every tool.
+        #
+        # Deliberately unwarned: unregistering is an orphaned client winding
+        # DOWN, the one call from a dead session an operator does not need to
+        # be told about. It is also idempotent-adjacent (a double unregister
+        # is normal), so warning here would flag the well-behaved client and
+        # bury the polling loop the warning exists for.
+        deleted = _deleted_session_notice(
+            session,
+            tool="unregister_session",
+            hint=(
+                "This session was already unregistered or timed out; nothing "
+                "left to clean up. Call register_session to start a new one."
+            ),
+            warn=False,
+        )
+        _dev_notify("unregister_session", f"{session.display_id} already deleted")
+        return {"error": "Session deleted", **deleted}
     if not session:
         _dev_notify("unregister_session", f"{session_id} not found")
         return {"error": "Session not found", "session_id": session_id}
@@ -994,6 +1085,8 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
 @mcp.tool()
 async def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
     """Unregister from event bus. session_id takes precedence if both given.
+
+    An already-deleted session_id reports "Session deleted", not "not found".
 
     Args:
         session_id: Your session ID

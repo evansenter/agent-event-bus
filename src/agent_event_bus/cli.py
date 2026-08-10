@@ -35,7 +35,10 @@ Examples:
     # List active channels
     agent-event-bus-cli channels
 
-    # Publish an event
+    # Publish an event. Publishing under a session that has ended still stores
+    # the event and exits 0 (dropping it would be worse), but warns on stderr
+    # and sets .session_deleted in the JSON on stdout - re-register to fix the
+    # attribution. Session ids the bus never registered stay silent.
     agent-event-bus-cli publish --type "task_done" --payload "Finished API" --channel "repo:my-project"
 
     # Get recent events (newest first by default)
@@ -326,6 +329,19 @@ def cmd_publish(args):
 
     result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
+
+    # The event was stored, so this exits 0 and stdout is unchanged - a hook
+    # that publishes and moves on keeps working. The hint goes to stderr,
+    # where a hook's log actually shows it: publishing under a session that
+    # ended is the one thing the caller can fix, and stdout is usually piped
+    # to /dev/null (#144).
+    if result.get("session_deleted"):
+        print(
+            f"Warning: publishing as deleted session "
+            f"{result.get('display_id') or result.get('session_id')}\n"
+            f"{result.get('hint', '')}".rstrip(),
+            file=sys.stderr,
+        )
 
 
 def cmd_events(args):

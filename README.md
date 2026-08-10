@@ -74,6 +74,14 @@ Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 | `set_webhook_active` | Pause/resume a webhook without unregistering |
 | `unregister_webhook` | Remove a webhook |
 
+**Sessions that have ended** (unregistered, or swept by the 24h heartbeat
+timeout) are never silently ignored: reads (`get_events`, `ack_events`) fail
+with `{"error": "Session deleted", "session_deleted": true, ...}`, while
+`publish_event` still stores the event and adds `session_deleted: true` to
+its result — losing an event from a fire-and-forget hook would be worse than
+a stale attribution. Either way, re-register. Session ids the bus never
+registered stay silent. See `agent-event-bus://guide`.
+
 ## Channels
 
 Events include channel metadata for context. **All sessions see all events** (broadcast model).

@@ -1641,6 +1641,197 @@ class TestDeletedSessionPolling:
         assert reg["display_id"] in rejections[0].message
 
 
+class TestDeletedSessionPublishing:
+    """A soft-deleted session must not be able to publish silently (#144).
+
+    The write half of #140. `publish_event` never loaded the session, and
+    _auto_heartbeat's UPDATE is a no-op for a deleted id, so the event landed
+    attributed to a session absent from `list_sessions` with nothing said to
+    anyone. Unlike the reads, the fix FLAGS rather than refuses: a refused
+    publish loses the event, and the publishers that outlive their session
+    are fire-and-forget hooks with no retry.
+    """
+
+    def _deleted_session(self, name):
+        reg = register_session(name=name, client_id=f"{name}-client")
+        sid = reg["session_id"]
+        assert server.storage.delete_session(sid)
+        return sid, reg
+
+    def test_publish_from_deleted_session_is_flagged(self):
+        sid, reg = self._deleted_session("pub-deleted")
+
+        result = publish_event(event_type="note", payload="from beyond", session_id=sid)
+
+        assert result["session_deleted"] is True
+        assert result["session_id"] == sid
+        assert result["display_id"] == reg["display_id"]
+        assert result["deleted_at"]
+        assert "register_session" in result["hint"]
+
+    def test_the_flag_is_not_an_error(self):
+        """The publish SUCCEEDED, so the one key every client branches on
+        first must stay absent - reusing the reads' error shape here would
+        make a stored event read as a failed one, and cmd_publish would start
+        exiting non-zero on events that landed fine."""
+        sid, _ = self._deleted_session("pub-not-error")
+
+        result = publish_event(event_type="note", payload="stored", session_id=sid)
+
+        assert "error" not in result
+        assert result["event_id"]
+
+    def test_the_event_is_actually_stored(self):
+        """Guards the other direction from the bug: refusing the write (option
+        1 in #144) would drop an event a fire-and-forget hook cannot retry.
+        Read back through the bus, not just asserted on the response."""
+        sid, _ = self._deleted_session("pub-stored")
+
+        published = publish_event(event_type="note", payload="must survive", session_id=sid)
+
+        events = get_events(order="desc", limit=10)["events"]
+        assert published["event_id"] in [e["id"] for e in events]
+        assert "must survive" in [e["payload"] for e in events]
+
+    def test_the_event_keeps_its_real_attribution(self):
+        """Re-attributing to "anonymous" (option 3) would destroy the only
+        thing that makes an orphaned publisher findable - the sessions row
+        survives soft-deletion, so events still join to it."""
+        sid, reg = self._deleted_session("pub-attribution")
+
+        publish_event(event_type="note", payload="mine", session_id=sid)
+
+        stored = [e for e in get_events(order="desc", limit=10)["events"] if e["payload"] == "mine"]
+        assert stored and stored[0]["session_id"] == sid
+        assert server.storage.get_session(sid, include_deleted=True).display_id == reg["display_id"]
+
+    def test_publishing_does_not_revive_the_session(self):
+        """The flag says "re-register", and it has to be telling the truth:
+        an auto-heartbeat that resurrected the row would make the warning
+        self-clearing and hide the orphan again."""
+        sid, _ = self._deleted_session("pub-no-revive")
+
+        publish_event(event_type="note", payload="knock knock", session_id=sid)
+
+        assert server.storage.get_session(sid) is None
+        assert sid not in [s["session_id"] for s in list_sessions()]
+
+    def test_live_session_publish_is_unflagged(self):
+        reg = register_session(name="pub-live", client_id="pub-live-client")
+
+        result = publish_event(event_type="note", payload="alive", session_id=reg["session_id"])
+
+        assert "session_deleted" not in result
+        assert "hint" not in result
+
+    def test_anonymous_publish_is_unflagged(self):
+        """Hooks publish without any session id; that is a supported call and
+        costs no lookup."""
+        result = publish_event(event_type="note", payload="no attribution")
+
+        assert "session_deleted" not in result
+        assert result["event_id"]
+
+    def test_unregistered_session_id_stays_silent(self):
+        """Foreign ids (Claude Code's own UUIDs) were never registered here -
+        only ids we know we deleted are worth flagging."""
+        result = publish_event(
+            event_type="note", payload="stranger", session_id="never-registered-publisher"
+        )
+
+        assert "session_deleted" not in result
+        assert result["event_id"]
+
+    def test_dm_from_a_deleted_session_still_notifies(self, mock_dm_notifications):
+        """The DM is why not refusing matters: the recipient is live and the
+        message is real, even though the sender's registration lapsed."""
+        sid, _ = self._deleted_session("pub-dm")
+        recipient = register_session(name="pub-dm-target", client_id="pub-dm-target-client")
+
+        publish_event(
+            event_type="help_needed",
+            payload="still here?",
+            session_id=sid,
+            channel=f"session:{recipient['session_id']}",
+        )
+
+        assert mock_dm_notifications.called
+
+    def test_warning_is_logged_once_per_deletion(self, monkeypatch, caplog):
+        """An orphaned publisher is quieter than a poller - it only speaks
+        when it publishes - but a hook firing on every tool call is still a
+        firehose. One WARNING per incident, same as the reads."""
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+        sid, reg = self._deleted_session("pub-warn-once")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            for _ in range(3):
+                publish_event(event_type="note", payload="again", session_id=sid)
+
+        warnings = [r for r in caplog.records if "deleted session" in r.message]
+        assert len(warnings) == 1
+        assert reg["display_id"] in warnings[0].message
+        # Not phrased as a rejection: nothing was rejected
+        assert "rejecting" not in warnings[0].message
+
+    def test_publishing_and_polling_each_get_their_own_warning(self, monkeypatch, caplog):
+        """The warn-once key includes the tool. A session that both publishes
+        and polls must not have one call silence the other - an operator who
+        sees only the get_events line never learns the writes are landing
+        under a dead session too."""
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+        sid, _ = self._deleted_session("pub-and-poll")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            publish_event(event_type="note", payload="write", session_id=sid)
+            get_events(session_id=sid, resume=True)
+
+        tools = {r.message.split(":")[0] for r in caplog.records if "deleted session" in r.message}
+        assert tools == {"publish_event", "get_events"}
+
+
+class TestDeletedSessionUnregister:
+    """unregister_session names the right reason for a session already gone.
+
+    It always failed loudly, so nothing was lost here - but it reported
+    "Session not found" for a row that exists and that WE deleted, which is
+    the one distinction the #140 contract is built on (#144).
+    """
+
+    def test_deleted_session_reports_deletion_not_absence(self):
+        reg = register_session(name="unreg-twice", client_id="unreg-twice-client")
+        sid = reg["session_id"]
+        assert unregister_session(session_id=sid)["success"] is True
+
+        result = unregister_session(session_id=sid)
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+        assert result["display_id"] == reg["display_id"]
+        assert result["deleted_at"]
+
+    def test_unknown_session_is_still_a_plain_not_found(self):
+        """Never-registered ids keep their old answer - the contract only
+        speaks about ids the bus knows it deleted."""
+        result = unregister_session(session_id="never-registered-unreg")
+
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_no_warning_is_logged(self, monkeypatch, caplog):
+        """The warn-once line exists to surface an orphan still WORKING the
+        bus. A client unregistering is one winding down - warning here would
+        flag the well-behaved caller and dilute the signal."""
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+        reg = register_session(name="unreg-quiet", client_id="unreg-quiet-client")
+        unregister_session(session_id=reg["session_id"])
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            unregister_session(session_id=reg["session_id"])
+
+        assert [r for r in caplog.records if "deleted session" in r.message] == []
+
+
 class TestAckEvents:
     """ack_events: advance the cursor to an id the caller already holds (#134).
 

@@ -303,6 +303,26 @@ class TestFormatResult:
         assert "Session deleted" in result
         assert "session=" not in result
 
+    def test_deleted_publisher_keeps_the_event_line(self):
+        """A flagged publish (#144) has no `error` to catch, and its
+        session_id would otherwise fall into the generic session branch -
+        logging `session=<name>` and losing both the event id and the fact
+        that the publisher is dead. The orphan is red, as in `from:`."""
+        result = _format_result(
+            {
+                "event_id": 77,
+                "channel": "all",
+                "session_deleted": True,
+                "session_id": "1f2e3d4c-aaaa-bbbb-cccc-ddddeeeeffff",
+                "display_id": "tender-hawk",
+            }
+        )
+        assert "event #77" in result
+        assert "[all]" in result
+        assert "tender-hawk" in result
+        assert _RED in result
+        assert "session=" not in result
+
     def test_structured_content_unwrapping(self):
         """FastMCP structuredContent wrapper is unwrapped."""
         wrapped = {

@@ -214,6 +214,21 @@ def _format_result(result) -> str:
     # deleted-session polling stayed invisible in the log for months.
     if "error" in result:
         return f"{_RED}ERROR:{_RESET} {result['error']}"
+    # A publish that succeeded but came from a soft-deleted session (#144).
+    # It has no "error" to catch above - the event really was stored - and its
+    # session_id would otherwise fall into the generic session branch below,
+    # hiding the event id AND the dead publisher behind `session=<name>`.
+    # Rendered red for the same reason #142 reddened deleted publishers in
+    # `from:`: this is the line an operator greps to find the orphan.
+    if result.get("session_deleted") and "event_id" in result:
+        publisher = result.get("display_id") or _format_session_id_value(
+            result.get("session_id") or "?"
+        )
+        return (
+            f"{_MAGENTA}event #{result['event_id']}{_RESET} "
+            f"[{result.get('channel', 'all')}] "
+            f"{_RED}from deleted session {publisher}{_RESET}"
+        )
     # Before the session_id branch, for the same reason the error check sits
     # above it: an ack's entire observable effect is the cursor move, and the
     # generic session line would swallow it - logging every successful ack as
