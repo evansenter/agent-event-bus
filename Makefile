@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test clean install-server install-client uninstall dev venv restart logs
+.PHONY: check fmt lint test clean install-server install-client uninstall dev venv restart logs install-bridge uninstall-bridge
 
 # Canonical paths (override with matching AGENT_EVENT_BUS_* env vars)
 LOG_FILE := $(or $(AGENT_EVENT_BUS_LOG),$(HOME)/.claude/contrib/agent-event-bus/agent-event-bus.log)
@@ -95,6 +95,27 @@ install-client:
 	@echo ""
 	@echo "Add to your shell profile (~/.zshrc, ~/.bashrc, or ~/.extra):"
 	@echo '  export AGENT_EVENT_BUS_URL="$(REMOTE_URL)"'
+
+# Supervise the RFC #122 bridge (macOS only; idempotent, restarts on crash).
+# Separate from install-server on purpose: the bridge is experimental, the bus
+# is not, and a bus host does not have to run one. Requires the venv that
+# install-server (or `make dev`) creates.
+install-bridge:
+	@if [ "$$(uname)" != "Darwin" ]; then \
+		echo "install-bridge is macOS-only (LaunchAgent)."; \
+		echo "On Linux, run the bridge under your own supervisor:"; \
+		echo "  uv run agent-event-bus-bridge"; \
+		exit 1; \
+	fi
+	./scripts/install-bridge-launchagent.sh
+
+# Stop supervising the bridge. Leaves the bus, the database, and wake/ alone.
+uninstall-bridge:
+	@if [ "$$(uname)" != "Darwin" ]; then \
+		echo "uninstall-bridge is macOS-only (LaunchAgent)."; \
+		exit 1; \
+	fi
+	./scripts/uninstall-bridge-launchagent.sh
 
 # Uninstall: service + CLI + MCP config
 uninstall:
