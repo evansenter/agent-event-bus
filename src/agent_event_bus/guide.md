@@ -181,22 +181,26 @@ Peek and ack name the same window by construction, because the ack uses the
 cursor the peek returned:
 
 ```
-# 1. Peek: see what's pending, cursor untouched. order="asc" is REQUIRED here
-#    - see the warning below.
-pending = get_events(session_id=sid, resume=True, peek=True,
-                     min_level="actionable", order="asc")
+# A pass drains at most `limit` (default 50), so re-peek until has_more is
+# false to clear a backlog in one invocation. The peek has to happen INSIDE
+# the loop - the ack moves the cursor, so the next pass is a fresh window.
+while True:
+    # 1. Peek: see what's pending, cursor untouched. order="asc" is REQUIRED
+    #    here - see the warning below.
+    pending = get_events(session_id=sid, resume=True, peek=True,
+                         min_level="actionable", order="asc")
 
-# 2. Act on pending["events"] - surface them, wake something, whatever
+    # 2. Act on pending["events"] - surface them, wake something, whatever
 
-# 3. Ack exactly what step 1 covered - but only if there was anything.
-#    On a bus with no events at all next_cursor is null, and acking null is
-#    an error, not a no-op.
-if pending["next_cursor"]:
-    ack_events(session_id=sid, cursor=pending["next_cursor"])
-    → {success: true, cursor: "55", previous_cursor: "42"}
+    # 3. Ack exactly what step 1 covered - but only if there was anything.
+    #    On a bus with no events at all next_cursor is null, and acking null
+    #    is an error, not a no-op.
+    if pending["next_cursor"]:
+        ack_events(session_id=sid, cursor=pending["next_cursor"])
+        → {success: true, cursor: "55", previous_cursor: "42"}
 
-# 4. One pass drains at most `limit` (default 50). Loop while
-#    pending["has_more"] to catch up on a backlog in a single invocation.
+    if not pending["has_more"]:
+        break
 ```
 
 Everything in the peek's raw window is now seen, filtered-out noise included
@@ -227,8 +231,11 @@ Everything in the peek's raw window is now seen, filtered-out noise included
 > reads are non-consuming; `ack_events` hands that decision back to you.
 
 Refused, rather than silently honored:
-- a cursor that **isn't an event id** — the string `null`, empty, negative;
-  checked before any position check, and the one a `jq -r` artifact lands on
+- a cursor that **isn't an event id** — `Invalid cursor ...: expected an event
+  id`, for the string `null`, empty, or anything else that won't parse; the
+  one a `jq -r` artifact lands on
+- a **negative** cursor — parses, so it gets its own `Invalid cursor ...: must
+  not be negative`. Both of these are checked before any position check
 - a cursor **ahead of the newest event** — it would mark events that don't
   exist yet as seen
 - a cursor **behind your current position** — pass `allow_rewind=True` to
@@ -237,7 +244,7 @@ Refused, rather than silently honored:
 - an ack from a **session id that never registered** — a plain
   `{error: "Session not found", session_id}`
 
-The **cursor** refusals — the first three bullets — all tell you where you
+The **cursor** refusals — the first four bullets — all tell you where you
 are the same way, so recovery does not branch on which of them you got, only
 on whether you have ever acked: re-ack `cursor` when it is set, and when it
 is `null` re-ack your own peek's `next_cursor` instead (see below).

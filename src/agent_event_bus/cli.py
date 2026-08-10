@@ -71,19 +71,24 @@ Examples:
     # A bounded consume cannot do this - min-level filters the view while the
     # cursor advances over the raw batch, so the counts refer to different
     # windows. Peek and ack refer to the same window by construction.
-    OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
-            --min-level actionable --order asc --json)
-    echo "$OUT" | jq -r '.events[].payload'
-    # `// empty` + the test: on a bus with no events at all next_cursor is
-    # null, and `jq -r` would print the string "null" for an ack to reject.
-    CUR=$(echo "$OUT" | jq -r '.next_cursor // empty')
-    # `if`, not `[ -n "$CUR" ] && ...`: as the last command of a hook the && form
-    # would exit 1 on the nothing-to-ack run, and abort early under `set -e`.
-    if [ -n "$CUR" ]; then
-        agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
-    fi
-    # One pass drains at most --limit (default 50). Loop while
-    # `jq -r '.has_more'` is true to clear a backlog in a single hook run.
+    # A pass drains at most --limit (default 50), so re-peek until has_more is
+    # false to clear a backlog in one hook run. The peek belongs INSIDE the
+    # loop - the ack moves the cursor, so the next pass is a fresh window.
+    while :; do
+        OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
+                --min-level actionable --order asc --json)
+        echo "$OUT" | jq -r '.events[].payload'
+        # `// empty` + the test: on a bus with no events at all next_cursor is
+        # null, and `jq -r` would print the string "null" for an ack to reject.
+        CUR=$(echo "$OUT" | jq -r '.next_cursor // empty')
+        # `if`, not `[ -n "$CUR" ] && ...`: lifted out of this loop as a hook's
+        # last command, the && form would exit 1 on the nothing-to-ack run and
+        # abort early under `set -e`.
+        if [ -n "$CUR" ]; then
+            agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
+        fi
+        [ "$(echo "$OUT" | jq -r '.has_more')" = "true" ] || break
+    done
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"

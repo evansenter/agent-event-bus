@@ -2073,7 +2073,7 @@ class TestAckRejectionShape:
         replayed = get_events(session_id=sid, resume=True, order="asc")["events"]
         assert replayed and replayed[0]["id"] < published["event_id"]
 
-    def test_each_tool_warns_once_for_the_same_dead_session(self, caplog):
+    def test_each_tool_warns_once_for_the_same_dead_session(self, caplog, monkeypatch):
         """A drain hook both polls and acks. Keyed without `tool`, whichever
         call warned first would silence the other forever, and the operator
         would never learn the acks are failing too."""
@@ -2081,7 +2081,10 @@ class TestAckRejectionShape:
 
         sid = self._session("both")
         server.storage.delete_session(sid)
-        server._warned_deleted_sessions.clear()
+        # setattr, not .clear(): pytest unwinds this, so the isolation does not
+        # depend on nothing downstream caring what the real set holds. Same
+        # form TestDeletedSessionPolling uses for the same global.
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
 
         with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
             get_events(session_id=sid, resume=True, order="asc")
