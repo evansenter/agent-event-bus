@@ -21,13 +21,17 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Resource URI | `agent-event-bus://guide` |
 | Data directory | `~/.claude/contrib/agent-event-bus/` |
 | Database | `~/.claude/contrib/agent-event-bus/data.db` |
-| Log files | `agent-event-bus.log`, `agent-event-bus.err`; bridge: `agent-event-bus-bridge.log`, `agent-event-bus-bridge.err` (the bridge's are launchd's stdout/stderr capture, which launchd TRUNCATES on every restart - it has no append-mode file logger of its own yet) |
+| Log files | Bus: `agent-event-bus.log` (the Python `FileHandler`, the one `_LOG` moves), `agent-event-bus.err`, plus `agent-event-bus.stdout` - launchd's stdout capture, hardcoded in the plist and therefore the one file no env var relocates. Bridge: `agent-event-bus-bridge.log`, `agent-event-bus-bridge.err` (both launchd captures; launchd APPENDS across restarts, so no file handler of its own is needed. Bridge records go to `.err` - it logs to stderr - while `.log` gets uvicorn access lines) |
 | LaunchAgent | `com.evansenter.agent-event-bus.plist`; bridge: `com.evansenter.agent-event-bus-bridge.plist` (separate unit - a bus host need not run a bridge) |
 | systemd service | `agent-event-bus.service` |
 | Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
 | Bridge hook-lock dir | `$XDG_RUNTIME_DIR/agent-event-bus-bridge-<uid>/`, else the system temp dir (`$TMPDIR`, or `/tmp` when unset; macOS: per-user `/var/folders/.../T`) - zero-byte, uid-scoped `hook.<hash>.lock` files, machine-scoped so a same-URL double-start refuses regardless of `$HOME`. Create-and-verified private (not adopted). Safe to remove when no bridge is running |
 
-**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`, `_LOG_PEER`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_BRIDGE_LOG`, `_BRIDGE_ERR`, `_WAKE_DIR`).
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`, `_LOG_PEER`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_WAKE_DIR`; and `_BRIDGE_LOG` / `_BRIDGE_ERR`, which -
+unlike every other `_BRIDGE_*` name - are **install-time only**: they are read by
+`scripts/install-bridge-launchagent.sh` and baked into the plist, so they must be in
+the environment of `make install-bridge` itself. Setting them for a running bridge
+does nothing, exactly as with the bus's `_LOG` / `_ERR` pair).
 One consulted variable is deliberately outside the prefix: **`CLAUDE_CODE_SESSION_ID`**, which the CLI reads as a session-attribution fallback when `--session-id` and `AGENT_EVENT_BUS_SESSION_ID` are both absent (#137).
 
 ---
