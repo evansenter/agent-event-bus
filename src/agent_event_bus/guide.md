@@ -196,13 +196,29 @@ ack_events(session_id=sid, cursor=pending["next_cursor"])
 Everything in the peek's raw window is now seen, filtered-out noise included
 — which is the point of a server-side noise policy.
 
-> **An ack is only as bounded as the peek that produced it.** Always peek with
-> `order="asc"`. With the default `order="desc"` the batch is the *newest*
-> slice of the window while `next_cursor` is still the tip, so acking it marks
-> every older event as seen — including the ones the peek never returned.
+> **An ack is only as bounded as the peek that produced it.** Two things break
+> the pairing, and both cost you events:
+>
+> **1. Ordering.** Always peek with `order="asc"`. Under the default `desc` the
+> batch is the *newest* slice while `next_cursor` is still the tip, so acking it
+> marks every older event as seen — including the ones the peek never returned.
 > Measured: a 20-event backlog peeked at `limit=5` under `desc` surfaces 5 and
-> silently loses the other 15. That is the consumed-but-never-surfaced loss
-> this primitive exists to prevent, so ordering is not a stylistic choice here.
+> silently loses the other 15.
+>
+> **2. Which filter you narrowed with.** Only ack a peek that was unfiltered or
+> filtered by `min_level`. The two filter kinds are applied on opposite sides of
+> the cursor bookkeeping:
+>
+> | Filter | Applied | `next_cursor` is | Safe to ack? |
+> |---|---|---|---|
+> | `min_level` | after bookkeeping | the **raw** batch max | **Yes** — the hidden noise counts as seen, deliberately |
+> | `channel`, `event_types`, `correlation_id` | in SQL, before | the **matched** batch max | **No** — commits every lower-id non-match |
+>
+> Measured: events 1-10 pending with only 3 and 7 matching, a peek with
+> `event_types=["help_needed"]` returns those two and `next_cursor: 8` — acking
+> it marks 1, 2, 4, 5 and 6 seen without ever surfacing them. This is precisely
+> the loss `get_events` refuses to perform on its own, which is why narrowed
+> reads are non-consuming; `ack_events` hands that decision back to you.
 
 Refused, rather than silently honored:
 - a cursor **ahead of the newest event** — it would mark events that don't

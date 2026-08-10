@@ -693,6 +693,25 @@ class TestCmdAck:
         assert "Session deleted" in err
         assert "Call register_session or stop polling." in err
 
+    @patch("agent_event_bus.cli.call_tool")
+    def test_json_error_goes_to_stdout_like_cmd_events(self, mock_call, capsys):
+        """--json must carry the error dict, not just the exit code. A drain
+        hook consuming --json would otherwise get empty stdout and a jq parse
+        error instead of the session_deleted flag it branches on."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "hint": "Call register_session or stop polling.",
+        }
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id="gone", json=True))
+
+        assert exc.value.code == 1
+        out = capsys.readouterr()
+        assert json.loads(out.out)["session_deleted"] is True
+        assert out.err == "", "--json puts the machine-readable form on stdout only"
+
     def test_parser_wires_the_subcommand(self):
         import sys
 

@@ -1894,3 +1894,56 @@ class TestAckNormalizesAndReportsConsistently:
 
         assert "error" in refused
         assert server.storage.get_session(sid).last_heartbeat > stale
+
+
+class TestAckNarrowingHazard:
+    """Acking a SQL-narrowed peek loses the non-matching events beneath it.
+
+    The two filter kinds sit on opposite sides of the cursor bookkeeping, and
+    only one of them is safe to ack. Pinned here because the difference is
+    invisible in the response - both return events and a next_cursor - and is
+    the reason get_events refuses to advance the cursor on narrowed reads at
+    all. ack_events hands that decision back to the caller.
+    """
+
+    def _prepared(self, name):
+        sid = register_session(name=name, client_id=f"{name}-c")["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        return sid
+
+    def test_event_types_peek_then_ack_buries_the_non_matches(self):
+        sid = self._prepared("narrowed")
+        for i in range(1, 11):
+            publish_event(event_type="help_needed" if i in (3, 7) else "note", payload=f"event-{i}")
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, event_types=["help_needed"], order="asc"
+        )
+        assert [e["payload"] for e in peeked["events"]] == ["event-3", "event-7"]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        remaining = [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ]
+        assert remaining == ["event-8", "event-9", "event-10"]
+        for buried in ("event-1", "event-2", "event-4", "event-5", "event-6"):
+            assert buried not in remaining, "committed without ever being surfaced"
+
+    def test_min_level_peek_next_cursor_is_the_raw_tip(self):
+        """The safe half of the same table: min_level filters AFTER cursor
+        bookkeeping, so its next_cursor spans the raw window and acking it is
+        correct - the hidden noise is meant to count as seen."""
+        sid = self._prepared("levelled")
+        published = [
+            publish_event(event_type="note" if i else "help_needed", payload=f"e{i}")
+            for i in range(3)
+        ]
+        tip = str(max(p["event_id"] for p in published))
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, min_level="actionable", order="asc"
+        )
+
+        assert [e["payload"] for e in peeked["events"]] == ["e0"]
+        assert peeked["next_cursor"] == tip, "spans the raw batch, not the filtered view"

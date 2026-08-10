@@ -77,7 +77,11 @@ Examples:
     # `// empty` + the test: on a bus with no events at all next_cursor is
     # null, and `jq -r` would print the string "null" for an ack to reject.
     CUR=$(echo "$OUT" | jq -r '.next_cursor // empty')
-    [ -n "$CUR" ] && agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
+    # `if`, not `[ -n "$CUR" ] && ...`: as the last command of a hook the && form
+    # would exit 1 on the nothing-to-ack run, and abort early under `set -e`.
+    if [ -n "$CUR" ]; then
+        agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
+    fi
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -412,14 +416,19 @@ def cmd_ack(args):
     result = call_tool("ack_events", arguments, url=args.url)
 
     if "error" in result:
-        message = f"Error: {result['error']}"
-        # Same as cmd_events: the hint carries the actionable half ("re-register
-        # or stop polling"). Dropping it here would leave an operator debugging
-        # a swept drain hook with an exit code and no next step - and would make
-        # this path the one place the shared #140 contract is not actually shared.
-        if result.get("hint"):
-            message += f"\n{result['hint']}"
-        print(message, file=sys.stderr)
+        # Mirrors cmd_events exactly, both halves. --json gets the error dict on
+        # stdout, so a drain hook can branch on session_deleted instead of
+        # parsing an empty stdout; otherwise the human form carries the hint,
+        # which is the actionable half ("re-register or stop polling"). Either
+        # way this is the same #140 shape a poll returns - a verb that dropped
+        # one half would make this the one place the contract is not shared.
+        if args.json:
+            print(json.dumps(result))
+        else:
+            message = f"Error: {result['error']}"
+            if result.get("hint"):
+                message += f"\n{result['hint']}"
+            print(message, file=sys.stderr)
         sys.exit(1)
 
     if args.json:
