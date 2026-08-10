@@ -13,6 +13,7 @@ Usage:
                          [--exclude T1,T2] [--timeout MS] [--json] [--order asc|desc]
                          [--channel CHANNEL] [--resume] [--peek] [--correlation-id ID]
                          [--min-level lifecycle|info|actionable]
+    agent-event-bus-cli ack --cursor N [--session-id ID] [--allow-rewind] [--json]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
     agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
     agent-event-bus-cli webhook list [--all]
@@ -65,6 +66,36 @@ Examples:
     # Thread a request to its responses with a correlation id
     agent-event-bus-cli publish --type task_request --payload "Review PR #42?" --correlation-id review-42
     agent-event-bus-cli events --correlation-id review-42 --order asc
+
+    # Drain safely under a server-side filter: peek, act, then ack what you saw.
+    # A bounded consume cannot do this - min-level filters the view while the
+    # cursor advances over the raw batch, so the counts refer to different
+    # windows. Peek and ack refer to the same window by construction.
+    # A pass drains at most --limit (default 50), so re-peek until has_more is
+    # false to clear a backlog in one hook run. The peek belongs INSIDE the
+    # loop - the ack moves the cursor, so the next pass is a fresh window.
+    while :; do
+        # A session deleted or timed out mid-drain FAILS this poll rather than
+        # returning an empty batch, and `events` exits non-zero on it - so
+        # under `set -e` the hook aborts here, loudly. Without it, .has_more
+        # reads null on the error object and the loop breaks instead.
+        OUT=$(agent-event-bus-cli events --session-id "$SID" --resume --peek \
+                --min-level actionable --order asc --json)
+        echo "$OUT" | jq -r '.events[].payload'
+        # `// empty` + the test: on a bus with no events at all next_cursor is
+        # null, and `jq -r` would print the string "null" for an ack to reject.
+        CUR=$(echo "$OUT" | jq -r '.next_cursor // empty')
+        # `if`, not `[ -n "$CUR" ] && ...`: lifted out of this loop as a hook's
+        # last command, the && form would exit 1 on the nothing-to-ack run and
+        # abort early under `set -e`.
+        if [ -n "$CUR" ]; then
+            agent-event-bus-cli ack --session-id "$SID" --cursor "$CUR"
+        fi
+        # has_more, NOT the event count: it counts the RAW batch, before
+        # --min-level filters it, so a pass of 50 lifecycle events prints
+        # nothing and still has more to drain.
+        [ "$(echo "$OUT" | jq -r '.has_more')" = "true" ] || break
+    done
 
     # Send notification
     agent-event-bus-cli notify --title "Build Complete" --message "All tests passed"
@@ -385,6 +416,48 @@ def cmd_events(args):
             print(hint, file=sys.stderr)
 
 
+def cmd_ack(args):
+    """Advance the session cursor to an event id already held."""
+    session_id = args.session_id or _session_id_from_env()
+    if not session_id:
+        print(
+            "Error: ack requires --session-id (or $AGENT_EVENT_BUS_SESSION_ID, "
+            "else $CLAUDE_CODE_SESSION_ID)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    arguments = {"session_id": session_id, "cursor": args.cursor}
+    if args.allow_rewind:
+        arguments["allow_rewind"] = True
+
+    result = call_tool("ack_events", arguments, url=args.url)
+
+    if "error" in result:
+        # Mirrors cmd_events exactly, both halves. --json gets the error dict on
+        # stdout, so a drain hook can branch on session_deleted instead of
+        # parsing an empty stdout; otherwise the human form carries the hint,
+        # which is the actionable half ("re-register or stop polling"). Either
+        # way this is the same #140 shape a poll returns - a verb that dropped
+        # one half would make this the one place the contract is not shared.
+        if args.json:
+            print(json.dumps(result))
+        else:
+            message = f"Error: {result['error']}"
+            if result.get("hint"):
+                message += f"\n{result['hint']}"
+            print(message, file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(result))
+    else:
+        # "start", not a dangling arrow, and the same word `make logs` uses
+        # for this case - one event should not read two ways.
+        previous = result.get("previous_cursor") or "start"
+        print(f"Cursor acked: {previous} → {result['cursor']}")
+
+
 def cmd_notify(args):
     """Send a system notification."""
     arguments = {
@@ -596,6 +669,28 @@ def main():
         help="Drop events below this signal level (server-side; replaces client denylists)",
     )
     p_events.set_defaults(func=cmd_events)
+
+    # ack
+    p_ack = subparsers.add_parser(
+        "ack", help="Advance the session cursor to an event id you already hold"
+    )
+    p_ack.add_argument(
+        "--cursor",
+        required=True,
+        help="Event id to mark as seen - the next_cursor from an --order asc peek "
+        "with no --channel/--event-types/--correlation-id (--min-level is safe)",
+    )
+    p_ack.add_argument(
+        "--session-id",
+        help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID, else $CLAUDE_CODE_SESSION_ID)",
+    )
+    p_ack.add_argument(
+        "--allow-rewind",
+        action="store_true",
+        help="Permit moving the cursor backwards to replay (refused by default)",
+    )
+    p_ack.add_argument("--json", action="store_true", help="Output the raw JSON result")
+    p_ack.set_defaults(func=cmd_ack)
 
     # notify
     p_notify = subparsers.add_parser("notify", help="Send system notification")

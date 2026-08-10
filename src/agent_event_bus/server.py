@@ -6,6 +6,7 @@ Provides tools for cross-session Claude Code communication:
 - list_channels: See channels with subscriber counts
 - publish_event: Broadcast events (auto-refreshes heartbeat)
 - get_events: Poll for new events (auto-refreshes heartbeat)
+- ack_events: Advance a session's cursor to an id it already holds
 - unregister_session: Clean up on exit
 - notify: Send system notifications
 - register_webhook: Register HTTP endpoint for push notifications
@@ -559,11 +560,11 @@ def _event_wire_dict(event: Event, *, id_key: str) -> dict:
     return d
 
 
-# (session_id, deleted_at) pairs already warned about, so an orphaned poller
+# (session_id, deleted_at, tool) triples already warned about, so an orphaned poller
 # hammering the bus every 5s contributes one WARNING rather than 100k of them.
 # Keyed on deleted_at too: a session that is revived and later deleted again is
 # a fresh incident and warns again. Bounded by the sessions table.
-_warned_deleted_sessions: set[tuple[str, str]] = set()
+_warned_deleted_sessions: set[tuple[str, str, str]] = set()
 
 
 def _load_polling_session(session_id: str | None) -> Session | None:
@@ -578,8 +579,12 @@ def _load_polling_session(session_id: str | None) -> Session | None:
     return storage.get_session(session_id, include_deleted=True)
 
 
-def _deleted_session_error(session: Session | None) -> dict | None:
+def _deleted_session_error(session: Session | None, tool: str = "get_events") -> dict | None:
     """Return an error dict if `session` is soft-deleted (#140).
+
+    `tool` only names the caller in the warning. Every session-scoped read
+    shares this one implementation rather than re-deriving the contract - a
+    second copy would drift on the response shape clients branch on.
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
@@ -598,16 +603,21 @@ def _deleted_session_error(session: Session | None) -> dict | None:
     deleted_at = session.deleted_at
     deleted_at_str = deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at)
 
-    warn_key = (session_id, deleted_at_str)
+    # `tool` is part of the key: a drain hook both polls and acks, and without
+    # it whichever call loses the race is silenced forever - the operator sees
+    # one get_events line and never learns the acks are failing too. Still
+    # bounded (sessions x deletions x tools), still not the 100k-line problem
+    # the set exists to prevent.
+    warn_key = (session_id, deleted_at_str, tool)
     if warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
         logger.warning(
-            f"get_events: rejecting polls from deleted session {session.display_id} "
+            f"{tool}: rejecting calls from deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
-            f"client is still polling. Further rejections are logged per-call by "
-            f"the request middleware."
+            f"client is still calling the bus. Further rejections are logged "
+            f"per-call by the request middleware."
         )
-        _dev_notify("get_events", f"deleted session polled: {session.display_id}")
+        _dev_notify(tool, f"deleted session call: {session.display_id}")
 
     return {
         "error": "Session deleted",
@@ -786,6 +796,160 @@ async def get_events(
         peek=peek,
         correlation_id=correlation_id,
         min_level=min_level,
+    )
+
+
+def _ack_events_impl(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
+    """Sync implementation of ack_events (runs in a worker thread)."""
+    session = _load_polling_session(session_id)
+    deleted = _deleted_session_error(session, tool="ack_events")
+    if deleted:
+        return deleted
+    if session is None:
+        return {"error": "Session not found", "session_id": session_id}
+
+    # Refreshed here, before the validation below, so "auto-refreshes
+    # heartbeat" holds for every call from a live session - the same point in
+    # the flow _get_events_impl refreshes at. An ack the server refuses is
+    # still the session saying it is alive.
+    _auto_heartbeat(session_id)
+
+    previous = session.last_cursor
+    tip = storage.get_cursor()
+
+    # What every refusal reports as `cursor`, and it has to be genuinely
+    # INERT to re-ack, not merely accepted.
+    #
+    # For a session that has never saved a cursor, NO id is both. "0" is
+    # lossless but persists, flipping the next resume from tip-relative to a
+    # full history replay. The tip is inert only if nothing was published
+    # between the peek and the ack - and it is read HERE, at ack time, so a
+    # publish in that window makes re-acking it commit events the session
+    # never saw. That is the loss this primitive exists to prevent, so the
+    # honest answer is that such a session has no position to restore: null.
+    # The resume path resolves a cursor-less session lazily (it initializes
+    # from the tip at resume time), and only leaving the field null preserves
+    # that. See guide.md - a null `cursor` means "re-ack the next_cursor your
+    # peek returned", NOT "fall back to a bare resume": a cursor-less resume
+    # initializes from the tip at resume time and would skip the same window.
+    position = previous
+
+    try:
+        target = int(cursor)
+    except (TypeError, ValueError):
+        return {
+            "error": f"Invalid cursor {cursor!r}: expected an event id",
+            "session_id": session_id,
+            "cursor": position,
+        }
+    if target < 0:
+        return {
+            "error": f"Invalid cursor {cursor!r}: must not be negative",
+            "session_id": session_id,
+            "cursor": position,
+        }
+
+    # Refuse to ack past the newest event. next_cursor never exceeds the tip,
+    # so a cursor beyond it did not come from a read - and honoring it would
+    # silently mark events that do not exist yet as seen, which is this API's
+    # worst failure mode: consumed but never surfaced.
+    # A bus with no events yet has no tip, and the only ackable position is 0.
+    # Treating "no tip" as "no ceiling" would let a fresh session ack past
+    # events that have not been published yet - the same loss, earlier.
+    if target > (int(tip) if tip else 0):
+        return {
+            "error": (
+                f"Cursor {cursor} is ahead of the newest event "
+                f"({tip if tip else 'none published yet'})"
+            ),
+            "session_id": session_id,
+            # `cursor` is ALWAYS the session's saved position, on every
+            # refusal - never the tip. It has one meaning ("where you are"),
+            # and re-acking it is safe whenever it is set; it is null for a
+            # session that has never acked, which is the block above.
+            # Handing back the tip here would make the one key a caller reads
+            # unconditionally a loaded gun: acking it commits the whole
+            # unsurfaced backlog, which is the exact loss this primitive
+            # exists to prevent.
+            "cursor": position,
+            # The ceiling, under its own name, for a caller that wants to
+            # clamp deliberately. Clamping is only safe if it has actually
+            # surfaced everything up to here.
+            "tip": tip,
+        }
+    # Keyed on `previous`, which is now exactly `position` - one notion of
+    # where the session is serves both the guard and what a refusal reports.
+    # A cursor-less session is deliberately unguarded: with no saved position
+    # nothing is behind, and a low ack only makes the bus RE-SERVE the events
+    # above it. That is a replay, the safe direction; the guard exists to stop
+    # loss, not to stop repetition (which allow_rewind exists to ask for).
+    #
+    # Advisory under concurrency, deliberately: `previous` is read outside the
+    # UPDATE, so two overlapping acks can both clear this on the same stale
+    # read and the lower one can land last. Left as is because the outcome is
+    # a re-serve rather than a drop - the ceiling above, which is the guard
+    # that prevents loss, cannot go the other way, since a concurrent publish
+    # only RAISES the tip and a stale tip read is therefore stricter, never
+    # looser. Making this atomic means folding it into update_session_cursor's
+    # WHERE, which would collapse "refused a rewind" and "lost the deletion
+    # race" into one False; worth doing only if a consumer ever acks the same
+    # session from two places at once.
+    if previous is not None and not allow_rewind:
+        try:
+            moving_backwards = target < int(previous)
+        except ValueError:
+            moving_backwards = False  # unparseable stored cursor: let the ack through
+        if moving_backwards:
+            return {
+                "error": (
+                    f"Cursor {cursor} is behind the session's current position "
+                    f"({previous}). Pass allow_rewind=true to replay deliberately."
+                ),
+                "session_id": session_id,
+                "cursor": position,
+            }
+
+    # str(target), not the raw cursor: int() accepts " 42 ", "+42" and "4_2",
+    # and the stored string is what surfaces again in previous_cursor, in
+    # list_sessions, and in the rewind rejection message. Persist the
+    # canonical form so those never read back as the caller's typing.
+    canonical = str(target)
+    if not storage.update_session_cursor(session_id, canonical):
+        # Lost a race with deletion between the load above and this write
+        # (the UPDATE is guarded by deleted_at IS NULL). Re-read so the caller
+        # gets the same shape a rejected poll gets, rather than a success the
+        # bus did not actually perform - cmd_ack exits non-zero on error
+        # precisely so a drain hook cannot mistake one for the other.
+        raced = _deleted_session_error(_load_polling_session(session_id), tool="ack_events")
+        return raced or {"error": "Session not found", "session_id": session_id}
+
+    _dev_notify("ack_events", f"{session.display_id} → {canonical}")
+    return {
+        "success": True,
+        "session_id": session_id,
+        "cursor": canonical,
+        "previous_cursor": previous,
+    }
+
+
+@mcp.tool()
+async def ack_events(session_id: str, cursor: str, allow_rewind: bool = False) -> dict:
+    """Advance a session's saved cursor to an event id it already holds.
+
+    Pairs with peek: peek with order="asc" and NO channel/event_types/
+    correlation_id filter, act, then ack that batch's next_cursor. Other
+    orderings or filters make next_cursor span events the peek never
+    returned, and acking it discards them. Auto-refreshes heartbeat.
+
+    A deleted session_id is refused with the same shape get_events returns.
+
+    Args:
+        session_id: Your session ID
+        cursor: Event id to mark as seen, e.g. next_cursor from a peek
+        allow_rewind: Permit moving the cursor backwards to replay (default: False)
+    """
+    return await _run_sync(
+        _ack_events_impl, session_id=session_id, cursor=cursor, allow_rewind=allow_rewind
     )
 
 

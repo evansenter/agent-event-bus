@@ -612,6 +612,127 @@ class TestCmdUnregisterErrorSurfacing:
         assert "Session not found" in captured.err
 
 
+def make_ack_args(**overrides):
+    """Namespace matching the ack subparser's output - keep in sync."""
+    defaults = dict(
+        cursor="42", session_id=None, allow_rewind=False, json=False, url=None, debug=False
+    )
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+class TestCmdAck:
+    """CLI wiring for ack_events (#134)."""
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_passes_session_and_cursor(self, mock_call, capsys):
+        mock_call.return_value = {"success": True, "cursor": "42", "previous_cursor": "30"}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+
+        mock_call.assert_called_once_with(
+            "ack_events", {"session_id": "abc123", "cursor": "42"}, url=None
+        )
+        assert "30 \u2192 42" in capsys.readouterr().out
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_first_ack_reads_as_start_not_a_dangling_arrow(self, mock_call, capsys):
+        """Same word `make logs` uses for this case - one event, one wording."""
+        mock_call.return_value = {"success": True, "cursor": "7", "previous_cursor": None}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+
+        assert "start \u2192 7" in capsys.readouterr().out
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_allow_rewind_is_only_sent_when_set(self, mock_call):
+        mock_call.return_value = {"success": True, "cursor": "42"}
+
+        cli.cmd_ack(make_ack_args(session_id="abc123"))
+        assert "allow_rewind" not in mock_call.call_args[0][1]
+
+        mock_call.reset_mock()
+        cli.cmd_ack(make_ack_args(session_id="abc123", allow_rewind=True))
+        assert mock_call.call_args[0][1]["allow_rewind"] is True
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_falls_back_to_the_session_id_env(self, mock_call, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_SESSION_ID", "env-session")
+        mock_call.return_value = {"success": True, "cursor": "42"}
+
+        cli.cmd_ack(make_ack_args(session_id=None))
+
+        assert mock_call.call_args[0][1]["session_id"] == "env-session"
+
+    def test_requires_a_session_id(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id=None))
+
+        assert exc.value.code == 1
+        assert "requires --session-id" in capsys.readouterr().err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_server_error_exits_nonzero(self, mock_call, capsys):
+        """A rejected ack must not look like a successful one - a drain hook
+        that ignores the exit code would re-serve or skip events."""
+        mock_call.return_value = {"error": "Cursor 999 is ahead of the newest event (5)"}
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id="abc123", cursor="999"))
+
+        assert exc.value.code == 1
+        assert "ahead of the newest event" in capsys.readouterr().err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_deleted_session_rejection_keeps_the_hint(self, mock_call, capsys):
+        """cmd_events prints the hint for this same #140 shape; dropping it
+        here would leave an operator debugging a swept drain hook with an exit
+        code and no next step - and make this the one place the shared
+        contract is not actually shared."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "hint": "This session was unregistered ... Call register_session or stop polling.",
+        }
+
+        with pytest.raises(SystemExit):
+            cli.cmd_ack(make_ack_args(session_id="gone"))
+
+        err = capsys.readouterr().err
+        assert "Session deleted" in err
+        assert "Call register_session or stop polling." in err
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_json_error_goes_to_stdout_like_cmd_events(self, mock_call, capsys):
+        """--json must carry the error dict, not just the exit code. A drain
+        hook consuming --json would otherwise get empty stdout and a jq parse
+        error instead of the session_deleted flag it branches on."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "hint": "Call register_session or stop polling.",
+        }
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_ack(make_ack_args(session_id="gone", json=True))
+
+        assert exc.value.code == 1
+        out = capsys.readouterr()
+        assert json.loads(out.out)["session_deleted"] is True
+        assert out.err == "", "--json puts the machine-readable form on stdout only"
+
+    def test_parser_wires_the_subcommand(self):
+        import sys
+
+        argv = ["cli", "ack", "--cursor", "77", "--session-id", "s1", "--allow-rewind"]
+        with patch.object(sys, "argv", argv):
+            with patch("agent_event_bus.cli.cmd_ack") as mock_cmd:
+                cli.main()
+                args = mock_cmd.call_args[0][0]
+
+        assert (args.cursor, args.session_id, args.allow_rewind) == ("77", "s1", True)
+
+
 class TestCmdNotify:
     """Tests for notify command."""
 

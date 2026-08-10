@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -17,6 +18,7 @@ register_session = server._register_session_impl
 list_sessions = server._list_sessions_impl
 publish_event = server._publish_event_impl
 get_events = server._get_events_impl
+ack_events = server._ack_events_impl
 unregister_session = server._unregister_session_impl
 
 
@@ -1637,3 +1639,460 @@ class TestDeletedSessionPolling:
         assert len(rejections) == 1
         # display_id is what an operator greps the request log for
         assert reg["display_id"] in rejections[0].message
+
+
+class TestAckEvents:
+    """ack_events: advance the cursor to an id the caller already holds (#134).
+
+    Exists because a bounded consume cannot bound anything under a server-side
+    filter: min_level filters the returned view while the cursor advances over
+    the raw batch, so "consume the N I just saw" advances past a different
+    window than the peek saw - events consumed but never surfaced. Peek and
+    ack name the same window by construction.
+    """
+
+    def _session(self, name="acker"):
+        return register_session(name=name, client_id=f"{name}-client")["session_id"]
+
+    def test_advances_the_saved_cursor(self):
+        sid = self._session()
+        published = publish_event(event_type="e", payload="one")
+
+        result = ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert result["success"] is True
+        assert result["cursor"] == str(published["event_id"])
+        assert server.storage.get_session(sid).last_cursor == str(published["event_id"])
+
+    def test_peek_then_ack_makes_progress_under_min_level(self):
+        """The whole point, end to end: a non-consuming filtered read followed
+        by an ack of its next_cursor leaves nothing unseen and nothing
+        re-served. This is the flow a drain hook cannot express today."""
+        sid = self._session("drain")
+        get_events(session_id=sid, resume=True, order="asc")  # establish cursor at tip
+        publish_event(event_type="session_registered", payload="noise")  # lifecycle
+        publish_event(event_type="help_needed", payload="signal")  # actionable
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, min_level="actionable", order="asc"
+        )
+        assert [e["payload"] for e in peeked["events"]] == ["signal"]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        # Everything the peek's RAW window covered is now seen - the lifecycle
+        # noise included, which is the point of a server-side noise policy.
+        assert get_events(session_id=sid, resume=True, order="asc")["events"] == []
+
+    def test_rejects_a_cursor_ahead_of_the_newest_event(self):
+        """Honoring it would mark events that do not exist yet as seen - the
+        consumed-but-never-surfaced failure this primitive exists to prevent."""
+        sid = self._session("ahead")
+        publish_event(event_type="e", payload="one")
+
+        result = ack_events(session_id=sid, cursor="999999")
+
+        assert "ahead of the newest event" in result["error"]
+        assert server.storage.get_session(sid).last_cursor != "999999"
+
+    def test_refuses_to_rewind_by_default(self):
+        sid = self._session("rewind")
+        first = publish_event(event_type="e", payload="one")
+        second = publish_event(event_type="e", payload="two")
+        ack_events(session_id=sid, cursor=str(second["event_id"]))
+
+        result = ack_events(session_id=sid, cursor=str(first["event_id"]))
+
+        assert "behind the session's current position" in result["error"]
+        assert server.storage.get_session(sid).last_cursor == str(second["event_id"])
+
+    def test_allow_rewind_replays_deliberately(self):
+        sid = self._session("replay")
+        first = publish_event(event_type="e", payload="one")
+        second = publish_event(event_type="e", payload="two")
+        ack_events(session_id=sid, cursor=str(second["event_id"]))
+
+        result = ack_events(session_id=sid, cursor=str(first["event_id"]), allow_rewind=True)
+
+        assert result["success"] is True
+        replayed = get_events(session_id=sid, resume=True, order="asc")
+        assert [e["payload"] for e in replayed["events"]] == ["two"]
+
+    def test_acking_refreshes_the_heartbeat(self):
+        """Acking is session activity. A consumer that only acks must not be
+        swept as stale out from under itself."""
+        from datetime import timedelta
+
+        sid = self._session("heartbeat")
+        published = publish_event(event_type="e", payload="one")
+        stale = datetime.now() - timedelta(hours=12)
+        server.storage.update_heartbeat(sid, stale)
+
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert server.storage.get_session(sid).last_heartbeat > stale
+
+    def test_rejects_a_non_numeric_cursor(self):
+        sid = self._session("garbage")
+        result = ack_events(session_id=sid, cursor="not-an-id")
+
+        assert "Invalid cursor" in result["error"]
+        assert server.storage.get_session(sid).last_cursor is None
+
+    def test_unknown_session_is_a_plain_not_found(self):
+        result = ack_events(session_id="never-registered", cursor="1")
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_deleted_session_is_rejected_like_a_poll(self):
+        """Shares get_events' deleted-session contract rather than inventing a
+        second one - a drain hook acking against a session that ended gets the
+        same shape, hint included, that its polls already get (#140)."""
+        sid = self._session("gone")
+        server.storage.delete_session(sid)
+
+        result = ack_events(session_id=sid, cursor="1")
+
+        assert result["session_deleted"] is True
+        assert result["error"] == "Session deleted"
+        assert "hint" in result and result["display_id"]
+
+    def test_rejects_any_positive_cursor_on_a_bus_with_no_events(self, tmp_path):
+        """The ahead-of-tip guard must not be inert on a fresh bus. With no
+        events, get_cursor() is None; treating that as "no ceiling" would let a
+        session ack past events that have not been published yet.
+
+        Runs against its own empty database: the suite shares one DB and never
+        deletes events, so ids only ever climb.
+        """
+        fresh = SQLiteStorage(db_path=str(tmp_path / "empty.db"))
+        now = datetime.now()
+        fresh.add_session(
+            Session(
+                id="fresh-session",
+                display_id="fresh-dino",
+                name="fresh",
+                machine="remote-host",
+                cwd="/x",
+                repo="x",
+                registered_at=now,
+                last_heartbeat=now,
+            )
+        )
+
+        with patch.object(server, "storage", fresh):
+            assert fresh.get_cursor() is None, "precondition: no events exist"
+            result = ack_events(session_id="fresh-session", cursor="5")
+
+        assert "ahead of the newest event" in result["error"]
+        assert "none published yet" in result["error"]
+        assert fresh.get_session("fresh-session").last_cursor is None
+
+    def test_reports_failure_if_the_session_dies_mid_ack(self):
+        """update_session_cursor is guarded by deleted_at IS NULL, so a
+        deletion racing the write makes the ack a no-op. Returning success for
+        a write the bus did not perform would break the one contract cmd_ack
+        relies on to exit non-zero."""
+        sid = self._session("raced")
+        published = publish_event(event_type="e", payload="one")
+        real_update = server.storage.update_session_cursor
+
+        def delete_then_update(session_id, cursor):
+            server.storage.delete_session(session_id)
+            return real_update(session_id, cursor)
+
+        with patch.object(server.storage, "update_session_cursor", delete_then_update):
+            result = ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        assert "success" not in result
+        assert result["session_deleted"] is True
+
+
+class TestAckOrderingHazard:
+    """Peeking at the default order="desc" makes an ack lose events.
+
+    Not a defect in ack_events - it cannot know how the peek was ordered - but
+    the reason guide.md's example specifies order="asc" and says why. Pinned
+    here so the hazard survives as executable knowledge rather than prose
+    someone edits away.
+    """
+
+    def test_desc_peek_then_ack_discards_the_unsurfaced_backlog(self):
+        reg = register_session(name="hazard", client_id="hazard-client")
+        sid = reg["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        for i in range(1, 21):
+            publish_event(event_type="help_needed", payload=f"event-{i}")
+
+        # The wrong way: default order (desc) returns the NEWEST slice while
+        # next_cursor is still the tip.
+        peeked = get_events(session_id=sid, resume=True, peek=True, limit=5)
+        assert [e["payload"] for e in peeked["events"]] == [
+            f"event-{i}" for i in (20, 19, 18, 17, 16)
+        ]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        remaining = get_events(session_id=sid, resume=True, order="asc")["events"]
+        assert remaining == [], "the 15 never-surfaced events are gone - permanently"
+
+    def test_asc_peek_then_ack_surfaces_everything_it_commits(self):
+        """The documented way: the ack covers exactly what the peek returned."""
+        reg = register_session(name="safe", client_id="safe-client")
+        sid = reg["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        for i in range(1, 21):
+            publish_event(event_type="help_needed", payload=f"event-{i}")
+
+        surfaced = []
+        while True:
+            peeked = get_events(session_id=sid, resume=True, peek=True, limit=5, order="asc")
+            if not peeked["events"]:
+                break
+            surfaced += [e["payload"] for e in peeked["events"]]
+            ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        assert surfaced == [f"event-{i}" for i in range(1, 21)], "nothing lost, nothing repeated"
+
+
+class TestAckNormalizesAndReportsConsistently:
+    """Round-2 polish, pinned: what gets stored and what gets promised."""
+
+    def _session(self, name):
+        return register_session(name=name, client_id=f"{name}-client")["session_id"]
+
+    def test_persists_the_canonical_cursor_not_the_caller_typing(self):
+        """int() accepts " 42 ", "+42" and "4_2". The stored string surfaces
+        again in previous_cursor, list_sessions, and the rewind rejection
+        message, so it must not read back as whatever the caller typed."""
+        sid = self._session("canonical")
+        publish_event(event_type="e", payload="one")
+        published = publish_event(event_type="e", payload="two")
+        target = published["event_id"]
+
+        result = ack_events(session_id=sid, cursor=f" +{target} ")
+
+        assert result["cursor"] == str(target)
+        assert server.storage.get_session(sid).last_cursor == str(target)
+
+        # ...and the rewind message quotes the canonical form back
+        rewound = ack_events(session_id=sid, cursor=str(target - 1))
+        assert f"({target})" in rewound["error"]
+
+    def test_heartbeat_refreshes_even_when_the_ack_is_refused(self):
+        """The docstring promises "auto-refreshes heartbeat" unqualified, and
+        _get_events_impl refreshes before its own checks. A refused ack is
+        still the session saying it is alive."""
+        from datetime import timedelta
+
+        sid = self._session("refused-hb")
+        publish_event(event_type="e", payload="one")
+        stale = datetime.now() - timedelta(hours=12)
+        server.storage.update_heartbeat(sid, stale)
+
+        refused = ack_events(session_id=sid, cursor="999999")
+
+        assert "error" in refused
+        assert server.storage.get_session(sid).last_heartbeat > stale
+
+
+class TestAckNarrowingHazard:
+    """Acking a SQL-narrowed peek loses the non-matching events beneath it.
+
+    The two filter kinds sit on opposite sides of the cursor bookkeeping, and
+    only one of them is safe to ack. Pinned here because the difference is
+    invisible in the response - both return events and a next_cursor - and is
+    the reason get_events refuses to advance the cursor on narrowed reads at
+    all. ack_events hands that decision back to the caller.
+    """
+
+    def _prepared(self, name):
+        sid = register_session(name=name, client_id=f"{name}-c")["session_id"]
+        get_events(session_id=sid, resume=True, order="asc")
+        return sid
+
+    def test_event_types_peek_then_ack_buries_the_non_matches(self):
+        sid = self._prepared("narrowed")
+        for i in range(1, 11):
+            publish_event(event_type="help_needed" if i in (3, 7) else "note", payload=f"event-{i}")
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, event_types=["help_needed"], order="asc"
+        )
+        assert [e["payload"] for e in peeked["events"]] == ["event-3", "event-7"]
+
+        ack_events(session_id=sid, cursor=peeked["next_cursor"])
+
+        remaining = [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ]
+        assert remaining == ["event-8", "event-9", "event-10"]
+        for buried in ("event-1", "event-2", "event-4", "event-5", "event-6"):
+            assert buried not in remaining, "committed without ever being surfaced"
+
+    def test_min_level_peek_next_cursor_is_the_raw_tip(self):
+        """The safe half of the same table: min_level filters AFTER cursor
+        bookkeeping, so its next_cursor spans the raw window and acking it is
+        correct - the hidden noise is meant to count as seen."""
+        sid = self._prepared("levelled")
+        published = [
+            publish_event(event_type="note" if i else "help_needed", payload=f"e{i}")
+            for i in range(3)
+        ]
+        tip = str(max(p["event_id"] for p in published))
+
+        peeked = get_events(
+            session_id=sid, resume=True, peek=True, min_level="actionable", order="asc"
+        )
+
+        assert [e["payload"] for e in peeked["events"]] == ["e0"]
+        assert peeked["next_cursor"] == tip, "spans the raw batch, not the filtered view"
+
+
+class TestAckRejectionShape:
+    """Round-4 polish: what a caller can read off a refusal, and what an
+    operator can read off the log."""
+
+    def _session(self, name):
+        return register_session(name=name, client_id=f"{name}-c")["session_id"]
+
+    def test_cursor_on_a_refusal_is_always_the_session_position(self):
+        """`cursor` must mean one thing on every refusal: where you are.
+
+        The earlier version returned the TIP on the ahead-of-tip refusal, and
+        a caller following "read cursor unconditionally to recover" would ack
+        it and commit the entire unsurfaced backlog. This test deliberately
+        leaves the position BEHIND the tip - with them equal (the shape the
+        first version of this test had) the divergence is invisible.
+        """
+        sid = self._session("shape")
+        ids = [publish_event(event_type="e", payload=f"e{i}")["event_id"] for i in range(5)]
+        ack_events(session_id=sid, cursor=str(ids[0]))
+        position, tip = str(ids[0]), str(ids[-1])
+        assert position != tip, "precondition: the two candidate values must differ"
+
+        ahead = ack_events(session_id=sid, cursor="999999")
+        behind = ack_events(session_id=sid, cursor="0")
+
+        assert ahead["cursor"] == position, "not the tip - acking that loses e1..e4"
+        assert behind["cursor"] == position
+        assert ahead["tip"] == tip, "the ceiling is available, under its own name"
+        assert "next_cursor" not in ahead
+
+    def test_recovering_by_the_documented_key_loses_nothing(self):
+        """The property the key exists for: a client that re-acks `cursor`
+        after any refusal is exactly where it started."""
+        sid = self._session("recover")
+        ids = [publish_event(event_type="e", payload=f"e{i}")["event_id"] for i in range(5)]
+        ack_events(session_id=sid, cursor=str(ids[0]))
+
+        refusal = ack_events(session_id=sid, cursor="999999")
+        ack_events(session_id=sid, cursor=refusal["cursor"])
+
+        still_pending = [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ]
+        assert still_pending == ["e1", "e2", "e3", "e4"], "recovery must not consume anything"
+
+    def test_every_refusal_reports_a_re_ackable_position(self):
+        """The guide says recovery needs no branching on which refusal you
+        got. That has to hold for ALL of them - the malformed-cursor branches
+        omitted `cursor` entirely, so a hook acking a jq artifact and then
+        following the documented recovery got a KeyError instead."""
+        sid = self._session("exceptionless")
+        published = publish_event(event_type="e", payload="one")
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+        position = str(published["event_id"])
+        # Move the tip past the session so `position` and the tip are distinct
+        # values - acked-at-the-tip lets a `cursor: tip` bug pass unnoticed.
+        publish_event(event_type="e", payload="two")
+        assert server.storage.get_cursor() != position, "precondition: position is behind the tip"
+
+        refusals = [
+            ack_events(session_id=sid, cursor="not-an-id"),
+            ack_events(session_id=sid, cursor="-3"),
+            ack_events(session_id=sid, cursor="999999"),
+            ack_events(session_id=sid, cursor="0"),
+        ]
+
+        for refusal in refusals:
+            assert "error" in refusal
+            assert refusal["cursor"] == position, f"no position on: {refusal['error']}"
+            # ...and the reported position is genuinely re-ackable
+            assert ack_events(session_id=sid, cursor=refusal["cursor"])["success"] is True
+
+    def test_a_cursor_less_session_is_told_it_has_no_position_to_restore(self):
+        """The never-acked path, pinned at the same strength as the acked one.
+
+        A peek-only drain never persists a cursor, and no concrete id is both
+        inert and lossless for it: "0" persists and flips the next resume from
+        tip-relative to a full-history replay, while the tip is read at ACK
+        time - so a publish between the peek and the refused ack makes
+        re-acking it commit events that were never surfaced. Both were shipped
+        and both were wrong, so this pins the race directly: events arrive in
+        the window, and following the documented recovery must still surface
+        them.
+        """
+        publish_event(event_type="note", payload="before-the-peek")
+        sid = self._session("peek-only")
+
+        # A peek-only drain reads the bus WITHOUT persisting a cursor.
+        peeked = get_events(session_id=sid, resume=True, peek=True, order="asc")
+        assert server.storage.get_session(sid).last_cursor is None, "precondition: cursor-less"
+
+        # The window the tip-at-ack-time answer lost: published after the peek
+        # saw the bus, before the refusal names a position.
+        after = publish_event(event_type="note", payload="arrived-after-the-peek")
+        assert int(peeked["next_cursor"]) < after["event_id"]
+
+        refusal = ack_events(session_id=sid, cursor="not-an-id")
+        assert refusal["cursor"] is None, "no saved position - naming one freezes the tip early"
+
+        # The documented recovery is the peek's own next_cursor, which the
+        # caller still holds. It commits exactly the surfaced window...
+        assert ack_events(session_id=sid, cursor=peeked["next_cursor"])["success"] is True
+        pending = [
+            e["payload"] for e in get_events(session_id=sid, resume=True, order="asc")["events"]
+        ]
+        # ...leaving the later arrival pending rather than consumed unseen.
+        assert pending == ["arrived-after-the-peek"]
+
+    def test_a_deliberate_rewind_to_zero_still_replays(self):
+        """The position fix must not disturb allow_rewind: acking 0 on purpose
+        is the documented way to replay from the beginning."""
+        sid = self._session("deliberate")
+        published = publish_event(event_type="note", payload="history")
+        ack_events(session_id=sid, cursor=str(published["event_id"]))
+
+        ack_events(session_id=sid, cursor="0", allow_rewind=True)
+
+        assert server.storage.get_session(sid).last_cursor == "0"
+        # Reading from the beginning again, not from the acked position. Asserted
+        # by id rather than payload: the suite shares one events table, so the
+        # replay's first page starts well before this test's own events.
+        replayed = get_events(session_id=sid, resume=True, order="asc")["events"]
+        assert replayed and replayed[0]["id"] < published["event_id"]
+
+    def test_each_tool_warns_once_for_the_same_dead_session(self, caplog, monkeypatch):
+        """A drain hook both polls and acks. Keyed without `tool`, whichever
+        call warned first would silence the other forever, and the operator
+        would never learn the acks are failing too."""
+        import logging
+
+        sid = self._session("both")
+        server.storage.delete_session(sid)
+        # setattr, not .clear(): pytest unwinds this, so the isolation does not
+        # depend on nothing downstream caring what the real set holds. Same
+        # form TestDeletedSessionPolling uses for the same global.
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            get_events(session_id=sid, resume=True, order="asc")
+            get_events(session_id=sid, resume=True, order="asc")  # deduped
+            ack_events(session_id=sid, cursor="1")
+            ack_events(session_id=sid, cursor="1")  # deduped
+
+        warned = [r.message for r in caplog.records if "rejecting calls" in r.message]
+        assert len(warned) == 2, f"one line per tool, deduped within each: {warned}"
+        assert any(m.startswith("get_events:") for m in warned)
+        assert any(m.startswith("ack_events:") for m in warned)

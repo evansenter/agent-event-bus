@@ -111,6 +111,65 @@ class TestFormatList:
         assert "2 items" in result
 
 
+class TestAckLogsTheCursorMove:
+    """An ack's whole observable effect is the cursor move.
+
+    The success dict carries session_id, so the generic session branch would
+    swallow it and every ack would log as `session=brave-trex` - the same
+    shape-swallowing that hid #140's errors, in the one tool where the moved
+    value IS the event worth logging.
+    """
+
+    def _plain(self, result):
+        import re
+
+        return re.sub(r"\033\[[0-9;]*m", "", _format_result(result))
+
+    def test_shows_the_movement_not_the_session(self):
+        out = self._plain(
+            {
+                "success": True,
+                "session_id": "drain-1",
+                "cursor": "55",
+                "previous_cursor": "42",
+            }
+        )
+        assert out == "cursor 42 → 55"
+
+    def test_first_ack_names_the_starting_point(self):
+        out = self._plain(
+            {"success": True, "session_id": "d", "cursor": "7", "previous_cursor": None}
+        )
+        assert out == "cursor start → 7"
+
+    def test_a_refused_ack_still_logs_as_an_error(self):
+        """The error branch stays above this one."""
+        out = self._plain(
+            {"error": "Cursor 9 is ahead of the newest event (5)", "session_id": "d", "cursor": "5"}
+        )
+        assert out.startswith("ERROR:")
+
+
+class TestToolColorRoster:
+    """The color map is keyed by tool name, so a rename silently drops a tool
+    into the default green - a log-legibility regression no test would catch.
+    The MCP registry itself is pinned this way in test_hardening.py; this
+    closes the same gap one layer down."""
+
+    def test_every_colored_tool_is_a_registered_tool(self):
+        """One direction only, deliberately. The reverse - every tool has a
+        color - is not the contract: most tools belong in the default bucket,
+        and only the category (write / read / everything else) decides. So
+        this cannot catch the omission that actually happened, ack_events
+        sitting in green until it was noticed by eye; nothing here should be
+        read as evidence the map is fully covered."""
+        from agent_event_bus.middleware import _TOOL_COLORS
+        from conftest import registered_tools
+
+        unknown = set(_TOOL_COLORS) - {t.name for t in registered_tools()}
+        assert not unknown, f"_TOOL_COLORS names tools that do not exist: {sorted(unknown)}"
+
+
 class TestFormatResult:
     """Tests for _format_result function."""
 

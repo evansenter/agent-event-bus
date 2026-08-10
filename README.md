@@ -66,6 +66,7 @@ Ensure `~/.local/bin` is in PATH: `export PATH="$HOME/.local/bin:$PATH"`
 | `list_channels` | List channels with subscriber counts |
 | `publish_event` | Publish event to channel |
 | `get_events` | Poll for events (use `resume=True` for incremental) |
+| `ack_events` | Mark events seen up to an id you already hold (pairs with `peek`) |
 | `unregister_session` | Clean up on exit |
 | `notify` | System notification |
 | `register_webhook` | Register HTTP endpoint for push notifications |

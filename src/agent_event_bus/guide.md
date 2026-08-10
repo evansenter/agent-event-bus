@@ -18,6 +18,7 @@ CC sessions (e.g., in separate terminals or worktrees), this MCP server lets ses
 | `list_channels()` | See active channels |
 | `publish_event(type, payload, channel?, correlation_id?, ...)` | Send event |
 | `get_events(session_id?, resume?, order?, event_types?, min_level?)` | Poll for events |
+| `ack_events(session_id, cursor)` | Mark events seen up to an id you already hold |
 | `unregister_session(session_id?)` | Clean up on exit |
 | `notify(title, message, sound?)` | System notification |
 | `register_webhook(url, channel?, event_types?, secret?)` | Register HTTP endpoint for push notifications |
@@ -166,6 +167,140 @@ get_events(session_id=session_id, resume=True, peek=True)
 get_events(session_id=session_id, resume=True, order="asc")
 ```
 CLI: `agent-event-bus-cli events --session-id ID --resume --peek`
+
+### Acking (peek, act, then commit)
+
+`ack_events(session_id, cursor)` sets your saved cursor to an event id you
+already hold. It exists because **a bounded consume cannot bound anything
+under a server-side filter**: `min_level` filters the events you get back,
+but the cursor advances over the *raw* batch behind them. "Consume the N I
+just saw" therefore advances past a different window than the peek showed —
+which is how events get consumed but never surfaced.
+
+Peek and ack name the same window by construction, because the ack uses the
+cursor the peek returned:
+
+```
+# A pass drains at most `limit` (default 50), so re-peek until has_more is
+# false to clear a backlog in one invocation. The peek has to happen INSIDE
+# the loop - the ack moves the cursor, so the next pass is a fresh window.
+while True:
+    # 1. Peek: see what's pending, cursor untouched. order="asc" is REQUIRED
+    #    here - see the warning below.
+    pending = get_events(session_id=sid, resume=True, peek=True,
+                         min_level="actionable", order="asc")
+
+    # 2. Bail on a refusal before indexing anything else. A session deleted
+    #    or timed out mid-drain FAILS the poll rather than returning an empty
+    #    batch (see below), and looping holds that window open for the whole
+    #    backlog rather than just one pass.
+    if "error" in pending:
+        # Say so - breaking silently reads exactly like a clean drain, and
+        # `hint` is the actionable half ("re-register or stop polling").
+        log(pending["error"], pending.get("hint"))
+        break
+
+    # 3. Act on pending["events"] - surface them, wake something, whatever
+
+    # 4. Ack exactly what step 1 covered - but only if there was anything.
+    #    On a bus with no events at all next_cursor is null, and acking null
+    #    is an error, not a no-op.
+    if pending["next_cursor"]:
+        ack_events(session_id=sid, cursor=pending["next_cursor"])
+        → {success: true, cursor: "55", previous_cursor: "42"}
+
+    # 5. has_more, NOT pending["events"]. has_more counts the RAW batch, before
+    #    min_level filters it, so a pass of 50 lifecycle events returns
+    #    events: [] with has_more: true. Breaking on "nothing surfaced" would
+    #    exit with that noise un-acked and re-peek the same window next run.
+    if not pending["has_more"]:
+        break
+```
+
+Everything in the peek's raw window is now seen, filtered-out noise included
+— which is the point of a server-side noise policy.
+
+> **An ack is only as bounded as the peek that produced it.** Two things break
+> the pairing, and both cost you events:
+>
+> **1. Ordering.** Always peek with `order="asc"`. Under the default `desc` the
+> batch is the *newest* slice while `next_cursor` is still the tip, so acking it
+> marks every older event as seen — including the ones the peek never returned.
+> Measured: a 20-event backlog peeked at `limit=5` under `desc` surfaces 5 and
+> silently loses the other 15.
+>
+> **2. Which filter you narrowed with.** Only ack a peek that was unfiltered or
+> filtered by `min_level`. The two filter kinds are applied on opposite sides of
+> the cursor bookkeeping:
+>
+> | Filter | Applied | `next_cursor` is | Safe to ack? |
+> |---|---|---|---|
+> | `min_level` | after bookkeeping | the **raw** batch max | **Yes** — the hidden noise counts as seen, deliberately |
+> | `channel`, `event_types`, `correlation_id` | in SQL, before | the **matched** batch max | **No** — commits every lower-id non-match |
+>
+> Measured: events 1-10 pending with only 3 and 7 matching, a peek with
+> `event_types=["help_needed"]` returns those two and `next_cursor: 8` — acking
+> it marks 1, 2, 4, 5 and 6 seen without ever surfacing them. This is precisely
+> the loss `get_events` refuses to perform on its own, which is why narrowed
+> reads are non-consuming; `ack_events` hands that decision back to you.
+
+Refused, rather than silently honored:
+- a cursor that **isn't an event id** — `Invalid cursor ...: expected an event
+  id`, for the string `null`, empty, or anything else that won't parse; the
+  one a `jq -r` artifact lands on
+- a **negative** cursor — parses, so it gets its own `Invalid cursor ...: must
+  not be negative`. Both of these are checked before any position check
+- a cursor **ahead of the newest event** — it would mark events that don't
+  exist yet as seen
+- a cursor **behind your current position** — pass `allow_rewind=True` to
+  replay deliberately
+- an ack from a **deleted session** — same error shape as a poll, see below
+- an ack from a **session id that never registered** — a plain
+  `{error: "Session not found", session_id}`
+
+The **cursor** refusals — the first four bullets — all tell you where you
+are the same way, so recovery does not branch on which of them you got, only
+on whether you have ever acked: re-ack `cursor` when it is set, and when it
+is `null` re-ack your own peek's `next_cursor` instead (see below).
+
+The last two bullets are the **session** refusals, and neither carries a
+`cursor` key at all: there is no position to return to, because there is no
+session. Both recover through `register_session` — the deleted one says so in
+its `hint`. Reading `cursor` unconditionally on a refusal will `KeyError` on
+these two, so branch on `error` first.
+
+```
+ack_events(session_id=sid, cursor="999999")
+→ {
+    error: "Cursor 999999 is ahead of the newest event (55)",
+    session_id: "my-id",
+    cursor: "42",     # YOUR position - safe to re-ack whenever it is set
+    tip: "55"         # ahead-of-tip only: the ceiling, if you mean to clamp
+  }
+```
+
+`cursor` means the same thing on every refusal: your **saved** position, never
+the tip. Clamping to `tip` is only safe if you have actually surfaced
+everything up to it.
+
+`cursor` is `null` when you have never acked — you have no saved position, so
+there is nothing for the server to hand back. Recover with the `next_cursor`
+your peek returned: you still hold it, and it is the only value that names
+the window you actually surfaced. The server deliberately does not substitute
+the tip here, because it would read it at *ack* time — anything published
+between your peek and your ack would be committed without ever being shown.
+
+Don't fall back to a bare `resume=True` instead. A cursor-less session's
+resume initializes from the tip *at that moment*, so it skips whatever
+arrived after your peek — the same loss by a different route. That is why the
+loop above acks on every pass: the first successful ack is what makes your
+position durable.
+
+A deleted-session refusal adds `session_deleted: true` and a `hint` (see
+below).
+
+CLI: `agent-event-bus-cli ack --session-id ID --cursor 55 [--allow-rewind]`.
+Refusals exit non-zero; `--json` prints the error object above to stdout.
 
 ### Deleted sessions
 
