@@ -27,7 +27,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
 | Bridge hook-lock dir | `$XDG_RUNTIME_DIR/agent-event-bus-bridge-<uid>/`, else the system temp dir (`$TMPDIR`, or `/tmp` when unset; macOS: per-user `/var/folders/.../T`) - zero-byte, uid-scoped `hook.<hash>.lock` files, machine-scoped so a same-URL double-start refuses regardless of `$HOME`. Create-and-verified private (not adopted). Safe to remove when no bridge is running |
 
-**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_BRIDGE_LOG`, `_BRIDGE_ERR`, `_WAKE_DIR`).
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`, `_LOG_PEER`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_BRIDGE_LOG`, `_BRIDGE_ERR`, `_WAKE_DIR`).
 One consulted variable is deliberately outside the prefix: **`CLAUDE_CODE_SESSION_ID`**, which the CLI reads as a session-attribution fallback when `--session-id` and `AGENT_EVENT_BUS_SESSION_ID` are both absent (#137).
 
 ---
@@ -188,15 +188,33 @@ AGENT_EVENT_BUS_DB=/path/to/db.sqlite agent-event-bus
 # them first) — bare shell assignments below will NOT apply at install time.
 AGENT_EVENT_BUS_LOG=/path/to/custom.log AGENT_EVENT_BUS_ERR=/path/to/custom.err make install-server
 
-# Dev mode console logging. Also appends the caller's peer address to the
-# `register_session` log line (#145) - `register_session(...) → session=x
-# from 127.0.0.1:54321`. Off outside DEV_MODE: this is instrumentation for
-# "which process is registering?", not a permanent log line. The PORT is the
-# identifying half (the bus is loopback/tailnet, so the address says
-# nothing); map it to a PID with `lsof -i :54321` while the calls are live.
-# Only register_session carries it - get_events runs every few seconds per
-# session and would drown the log you are reading.
+# Dev mode console logging (also turns on peer logging below)
 DEV_MODE=1 agent-event-bus
+
+# "Which process is registering?" (#145). Appends the caller's peer to the
+# register_session log line:
+#     register_session(name="x") → session=brave-trex from 127.0.0.1:54321
+# Then, while the calls are live: `lsof -i :54321`. The PORT is the
+# identifying half of a DIRECT connection - the bus listens on loopback, so
+# the address alone rarely narrows anything.
+#
+# Prefer this over DEV_MODE=1 for a live diagnosis: DEV_MODE also fires a
+# desktop notification per tool call (_dev_notify) and drops the logger to
+# DEBUG, so on a host with the #145 churn you would take ~1.5 notifications
+# per minute for as long as you watch. This variable turns on peer logging
+# alone. Both work; neither is on by default - it is instrumentation, not a
+# permanent log line.
+#
+# Only register_session carries it: get_events runs every few seconds per
+# session and would drown the log you are reading it from.
+#
+# CAVEAT - `tailscale serve`: a proxied request is terminated by the LOCAL
+# tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled
+# while the real caller is somewhere on the tailnet. Those lines are marked
+# `from 127.0.0.1:54321 via tailscale` (Tailscale's identity header is the
+# only thing in the ASGI scope that distinguishes them). An unmarked
+# loopback peer is a genuinely local process.
+AGENT_EVENT_BUS_LOG_PEER=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)
 AGENT_EVENT_BUS_ICON=/path/to/icon.png agent-event-bus

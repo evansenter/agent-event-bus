@@ -631,6 +631,35 @@ class TestTailscaleAuthMiddleware:
         assert responses[0]["status"] == 200
 
     @pytest.mark.asyncio
+    async def test_explicit_null_client_does_not_raise(self, mock_app):
+        """A unix-socket scope carries client=None, and subscripting the
+        .get default raised TypeError here - a 500 on every request, before
+        any handler ran. It must fall through to the header check like any
+        other untrusted peer instead."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "client": None,
+            "headers": [(b"tailscale-user-login", b"user@example.com")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        assert mock_app.called
+        assert responses[0]["status"] == 200
+
+    @pytest.mark.asyncio
     async def test_rejects_request_without_tailscale_header(self, mock_app):
         """Requests without Tailscale-User-Login header get 401."""
         middleware = TailscaleAuthMiddleware(mock_app)
@@ -812,7 +841,7 @@ class TestLoggingOffLoop:
 
 
 class TestPeerLogging:
-    """DEV_MODE-gated peer address/port on register_session (#145).
+    """Opt-in peer address/port on register_session (#145).
 
     Instrumentation, not a permanent log line: something registers and
     immediately unregisters a session ~1.5x/min on the bus host and nothing
@@ -820,7 +849,15 @@ class TestPeerLogging:
     it is what `lsof -i` maps back to a PID.
     """
 
-    def _run(self, monkeypatch, tool_name="register_session", scope_extra=None, dev_mode=True):
+    def _run(
+        self,
+        monkeypatch,
+        tool_name="register_session",
+        scope_extra=None,
+        dev_mode=True,
+        log_peer=False,
+        arguments=None,
+    ):
         """Drive one MCP tool call through the middleware, return the log line."""
         import asyncio
         import json
@@ -831,6 +868,10 @@ class TestPeerLogging:
             monkeypatch.setenv("DEV_MODE", "1")
         else:
             monkeypatch.delenv("DEV_MODE", raising=False)
+        if log_peer:
+            monkeypatch.setenv("AGENT_EVENT_BUS_LOG_PEER", "1")
+        else:
+            monkeypatch.delenv("AGENT_EVENT_BUS_LOG_PEER", raising=False)
         monkeypatch.setattr(mw, "_lookup_session_display_id", lambda sid: None)
 
         lines = []
@@ -851,7 +892,10 @@ class TestPeerLogging:
         request_body = json.dumps(
             {
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": {"name": "evansenter"}},
+                "params": {
+                    "name": tool_name,
+                    "arguments": {"name": "evansenter"} if arguments is None else arguments,
+                },
             }
         ).encode()
 
@@ -915,3 +959,52 @@ class TestPeerLogging:
 
         assert "from unknown peer" in line
         assert "register_session" in line
+
+    def test_the_no_args_log_branch_carries_the_peer_too(self, monkeypatch):
+        """session_id is filtered out of the args (it becomes the caller
+        prefix), so a call carrying only that renders through the OTHER
+        logger.info branch. Both have to append the peer or the diagnosis
+        silently depends on which arguments the culprit happens to send."""
+        line = self._run(monkeypatch, arguments={"session_id": "abc-123"})
+
+        # Empty parens: the args branch never renders these (session_id was
+        # the only argument, and it is filtered into the caller prefix)
+        assert "()" in line
+        assert "register_session" in line
+        assert "from 127.0.0.1:54321" in line
+
+    def test_log_peer_env_var_works_without_dev_mode(self, monkeypatch):
+        """DEV_MODE is not a quiet switch: it also fires a desktop
+        notification per tool call (_dev_notify) and drops the logger to
+        DEBUG. An operator diagnosing #145 on the bus host would take
+        ~1.5 notifications/min from the churn alone, so peer logging has its
+        own switch."""
+        line = self._run(monkeypatch, dev_mode=False, log_peer=True)
+
+        assert "from 127.0.0.1:54321" in line
+
+    def test_tailscale_proxied_calls_are_marked(self, monkeypatch):
+        """Behind `tailscale serve` the peer is the LOCAL tailscaled, not the
+        caller - so lsof names tailscaled while the culprit is remote. Marked,
+        because un-marked it is byte-identical to a genuinely local caller and
+        would have an operator eliminate every remote candidate."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={
+                "client": ("127.0.0.1", 54321),
+                "headers": [(b"tailscale-user-login", b"evansenter@github")],
+            },
+        )
+
+        assert "from 127.0.0.1:54321 via tailscale" in line
+
+    def test_direct_calls_are_not_marked_as_proxied(self, monkeypatch):
+        """The marker has to mean something: a direct loopback call is the
+        case where the port DOES name the culprit."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={"client": ("127.0.0.1", 54321), "headers": [(b"user-agent", b"python")]},
+        )
+
+        assert "from 127.0.0.1:54321" in line
+        assert "via tailscale" not in line

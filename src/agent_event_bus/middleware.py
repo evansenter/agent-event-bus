@@ -351,8 +351,13 @@ class TailscaleAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Trust localhost connections (CLI, local MCP)
-        client_ip = scope.get("client", ("", 0))[0]
+        # Trust localhost connections (CLI, local MCP).
+        # `or`, not a .get default: a unix-socket scope carries an explicit
+        # client=None, and subscripting that raised TypeError here - a 500 on
+        # every request, before any handler ran. "" is not in TRUSTED_IPS, so
+        # such a request falls through to the header check exactly as an
+        # unknown peer should.
+        client_ip = (scope.get("client") or ("", 0))[0]
         if client_ip in self.TRUSTED_IPS:
             await self.app(scope, receive, send)
             return
@@ -405,24 +410,42 @@ class TailscaleAuthMiddleware:
 PEER_LOGGED_TOOLS = ("register_session",)
 
 
+def _peer_logging_enabled() -> bool:
+    """Whether register_session lines carry the caller's peer (#145).
+
+    Two switches, deliberately. DEV_MODE is the repo-wide debug switch, but
+    it is not a QUIET one: _dev_notify fires a desktop notification per tool
+    call and the logger drops to DEBUG, so an operator who flips it on the
+    bus host to read one port also gets a notification for every
+    registration - ~1.5/min from the churn alone, plus every real session.
+    AGENT_EVENT_BUS_LOG_PEER turns peer logging on by itself, which is the
+    mode this instrumentation is actually meant to be used in.
+
+    Read from the environment per call rather than captured at import, so
+    flipping it in a test does not depend on import order. An operator flips
+    it by restarting the server either way.
+    """
+    return bool(os.environ.get("DEV_MODE") or os.environ.get("AGENT_EVENT_BUS_LOG_PEER"))
+
+
 def _peer_label(scope) -> str | None:
-    """Peer of the connection behind an ASGI scope, as host:port - DEV_MODE only.
+    """Peer of the connection behind an ASGI scope, as host:port.
 
     Instrumentation for #145, not a permanent log line: something registers
     and immediately unregisters a session ~1.5x/min on the bus host, and
     nothing recorded WHERE the calls came from. Returns None (and the log
-    line is unchanged) unless DEV_MODE is set, so a bus serving real sessions
-    does not start recording a peer for every registration forever.
+    line is unchanged) unless peer logging is switched on, so a bus serving
+    real sessions does not record a peer for every registration forever.
 
-    The PORT is the identifying half. The bus is loopback or tailnet, so the
-    address is nearly always 127.0.0.1 and says nothing; the ephemeral port is
-    what `lsof -i :PORT` maps back to a PID while the churn is live.
+    The PORT is the identifying half of a DIRECT connection: the bus listens
+    on loopback, so the address alone rarely narrows anything, while the
+    ephemeral port is what `lsof -i :PORT` maps back to a PID while the churn
+    is live.
 
-    Read from the environment per call rather than captured at import, so
-    flipping it in a test does not depend on import order. An operator flips
-    it by restarting the server with DEV_MODE=1 either way.
+    That reasoning inverts behind `tailscale serve`, which is why the label
+    says so - see the marker below.
     """
-    if not os.environ.get("DEV_MODE"):
+    if not _peer_logging_enabled():
         return None
     # Absent for a unix socket, and some ASGI servers omit it entirely. Say
     # so rather than dropping the suffix, which would read as "not enabled"
@@ -434,6 +457,18 @@ def _peer_label(scope) -> str | None:
         host, port = client
     except (TypeError, ValueError):
         return "unknown peer"
+
+    # Behind `tailscale serve` the connection is terminated by the LOCAL
+    # tailscaled and proxied here, so this is tailscaled's socket rather than
+    # the caller's: `lsof -i :PORT` names tailscaled while the real caller is
+    # somewhere on the tailnet. Un-marked, that is byte-identical to a
+    # genuinely local caller, and an operator would eliminate every remote
+    # candidate on the strength of a loopback address. The identity header
+    # Tailscale injects is the only thing in the scope that separates them -
+    # the same header TailscaleAuthMiddleware authenticates on.
+    headers = dict(scope.get("headers") or [])
+    if TailscaleAuthMiddleware.TAILSCALE_USER_HEADER in headers:
+        return f"{host}:{port} via tailscale"
     return f"{host}:{port}"
 
 
