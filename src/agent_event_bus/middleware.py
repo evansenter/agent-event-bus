@@ -403,7 +403,7 @@ class TailscaleAuthMiddleware:
         )
 
 
-# Tools whose log line carries the caller's peer address under DEV_MODE
+# Tools whose log line carries the caller's peer address under peer logging
 # (#145). Just register_session: the churn being diagnosed arrives as
 # register/unregister pairs, and the registration alone names the process, so
 # there is no reason to double the noise.
@@ -464,10 +464,18 @@ def _peer_label(scope) -> str | None:
     # somewhere on the tailnet. Un-marked, that is byte-identical to a
     # genuinely local caller, and an operator would eliminate every remote
     # candidate on the strength of a loopback address. The identity header
-    # Tailscale injects is the only thing in the scope that separates them -
-    # the same header TailscaleAuthMiddleware authenticates on.
+    # Tailscale injects is the only thing in the scope that separates them.
+    #
+    # Truthiness, not presence: TailscaleAuthMiddleware treats an empty value
+    # as no identity at all (`if not tailscale_user`), so keying on presence
+    # would label a request "proxied" that the auth layer would have
+    # rejected. The two must agree on what counts as an identity.
+    #
+    # Advisory, not proof: loopback bypasses auth entirely, so a local
+    # process CAN set this header itself and be marked as proxied. It
+    # narrows the candidate set; it does not authenticate anything.
     headers = dict(scope.get("headers") or [])
-    if TailscaleAuthMiddleware.TAILSCALE_USER_HEADER in headers:
+    if headers.get(TailscaleAuthMiddleware.TAILSCALE_USER_HEADER):
         return f"{host}:{port} via tailscale"
     return f"{host}:{port}"
 
@@ -527,7 +535,8 @@ class RequestLoggingMiddleware:
     ) -> None:
         """Parse and log one MCP tool call (runs in a worker thread).
 
-        `peer` is None unless DEV_MODE is on (#145); see _peer_label.
+        `peer` is None unless peer logging is on (#145); see
+        _peer_logging_enabled.
         """
         try:
             req_json = json.loads(request_body) if request_body else {}

@@ -998,6 +998,23 @@ class TestPeerLogging:
 
         assert "from 127.0.0.1:54321 via tailscale" in line
 
+    def test_empty_identity_header_is_not_treated_as_proxied(self, monkeypatch):
+        """TailscaleAuthMiddleware treats an empty value as no identity at
+        all (`if not tailscale_user`), so keying the marker on presence would
+        label a request "proxied" that the auth layer would have rejected -
+        and the marker exists precisely to keep an operator from eliminating
+        the wrong candidates."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={
+                "client": ("127.0.0.1", 54321),
+                "headers": [(b"tailscale-user-login", b"")],
+            },
+        )
+
+        assert "from 127.0.0.1:54321" in line
+        assert "via tailscale" not in line
+
     def test_direct_calls_are_not_marked_as_proxied(self, monkeypatch):
         """The marker has to mean something: a direct loopback call is the
         case where the port DOES name the culprit."""

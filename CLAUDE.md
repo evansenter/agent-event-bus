@@ -216,8 +216,17 @@ DEV_MODE=1 agent-event-bus
 # tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled
 # while the real caller is somewhere on the tailnet. Those lines are marked
 # `from 127.0.0.1:54321 via tailscale` (Tailscale's identity header is the
-# only thing in the ASGI scope that distinguishes them). An unmarked
-# loopback peer is a genuinely local process.
+# only thing in the ASGI scope that distinguishes them, and loopback bypasses
+# auth - so the marker narrows the candidates, it does not authenticate).
+# An unmarked loopback peer is a genuinely local process.
+#
+# CAVEAT - the SUPERVISED bus does not see this. The line below is a
+# foreground invocation; `scripts/com.evansenter.agent-event-bus.plist`
+# templates only PATH, PYTHONPATH, _ICON, _LOG and _ERR, so neither this
+# variable nor DEV_MODE reaches a launchd-managed server. On the bus host,
+# either add it to the plist's EnvironmentVariables and reload the
+# LaunchAgent, or stop the service and run the bus in the foreground for the
+# duration of the diagnosis.
 AGENT_EVENT_BUS_LOG_PEER=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)
