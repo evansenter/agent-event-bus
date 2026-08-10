@@ -327,6 +327,19 @@ def cmd_publish(args):
     result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
+    if result.get("session_deleted"):
+        # Exit status stays 0 and the event id is real: #144 stores the event
+        # and flags it. The warning goes to stderr because the callers this
+        # actually reaches are hooks that discard stdout, and it names the id
+        # the operator would grep for.
+        name = result.get("display_id") or session_id
+        print(
+            f"Warning: session {name} was deleted at {result.get('deleted_at')}; "
+            f"the event was stored under it anyway. Re-register to publish as a "
+            f"live session.",
+            file=sys.stderr,
+        )
+
 
 def cmd_events(args):
     """Get recent events."""

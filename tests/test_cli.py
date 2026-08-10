@@ -260,6 +260,36 @@ class TestCmdPublish:
         )
 
     @patch("agent_event_bus.cli.call_tool")
+    def test_publish_warns_but_succeeds_for_a_deleted_session(self, mock_call, capsys):
+        """#144: the event was stored, so the exit status stays 0 - but the
+        warning has to reach stderr, since the hooks this affects discard
+        stdout and would otherwise never see the flag."""
+        mock_call.return_value = {
+            "event_id": 4211,
+            "session_deleted": True,
+            "session_id": "stale-id",
+            "display_id": "grand-bison",
+            "deleted_at": "2026-03-21T11:04:00",
+            "hint": "Call register_session to get a live session.",
+        }
+
+        cli.cmd_publish(make_publish_args(session_id="stale-id"))
+
+        captured = capsys.readouterr()
+        assert "grand-bison" in captured.err
+        assert "stored" in captured.err
+        # The event id still lands on stdout for anything parsing the result
+        assert "4211" in captured.out
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_is_silent_for_a_live_session(self, mock_call, capsys):
+        mock_call.return_value = {"event_id": 1}
+
+        cli.cmd_publish(make_publish_args(session_id="live-id"))
+
+        assert capsys.readouterr().err == ""
+
+    @patch("agent_event_bus.cli.call_tool")
     def test_publish_with_channel(self, mock_call):
         """Test publish with channel."""
         mock_call.return_value = {"event_id": 1}

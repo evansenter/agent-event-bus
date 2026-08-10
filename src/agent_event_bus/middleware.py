@@ -214,6 +214,17 @@ def _format_result(result) -> str:
     # deleted-session polling stayed invisible in the log for months.
     if "error" in result:
         return f"{_RED}ERROR:{_RESET} {result['error']}"
+    # A publish by a soft-deleted session (#144) stores the event and flags the
+    # response instead of failing it, so there is no "error" above to catch it -
+    # and the generic session_id branch below would render it as a plain
+    # register. Naming the dead session here is what makes an orphaned publisher
+    # greppable in `make logs`, the same way a rejected poll already is.
+    if result.get("session_deleted") and "event_id" in result:
+        name = result.get("display_id") or _format_session_id_value(result.get("session_id", "?"))
+        return (
+            f"{_MAGENTA}event #{result['event_id']}{_RESET} "
+            f"[{result.get('channel', 'all')}] {_RED}from deleted {name}{_RESET}"
+        )
     # Before the session_id branch, for the same reason the error check sits
     # above it: an ack's entire observable effect is the cursor move, and the
     # generic session line would swallow it - logging every successful ack as

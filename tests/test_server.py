@@ -1641,6 +1641,152 @@ class TestDeletedSessionPolling:
         assert reg["display_id"] in rejections[0].message
 
 
+class TestDeletedSessionPublishing:
+    """A soft-deleted session's publishes are flagged, not rejected (#144).
+
+    The write half of #140, decided the other way round: the event still lands,
+    and the response carries session_deleted so the publisher can learn its
+    session is gone. Rejecting would lose the event, and the common publishers
+    are fire-and-forget hooks with no retry and no error handling.
+    """
+
+    def _deleted_session(self, name):
+        reg = register_session(name=name, client_id=f"{name}-client")
+        sid = reg["session_id"]
+        assert server.storage.delete_session(sid)
+        return sid, reg
+
+    def test_event_is_still_stored(self):
+        """The whole point of not mirroring get_events: no data is lost."""
+        sid, _ = self._deleted_session("pub-deleted-stored")
+
+        result = publish_event(event_type="task_completed", payload="work finished", session_id=sid)
+
+        assert result["event_id"]
+        readback = get_events(cursor=str(result["event_id"] - 1), order="asc", limit=5)
+        assert any(e["id"] == result["event_id"] for e in readback["events"])
+
+    def test_response_carries_the_deletion_details(self):
+        sid, reg = self._deleted_session("pub-deleted-flag")
+
+        result = publish_event(event_type="note", payload="hello", session_id=sid)
+
+        assert result["session_deleted"] is True
+        assert result["session_id"] == sid
+        assert result["display_id"] == reg["display_id"]
+        assert result["deleted_at"]
+        assert result["hint"]
+
+    def test_flag_is_not_an_error(self):
+        """A client branching on "error" must not read a stored event as a
+        failed write - that is the difference between this and a poll."""
+        sid, _ = self._deleted_session("pub-deleted-no-error")
+
+        result = publish_event(event_type="note", payload="hello", session_id=sid)
+
+        assert "error" not in result
+
+    def test_attribution_is_not_rewritten(self):
+        """Option 3 (re-attribute to "anonymous") was declined: which dead
+        session published is the evidence an orphaned-client hunt starts from."""
+        sid, _ = self._deleted_session("pub-deleted-attrib")
+
+        published = publish_event(event_type="note", payload="mine", session_id=sid)
+
+        readback = get_events(cursor=str(published["event_id"] - 1), order="asc", limit=5)
+        stored = next(e for e in readback["events"] if e["id"] == published["event_id"])
+        assert stored["session_id"] == sid
+
+    def test_normal_publish_fields_survive_the_flag(self):
+        """The flag is merged onto the usual result, not substituted for it."""
+        sid, _ = self._deleted_session("pub-deleted-fields")
+
+        result = publish_event(
+            event_type="help_needed",
+            payload="stuck",
+            session_id=sid,
+            channel="all",
+            correlation_id="corr-144",
+        )
+
+        assert result["event_type"] == "help_needed"
+        assert result["payload"] == "stuck"
+        assert result["channel"] == "all"
+        assert result["correlation_id"] == "corr-144"
+        assert result["signal_level"] == "actionable"
+
+    def test_live_session_publish_is_unflagged(self):
+        reg = register_session(name="pub-live", client_id="pub-live-client")
+
+        result = publish_event(event_type="note", payload="alive", session_id=reg["session_id"])
+
+        assert "session_deleted" not in result
+
+    def test_unregistered_session_id_stays_silent(self):
+        """Same blast radius as #140: foreign ids are a supported way to use
+        the bus, so only ids we know we deleted are flagged."""
+        result = publish_event(
+            event_type="note", payload="stranger", session_id="never-registered-publisher"
+        )
+
+        assert "session_deleted" not in result
+
+    def test_anonymous_publisher_is_not_flagged(self):
+        result = publish_event(event_type="note", payload="anon", session_id="anonymous")
+
+        assert "session_deleted" not in result
+
+    def test_stale_cleanup_deletion_is_flagged(self):
+        """Sessions swept by the heartbeat timeout - not explicitly
+        unregistered - are the ones that publish on unnoticed longest."""
+        reg = register_session(name="pub-stale", client_id="pub-stale-client")
+        server.storage.cleanup_stale_sessions(timeout_seconds=0)
+
+        result = publish_event(event_type="note", payload="zombie", session_id=reg["session_id"])
+
+        assert result["session_deleted"] is True
+
+    def test_re_registering_clears_the_flag(self):
+        """The hint tells the caller to re-register; that has to actually work."""
+        sid, _ = self._deleted_session("pub-deleted-revive")
+        assert publish_event(event_type="note", payload="dead", session_id=sid)["session_deleted"]
+
+        register_session(name="pub-deleted-revive", client_id="pub-deleted-revive-client")
+
+        result = publish_event(event_type="note", payload="alive again", session_id=sid)
+        assert "session_deleted" not in result
+
+    def test_warning_is_logged_once_per_deletion(self, monkeypatch, caplog):
+        """An orphaned hook publishes on every tool call; one WARNING per
+        incident is discoverable, thousands are the volume that hid #140."""
+        monkeypatch.setattr(server, "_warned_deleted_sessions", set())
+        sid, reg = self._deleted_session("pub-deleted-warn-once")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+            for _ in range(3):
+                publish_event(event_type="note", payload="again", session_id=sid)
+
+        warnings = [r for r in caplog.records if "deleted session" in r.message]
+        assert len(warnings) == 1
+        assert reg["display_id"] in warnings[0].message
+        # "storing", not "rejecting": the operator reading the log has to be
+        # able to tell the two dispositions apart
+        assert "storing events from" in warnings[0].message
+
+    def test_publish_warning_does_not_silence_the_poll_warning(self):
+        """The warn-once key includes the tool, so an orphaned client that both
+        publishes and polls surfaces both halves rather than whichever ran
+        first."""
+        sid, _ = self._deleted_session("pub-deleted-two-tools")
+
+        with patch.object(server, "_warned_deleted_sessions", set()):
+            publish_event(event_type="note", payload="one", session_id=sid)
+            assert len(server._warned_deleted_sessions) == 1
+
+            get_events(session_id=sid, resume=True)
+            assert len(server._warned_deleted_sessions) == 2
+
+
 class TestAckEvents:
     """ack_events: advance the cursor to an id the caller already holds (#134).
 

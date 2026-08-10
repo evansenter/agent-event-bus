@@ -303,6 +303,28 @@ class TestFormatResult:
         assert "Session deleted" in result
         assert "session=" not in result
 
+    def test_deleted_publisher_is_named_on_a_stored_event(self):
+        """#144 stores the event and flags it, so there is no "error" key to
+        catch it - and the generic session_id branch would render an orphaned
+        publisher as an ordinary register."""
+        result = _format_result(
+            {
+                "event_id": 4211,
+                "channel": "all",
+                "session_deleted": True,
+                "session_id": "stale-id",
+                "display_id": "grand-bison",
+            }
+        )
+        assert "event #4211" in result
+        assert "grand-bison" in result
+        assert "session=" not in result
+
+    def test_normal_publish_is_unchanged(self):
+        result = _format_result({"event_id": 7, "channel": "all"})
+        assert "event #7" in result
+        assert "deleted" not in result
+
     def test_structured_content_unwrapping(self):
         """FastMCP structuredContent wrapper is unwrapped."""
         wrapped = {
