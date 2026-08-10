@@ -231,6 +231,30 @@ def cmd_channels(args):
     print()
 
 
+def _session_id_from_env() -> str | None:
+    """Session id for an omitted --session-id, in precedence order.
+
+    AGENT_EVENT_BUS_SESSION_ID is the explicit, tool-agnostic knob and wins.
+    CLAUDE_CODE_SESSION_ID is the fallback because Claude Code injects it into
+    every subprocess it spawns, so it is present exactly where the explicit one
+    tends not to be.
+
+    The fallback exists because setting the explicit var from a shell profile
+    is not reliable: the dotfiles that map one to the other live in ~/.exports,
+    which is sourced from ~/.zshrc - and zsh reads .zshrc for INTERACTIVE
+    shells only. Tool-spawned subprocesses are non-interactive, so the mapping
+    never runs there and publishes landed as "anonymous" (`zsh -i -c` sees it,
+    `zsh -c` does not). That is a property of shell startup, not of any OS -
+    it reproduces on Linux - so the fix belongs here, where it holds for every
+    shell, spawner, and machine, rather than in one shell's rc plumbing.
+
+    The two ids are the same value by construction: the SessionStart hook
+    registers on the bus with client_id = the Claude Code session id, which the
+    bus adopts as its session id.
+    """
+    return os.environ.get("AGENT_EVENT_BUS_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+
+
 def cmd_publish(args):
     """Publish an event."""
     arguments = {
@@ -240,7 +264,7 @@ def cmd_publish(args):
     if args.channel:
         arguments["channel"] = args.channel
     # Use explicit --session-id, fall back to env var
-    session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
+    session_id = args.session_id or _session_id_from_env()
     if session_id:
         arguments["session_id"] = session_id
     # Optional structured payload fields (RFC #121)
@@ -260,7 +284,7 @@ def cmd_publish(args):
 def cmd_events(args):
     """Get recent events."""
     # Use explicit --session-id, fall back to env var (matches cmd_publish)
-    session_id = args.session_id or os.environ.get("AGENT_EVENT_BUS_SESSION_ID")
+    session_id = args.session_id or _session_id_from_env()
 
     # Validate --resume requires a session id (flag or env var)
     if args.resume and not session_id:
@@ -467,7 +491,8 @@ def main():
     p_publish.add_argument("--payload", required=True, help="Event payload")
     p_publish.add_argument("--channel", default="all", help="Target channel")
     p_publish.add_argument(
-        "--session-id", help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID)"
+        "--session-id",
+        help="Your session ID (default: $AGENT_EVENT_BUS_SESSION_ID, else $CLAUDE_CODE_SESSION_ID)",
     )
     p_publish.add_argument("--title", help="Optional short headline for the payload")
     p_publish.add_argument("--tags", help="Comma-separated tags for downstream filtering")
@@ -484,7 +509,8 @@ def main():
     p_events.add_argument("--cursor", help="Cursor from previous call (for pagination)")
     p_events.add_argument(
         "--session-id",
-        help="Your session ID for cursor tracking (default: $AGENT_EVENT_BUS_SESSION_ID)",
+        help="Your session ID for cursor tracking (default: "
+        "$AGENT_EVENT_BUS_SESSION_ID, else $CLAUDE_CODE_SESSION_ID)",
     )
     p_events.add_argument("--limit", type=int, help="Maximum number of events to return")
     p_events.add_argument(
