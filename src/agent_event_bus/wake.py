@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,28 @@ PANES_LOCK_FILENAME = "panes.lock"
 # suffix outside `<sid>.jsonl*` so the spool-pruning follow-up (whose safe
 # target is that glob) can never sweep it.
 BUSY_SUFFIX = ".busy"
+
+# How long a marker stays believed without being refreshed.
+#
+# This is NOT the static TTL the design first rejected. That objection was
+# that ageing a marker out opens a mid-turn injection window on a long turn -
+# true only for a marker nobody touches. `set_busy` refreshes the mtime, so a
+# turn that keeps calling it stays gated for as long as it runs, while a turn
+# that STOPPED calling it ages out. The two cases the design originally
+# conflated come apart along exactly that line.
+#
+# It has to exist because a marker can outlive its turn on a session that is
+# still alive: the Stop hook does not run when a turn ends by user interrupt,
+# and SessionEnd does not fire either. Without ageing, pressing Esc and
+# walking away leaves the session mapped, genuinely idle, and gated against
+# every DM forever - the exact silent non-wake this whole path exists to
+# remove.
+#
+# One hour is sized for the DEFAULT wiring, where the only refresh is
+# UserPromptSubmit at the start of the turn: it must exceed a long turn, or
+# an active session reads idle. Deployments that also refresh from a
+# per-tool-call hook can safely run this far lower; see docs/BRIDGE.md.
+DEFAULT_BUSY_TTL_SECONDS = 3600.0
 
 SUPPORTED_MUXES = ("tmux", "zellij")
 
@@ -176,8 +199,20 @@ def _read_panes(panes_file: Path) -> dict:
     try:
         with open(panes_file, encoding="utf-8") as f:
             panes = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except ValueError:
+        # Damaged CONTENT (a torn or hand-mangled file) is replaced rather
+        # than propagated: the writer holds the lock, so it is the one party
+        # that can restore a well-formed file, and preserving unparseable
+        # bytes would wedge every future write behind the same failure.
+        return {}
+    # Every other OSError propagates, and must. A transient,
+    # content-independent failure (EMFILE/ENFILE on a busy box) is not
+    # evidence the file is damaged - treating it as "empty" would have the
+    # read-modify-write replace a healthy mapping with only the calling
+    # session's entry, unmapping every other live session on the host with
+    # nothing logged anywhere. Aborting leaves the existing file intact.
     return panes if isinstance(panes, dict) else {}
 
 
@@ -314,11 +349,21 @@ def busy_path(wake_dir: Path, session_id: str) -> Path:
 
 
 def set_busy(wake_dir: Path, session_id: str) -> None:
-    """Mark the session mid-turn. Idempotent."""
+    """Mark the session mid-turn, or refresh an existing mark. Idempotent.
+
+    The refresh is what makes the staleness window safe: calling this
+    repeatedly during a long turn holds the gate closed indefinitely, so
+    ageing a marker out cannot cut short a turn that is still running. A turn
+    that has stopped calling it has, by construction, stopped.
+    """
     _ensure_wake_dir(wake_dir)
     path = busy_path(wake_dir, session_id)
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
     os.close(fd)
+    # O_CREAT does not update mtime on a file that already exists, and the
+    # mtime IS the freshness signal - without this an idempotent re-mark
+    # would look like the original one and age out mid-turn.
+    os.utime(path, None)
 
 
 def clear_busy(wake_dir: Path, session_id: str) -> None:
@@ -326,23 +371,43 @@ def clear_busy(wake_dir: Path, session_id: str) -> None:
     busy_path(wake_dir, session_id).unlink(missing_ok=True)
 
 
-def is_busy(wake_dir: Path, session_id: str) -> bool:
-    """Is the session mid-turn?
+def is_busy(wake_dir: Path, session_id: str, ttl_seconds: float = DEFAULT_BUSY_TTL_SECONDS) -> bool:
+    """Is the session mid-turn? False once the marker goes stale.
 
-    Deliberately has no staleness window. A marker outlives its session only
-    when SessionEnd never ran (hard kill, crash, reboot) - and then the
-    session is gone, so declining to inject is correct rather than a bug: the
-    alternative is typing into whatever now owns the pane. A resumed session
-    clears it at SessionStart, and a Stop hook that timed out and orphaned one
-    on a live session gets it cleared by the next turn's Stop. Both self-heal,
-    so a TTL would buy nothing and open a mid-turn injection window on any
-    turn that ran longer than it.
+    A marker can outlive its turn on a session that is STILL ALIVE, which is
+    the case an earlier version of this design missed. Three ways a marker is
+    left behind, only two of which end with the session gone:
+
+    - SessionEnd never ran (hard kill, crash, reboot). Session gone; the pane
+      belongs to something else now, so declining to inject is correct.
+    - A Stop hook timed out. Self-heals at the next turn's Stop.
+    - **The user interrupted the turn.** Stop does not run, SessionEnd does
+      not fire, and the session sits idle at its prompt - mapped, wakeable,
+      and gated. Neither self-heal reaches it: SessionStart needs a restart,
+      and "the next Stop" needs the human to come back and finish a turn.
+      Pressing Esc and walking away is close to the canonical reason to want
+      a wake at all, so leaving this one latched would defeat the feature on
+      its best case.
+
+    Ageing the marker out is what covers the third case, and refreshment is
+    what keeps it from breaking the first two: see DEFAULT_BUSY_TTL_SECONDS.
+
+    Staleness is measured from mtime, so a caller that refreshes (set_busy)
+    can hold the gate closed for an arbitrarily long turn.
     """
+    path = busy_path(wake_dir, session_id)
     try:
-        return busy_path(wake_dir, session_id).exists()
+        age = time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        return False
     except OSError:
         # Same never-500 posture as the panes read: a delivery is already
         # spooled by the time this is consulted, and raising would make the
         # bus retry it. An unreadable marker reads as idle, matching the
         # no-marker default rather than wedging the session unwakeable.
         return False
+    # Wall clock, not monotonic: the marker is written by a DIFFERENT process
+    # (a session hook) and read here, so the only shared clock is the file
+    # system's. A backwards clock step makes age negative, which reads as
+    # fresh - the safe direction, since it keeps the gate closed.
+    return age < ttl_seconds

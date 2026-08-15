@@ -83,14 +83,17 @@ than renamed. `spool-tmux-failed` becomes `spool-mux-failed`. New: `spool-busy`.
 ### Startup preflight
 
 The current preflight refuses to start when `--backend tmux` and no `tmux`
-binary is on PATH. Generalized: refuse only when **neither** `tmux` nor `zellij`
-is on PATH, and log which are present. A per-entry missing binary lands on
+binary is on PATH. Generalized to **warn** rather than refuse, and only when
+neither is on PATH, logging which are present. Refusing was defensible while
+the backend was something an operator typed; as a checked-in plist default it
+would be a launchd crash loop that kills a working spool bridge on a host whose
+operator never asked for injection. A per-entry missing binary lands on
 `spool-mux-failed`, which is already the "this box's mux is broken" arm.
 
 ### Idle gate
 
 `wake/<sid>.busy`, created at `UserPromptSubmit` and removed at `Stop`. The
-bridge injects only when the marker is absent; otherwise `spool-busy`.
+bridge injects only when the marker is absent or stale; otherwise `spool-busy`.
 
 The argument is that gating costs **zero coverage**. While a session is busy,
 injection is redundant — `drain-directed-events.sh` (Stop hook) already peeks
@@ -98,13 +101,28 @@ the bus at end-of-turn and surfaces directed events — and the busy window is
 exactly when a permission dialog can be on screen for injected text plus a
 newline to answer.
 
-**No TTL on the marker, deliberately.** A stale marker requires `SessionEnd` not
-to fire (hard kill, crash, reboot). In that case the session is gone, so
-declining to inject is the *correct* outcome — the alternative is typing into
-whatever now owns the pane. If the session resumes under the same id,
-`SessionStart` clears the marker. If a `Stop` hook times out and orphans a marker
-on a live session, the next turn's `Stop` clears it. Both paths self-heal, so a
-TTL would add a mid-long-turn injection window in exchange for nothing.
+**Ageing window on a refreshed marker** (`--busy-ttl`, default 1 hour).
+
+This design initially rejected a TTL outright, on the reasoning that a stale
+marker implies a dead session — hard kill, crash, reboot — where declining to
+inject is the *correct* outcome. **That enumeration was incomplete**, and
+review caught it: the `Stop` hook does not run when a turn ends because the
+user *interrupted* it, and `SessionEnd` does not fire either. The session then
+sits idle at its prompt — alive, mapped, wakeable — and gated against every DM
+until its human returns and completes a turn. Pressing Esc and walking away is
+close to the canonical reason to want a wake at all, so that case cannot be
+left latched.
+
+The fix is not the TTL that was rejected. The objection to a TTL was that
+ageing opens a mid-turn injection window on a long turn, which is true only of
+a marker nobody touches. `set_busy` refreshes the mtime, so a turn that keeps
+marking itself busy holds the gate for as long as it runs, while an interrupted
+one stops refreshing and ages out. The two cases the original argument
+conflated separate exactly along that line.
+
+The default window is an hour because with the default wiring the only refresh
+is `UserPromptSubmit`; a deployment that also refreshes per tool call can run
+it far lower.
 
 ### Failure modes not solved
 
@@ -115,6 +133,9 @@ Stated rather than papered over, per the verification-boundaries rule:
   (`dump-screen` / `capture-pane` matched against the prompt box) was considered
   and rejected: it is exactly the version-fragile guess about host behavior that
   #141 punished twice.
+- **A turn that outruns `--busy-ttl` with no per-tool refresh wired** reads as
+  idle for the remainder of that turn. Same class as the Stop-block window
+  below, with a much longer fuse; the per-tool refresh closes it.
 - **The Stop-block continuation window** reads idle while the session is
   actually working, because a blocking Stop hook restarts the turn without a
   `UserPromptSubmit`. Benign — the TUI queues typed text mid-turn.

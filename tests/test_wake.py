@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -204,6 +205,31 @@ class TestPaneEntries:
         assert result["existed"] is False
         assert not (tmp_path / "absent" / "panes.json").exists()
 
+    def test_transient_io_error_aborts_rather_than_truncating(self, tmp_path, monkeypatch):
+        """A blanket OSError->{} would treat a transient, content-independent
+        failure (EMFILE/ENFILE on a busy box) as "the file is damaged", and
+        the read-modify-write would then replace a healthy mapping with only
+        the calling session's entry - unmapping every other live session on
+        the host, with nothing logged anywhere. Aborting leaves it intact."""
+        wake.set_pane_entry(tmp_path, "other-session", MuxTarget(mux="tmux", pane="%9"))
+
+        import builtins
+
+        real_open = builtins.open
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith("panes.json"):
+                raise OSError(24, "Too many open files")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", flaky)
+        with pytest.raises(OSError):
+            wake.set_pane_entry(tmp_path, "mine", MuxTarget(mux="tmux", pane="%1"))
+
+        monkeypatch.undo()
+        panes = json.loads((tmp_path / "panes.json").read_text(encoding="utf-8"))
+        assert "other-session" in panes
+
     def test_damaged_file_is_replaced_rather_than_propagated(self, tmp_path):
         """The writer holds the lock, so it is the only party that can restore
         a well-formed file. Preserving unparseable bytes would wedge every
@@ -348,6 +374,53 @@ class TestBusyMarker:
     def test_marker_is_0600(self, tmp_path):
         wake.set_busy(tmp_path, "sid-1")
         assert stat.S_IMODE(wake.busy_path(tmp_path, "sid-1").stat().st_mode) == 0o600
+
+    def test_marker_ages_out(self, tmp_path):
+        """The case the first version of this design missed: a marker can
+        outlive its turn on a session that is STILL ALIVE. The Stop hook does
+        not run when a turn ends by user interrupt, and SessionEnd does not
+        fire either - so the session sits idle at its prompt, mapped and
+        wakeable, gated against every DM. Neither documented self-heal reaches
+        it (SessionStart needs a restart; "the next Stop" needs the human to
+        come back and finish a turn), which made pressing Esc and walking away
+        - close to the canonical reason to want a wake - a permanent gate."""
+        wake.set_busy(tmp_path, "sid-1")
+        old = time.time() - 7200
+        os.utime(wake.busy_path(tmp_path, "sid-1"), (old, old))
+
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=3600) is False
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=10800) is True
+
+    def test_refresh_holds_the_gate_open_indefinitely(self, tmp_path):
+        """This is what separates the ageing window from the static TTL the
+        design rejected. The objection to a TTL was that it opens a mid-turn
+        injection window on a long turn - true only for a marker nobody
+        touches. A turn that keeps marking itself busy stays gated however
+        long it runs; a turn that stopped has, by construction, stopped."""
+        wake.set_busy(tmp_path, "sid-1")
+        old = time.time() - 7200
+        os.utime(wake.busy_path(tmp_path, "sid-1"), (old, old))
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=60) is False
+
+        wake.set_busy(tmp_path, "sid-1")  # refresh mid-turn
+
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=60) is True
+
+    def test_zero_ttl_disables_the_gate(self, tmp_path):
+        """A legitimate value meaning "ignore the marker entirely"."""
+        wake.set_busy(tmp_path, "sid-1")
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=0) is False
+
+    def test_backwards_clock_reads_as_fresh(self, tmp_path):
+        """A marker is written by one process and read by another, so the only
+        shared clock is the filesystem's and a backwards step is possible. A
+        negative age must read as FRESH - keeping the gate closed is the safe
+        direction; the alternative injects into a possibly-live turn."""
+        wake.set_busy(tmp_path, "sid-1")
+        future = time.time() + 3600
+        os.utime(wake.busy_path(tmp_path, "sid-1"), (future, future))
+
+        assert wake.is_busy(tmp_path, "sid-1", ttl_seconds=60) is True
 
     def test_unreadable_marker_reads_as_idle(self, tmp_path, monkeypatch):
         """Same never-500 posture as the panes read: the delivery is already

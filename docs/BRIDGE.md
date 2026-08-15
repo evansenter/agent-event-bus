@@ -296,9 +296,15 @@ whole remainder of that turn - reopening precisely the window the gate exists
 to close. Pass `--keep-wake-state` for that source; only the hook knows it:
 
 ```bash
-# SessionStart, source-aware
+# SessionStart, source-aware. `if`/`fi` rather than `[[ ... ]] && args+=(...)`:
+# as the last statement of a function or script that form returns 1 on a
+# non-compact start, which under `set -e` exits the hook before `panes set`
+# ever runs - and a mapping that is silently never written is exactly the
+# quiet-absent path this document warns about.
 args=(--session-id "$SESSION_ID")
-[[ "$SOURCE" == "compact" ]] && args+=(--keep-wake-state)
+if [[ "$SOURCE" == "compact" ]]; then
+    args+=(--keep-wake-state)
+fi
 agent-event-bus-cli panes set "${args[@]}"
 ```
 
@@ -370,14 +376,37 @@ Stop hook that peeks the bus surfaces directed events at end-of-turn anyway -
 and the busy window is exactly when a permission dialog can be on screen for
 injected text plus a newline to answer it.
 
-The marker has **no staleness window**, deliberately. It outlives its session
-only when SessionEnd never ran (hard kill, crash, reboot), and then the session
-is gone, so declining to inject is correct rather than a bug - the alternative
-is typing into whatever now owns the pane. A resumed session clears it via
-`panes set` at SessionStart; a Stop hook that timed out and orphaned one on a
-live session has it cleared by the next turn's Stop. Both self-heal, so a TTL
-would buy nothing and would open a mid-turn injection window on any turn that
-ran longer than it.
+The marker **ages out** after `--busy-ttl` (default 1 hour), and `set_busy`
+refreshes it.
+
+That combination matters, because the two halves answer different failures. A
+marker can be left behind three ways, and only two end with the session gone:
+
+- **SessionEnd never ran** (hard kill, crash, reboot). The session is gone and
+  the pane belongs to something else now, so declining to inject is correct.
+- **A Stop hook timed out.** Cleared at the next turn's Stop.
+- **The user interrupted the turn** (Esc). Stop does not run and SessionEnd
+  does not fire, so the session sits idle at its prompt - mapped, wakeable and
+  gated. Neither self-heal above reaches it: SessionStart needs a restart, and
+  "the next Stop" needs the human to come back and finish a turn. Pressing Esc
+  and walking away is close to the canonical reason to want a wake at all, so
+  a marker that latched here would defeat the feature on its best case.
+
+Ageing covers the third. **Refreshment** is what keeps ageing from breaking the
+others: an earlier version of this design rejected a TTL because ageing opens a
+mid-turn injection window on a long turn - true only of a marker nobody
+touches. A turn that keeps calling `wake-state busy` stays gated for as long as
+it runs; a turn that stopped calling it has, by construction, stopped.
+
+With the default wiring the only refresh is `UserPromptSubmit` at the start of
+the turn, which is why the default window is an hour: it has to exceed a long
+turn. **Wire a per-tool-call refresh and you can lower it a lot** - any hook
+that fires during a turn can run `agent-event-bus-cli wake-state busy`, and the
+marker is then a heartbeat rather than a one-shot. That costs a subprocess per
+tool call, which is why it is not the default.
+
+`--busy-ttl 0` ignores the marker entirely; `inf` restores the never-expire
+behaviour for a deployment that would rather latch than risk a mid-turn wake.
 
 **Failure modes this does not solve**, stated rather than papered over:
 

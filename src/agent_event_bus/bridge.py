@@ -89,6 +89,7 @@ from agent_event_bus.helpers import SIGNATURE_HEADER, WEBHOOK_CONTENT_TYPE
 # on the same module, so a change that breaks this reader breaks a test here
 # rather than silently producing wakes that never happen.
 from agent_event_bus.wake import (
+    DEFAULT_BUSY_TTL_SECONDS,
     DEFAULT_WAKE_DIR,
     PANES_FILENAME,
     SUPPORTED_MUXES,
@@ -198,6 +199,11 @@ class BridgeConfig:
     backend: str = "spool"  # "spool" | "mux" ("tmux" is a legacy alias)
     secret: str | None = None
     cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
+    # How long a <sid>.busy marker is believed without a refresh. See
+    # wake.DEFAULT_BUSY_TTL_SECONDS - this is an ageing window on a REFRESHED
+    # marker, not a static TTL: a turn that keeps marking itself busy holds
+    # the gate for as long as it runs.
+    busy_ttl_seconds: float = DEFAULT_BUSY_TTL_SECONDS
     wake_dir: Path = field(default_factory=lambda: DEFAULT_WAKE_DIR)
     # URL the bus POSTs to; None means loopback (bus on this machine)
     hook_url: str | None = None
@@ -491,7 +497,7 @@ class Injector:
         # redundant anyway (a Stop hook surfaces directed events at
         # end-of-turn) and it is the one window where a permission dialog can
         # be on screen to swallow the keystrokes.
-        if is_busy(self.config.wake_dir, session_id):
+        if is_busy(self.config.wake_dir, session_id, self.config.busy_ttl_seconds):
             logger.debug(f"Turn in flight for {session_id[:8]}...; spooled only")
             return "spool-busy"
 
@@ -838,7 +844,12 @@ class Injector:
                 f"{session_id[:8]}... ({e!r}); treating as unmapped",
             )
             return None
-        self._warned_panes_keys.discard(entry_key)  # healthy entry re-arms it
+        # Both per-entry keys re-arm on a healthy entry. Missing the
+        # parse-error one would silence it for that session for the lifetime
+        # of the daemon, including if the condition came back - the opposite
+        # of every other per-entry key here.
+        self._warned_panes_keys.discard(entry_key)
+        self._warned_panes_keys.discard(f"parse-error:{session_id}")
         return target
 
     _PANES_FILE_KEYS = frozenset({"unparseable", "unreadable", "not-an-object", "unexpected"})
@@ -1668,6 +1679,14 @@ def build_parser() -> argparse.ArgumentParser:
         "drain hook)",
     )
     parser.add_argument(
+        "--busy-ttl",
+        # Raw string default, cast in config_from_args - see _to_number
+        default=os.environ.get("AGENT_EVENT_BUS_BRIDGE_BUSY_TTL") or str(DEFAULT_BUSY_TTL_SECONDS),
+        help="Seconds a <session_id>.busy marker is believed without a refresh "
+        "(mux backend only). Lower this only if something refreshes the marker "
+        "during a turn; with the default wiring it must exceed a long turn",
+    )
+    parser.add_argument(
         "--wake-dir",
         type=Path,
         # `or`: an empty env var would make Path("") == cwd - the bridge
@@ -1730,6 +1749,9 @@ def validate_config(config: BridgeConfig) -> None:
     config.port = _to_number(config.port, int, "--port", "AGENT_EVENT_BUS_BRIDGE_PORT")
     config.cooldown_seconds = _to_number(
         config.cooldown_seconds, float, "--cooldown", "AGENT_EVENT_BUS_BRIDGE_COOLDOWN"
+    )
+    config.busy_ttl_seconds = _to_number(
+        config.busy_ttl_seconds, float, "--busy-ttl", "AGENT_EVENT_BUS_BRIDGE_BUSY_TTL"
     )
     try:
         config.wake_dir = Path(config.wake_dir)
@@ -1841,6 +1863,17 @@ def validate_config(config: BridgeConfig) -> None:
             f"Invalid cooldown {config.cooldown_seconds} "
             "(check --cooldown / AGENT_EVENT_BUS_BRIDGE_COOLDOWN): "
             "must be finite and >= 0"
+        )
+    # nan makes every age comparison False, so the gate would never engage and
+    # every mid-turn DM would inject. 0 is a legitimate value meaning "ignore
+    # the marker entirely"; inf is legitimate too, restoring the never-expire
+    # behaviour for a deployment that would rather latch than risk a mid-turn
+    # wake - so only nan and negatives are refused.
+    if math.isnan(config.busy_ttl_seconds) or config.busy_ttl_seconds < 0:
+        raise BridgeConfigError(
+            f"Invalid busy TTL {config.busy_ttl_seconds} "
+            "(check --busy-ttl / AGENT_EVENT_BUS_BRIDGE_BUSY_TTL): "
+            "must not be negative or nan"
         )
     # A daemon's cwd is whatever its supervisor hands it - a relative wake
     # dir would silently relocate the durable path (and its chmod)
@@ -1970,6 +2003,7 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
         # delivery silently
         secret=os.environ.get("AGENT_EVENT_BUS_BRIDGE_SECRET") or None,
         cooldown_seconds=args.cooldown,  # raw; validate_config coerces
+        busy_ttl_seconds=args.busy_ttl,  # raw; validate_config coerces
         wake_dir=args.wake_dir,
         hook_url=args.hook_url,
         bind=args.bind,

@@ -1985,6 +1985,32 @@ class TestIdleGate:
             wake.clear_busy(config.wake_dir, "target-1")
             assert injector.deliver("target-1", make_event()) == "tmux"
 
+    def test_a_stale_marker_no_longer_latches_the_gate(self, tmp_path):
+        """End-to-end for the interrupt case: a user pressing Esc ends the
+        turn without firing Stop, so the marker persists on a session that is
+        alive, mapped and genuinely idle. Before the ageing window that was a
+        permanent gate - every DM spool-busy, forever, with no warning on
+        either side."""
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        config.busy_ttl_seconds = 60.0
+        wake.set_busy(config.wake_dir, "target-1")
+        old = time.time() - 3600
+        os.utime(wake.busy_path(config.wake_dir, "target-1"), (old, old))
+
+        with patch.object(bridge.subprocess, "run", capture_run()[1]):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_a_refreshed_marker_still_gates(self, tmp_path):
+        """The other half: ageing must not cut short a turn that is still
+        running and still marking itself busy."""
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        config.busy_ttl_seconds = 60.0
+        wake.set_busy(config.wake_dir, "target-1")
+
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            assert injector.deliver("target-1", make_event()) == "spool-busy"
+        mock_run.assert_not_called()
+
     def test_gate_does_not_apply_to_the_spool_backend(self, tmp_path):
         """The spool backend never injects, so it has nothing to gate - and a
         busy marker must not change what it records."""
