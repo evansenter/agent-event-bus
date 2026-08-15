@@ -204,9 +204,9 @@ DEV_MODE=1 agent-event-bus
 # register_session log line, so `lsof -i :PORT` can name the process. Prefer
 # it over DEV_MODE for a live diagnosis (DEV_MODE also fires a desktop
 # notification per tool call). Lines land in agent-event-bus.log, not the
-# console; neither switch reaches the launchd-supervised bus. Temporary
-# instrumentation - full operator notes, label vocabulary and caveats in
-# docs/PEER-LOGGING.md.
+# console; neither switch reaches the supervised bus (launchd or systemd).
+# To disable, UNSET it - `=0` still enables it. Temporary instrumentation -
+# full operator notes, label vocabulary and caveats in docs/PEER-LOGGING.md.
 AGENT_EVENT_BUS_LOG_PEER=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)

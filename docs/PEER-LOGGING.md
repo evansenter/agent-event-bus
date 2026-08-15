@@ -4,12 +4,43 @@ Operator instrumentation for [#145](https://github.com/evansenter/agent-event-bu
 something registers and immediately unregisters a session ~1.5 times a minute
 on the bus host, and nothing recorded *where* the calls came from.
 
-**Temporary by intent.** Once the process is named, this can be removed —
-delete this file and the `AGENT_EVENT_BUS_LOG_PEER` block in CLAUDE.md's
-Operations section along with `_peer_label` / `PEER_LOGGED_TOOLS` in
-`middleware.py`. Kept out of `CLAUDE.md` (and out of `guide.md`) for the same
-reason as `BRIDGE.md`: CLAUDE.md loads into every session, and this is
-operator material with a stated removal condition.
+Kept out of `CLAUDE.md` (and out of `guide.md`) for the same reason as
+`BRIDGE.md`: CLAUDE.md loads into every session, and this is operator material
+with a stated removal condition.
+
+## Removing it
+
+**Temporary by intent.** Once the process is named, delete all of the
+following — a partial removal leaves a dead helper, a vestigial parameter, or
+a dangling pointer:
+
+`src/agent_event_bus/middleware.py`
+- `PEER_LOGGED_TOOLS`
+- `_peer_logging_enabled()`
+- `_peer_label()`
+- the `peer` plumbing: `peer = _peer_label(scope)` in
+  `RequestLoggingMiddleware.__call__`, the extra argument to
+  `_log_tool_call(..., peer)`, that function's `peer` parameter, and the
+  `peer_suffix` it builds
+
+  Leave the `(scope.get("client") or ...)` / `(scope.get("headers") or ...)`
+  reads in `TailscaleAuthMiddleware` alone — those fix a real crash on an
+  explicit `None` and are not part of this instrumentation.
+
+`tests/test_middleware.py`
+- `TestPeerLogging` in full
+- `TestTailscaleAuthMiddleware::test_explicit_null_client_does_not_raise` and
+  `::test_explicit_null_headers_does_not_raise` **stay** — they pin the
+  crash fix above, not the peer label
+
+`CLAUDE.md` — four references, not one:
+- the `AGENT_EVENT_BUS_LOG_PEER` block in Operations
+- `_LOG_PEER` in the environment-variable list (Naming Conventions)
+- the `docs/PEER-LOGGING.md` line in the Architecture tree
+- the See Also entry
+
+`docs/PEER-LOGGING.md`
+- this file
 
 ## Turning it on
 
@@ -91,16 +122,19 @@ process as far as anything in the scope can tell: `tailscale serve` is the
 only proxy this deployment puts in front of the bus, but nothing here proves
 the absence of another.
 
-### The supervised bus does not see either switch
+### The supervised bus does not see either switch — on either platform
 
-`scripts/com.evansenter.agent-event-bus.plist` templates only `PATH`,
-`PYTHONPATH`, `AGENT_EVENT_BUS_ICON`, `_LOG` and `_ERR`, so neither
-`AGENT_EVENT_BUS_LOG_PEER` nor `DEV_MODE` reaches a launchd-managed server.
-On the bus host, either:
+Both service templates carry the same short set of variables (`PYTHONPATH`,
+`AGENT_EVENT_BUS_ICON`, `_LOG`, `_ERR`; the plist adds `PATH`), so neither
+`AGENT_EVENT_BUS_LOG_PEER` nor `DEV_MODE` reaches a supervised server:
 
-- add it to the plist's `EnvironmentVariables` and reload the LaunchAgent, or
-- stop the service and run the bus in the foreground for the duration of the
-  diagnosis.
+| Platform | File | Add |
+|---|---|---|
+| macOS (launchd) | `scripts/com.evansenter.agent-event-bus.plist` | a key in `EnvironmentVariables`, then reload the LaunchAgent |
+| Linux (systemd) | `scripts/agent-event-bus.service` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1`, then `systemctl --user daemon-reload` |
 
-Note that `make install-server` regenerates the plist from the template, so a
+Or, on either: stop the service and run the bus in the foreground for the
+duration of the diagnosis.
+
+Note that `make install-server` regenerates both from their templates, so a
 hand-edit does not survive a reinstall.
