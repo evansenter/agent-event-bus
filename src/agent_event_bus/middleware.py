@@ -474,26 +474,29 @@ def _peer_label(scope) -> str | None:
     # the caller's: `lsof -i :PORT` names tailscaled while the real caller is
     # somewhere on the tailnet. Un-marked, that is byte-identical to a
     # genuinely local caller, and an operator would eliminate every remote
-    # candidate on the strength of a loopback address. The identity header
-    # Tailscale injects is the only thing in the scope that separates them.
+    # candidate on the strength of a loopback address. Tailscale's identity
+    # header is the only thing in the scope that separates them.
     #
-    # Truthiness, not presence: TailscaleAuthMiddleware treats an empty value
-    # as no identity at all (`if not tailscale_user`), so keying on presence
-    # would label a request "proxied" that the auth layer would have
-    # rejected. The two must agree on what counts as an identity.
+    # Truthiness, not presence, so this agrees with the auth check above on
+    # what an identity is; advisory either way, since loopback bypasses auth
+    # and a local process can set the header itself. Both pinned by tests
+    # (test_empty_identity_header_..., test_direct_calls_are_not_marked_...).
     #
-    # Advisory, not proof: loopback bypasses auth entirely, so a local
-    # process CAN set this header itself and be marked as proxied. It
-    # narrows the candidate set; it does not authenticate anything.
-    #
-    # Scanned rather than dict()-ed: this runs on the event loop for every
-    # /mcp POST once peer logging is on, while only register_session
-    # consumes the result (the tool name lives in the request body, so
-    # PEER_LOGGED_TOOLS cannot be checked until _log_tool_call). Scanning
-    # short-circuits on the first match instead of materializing a dict that
-    # every get_events poll then discards.
+    # Scanned, not dict()-ed: this runs on the event loop for every /mcp POST
+    # while only register_session consumes it (the tool name lives in the
+    # request body, so PEER_LOGGED_TOOLS cannot be checked until
+    # _log_tool_call), so short-circuit rather than build a dict every
+    # get_events poll discards.
     wanted = TailscaleAuthMiddleware.TAILSCALE_USER_HEADER
-    identity = next((v for k, v in (scope.get("headers") or []) if k == wanted), None)
+    try:
+        identity = next((v for k, v in (scope.get("headers") or []) if k == wanted), None)
+    except (TypeError, ValueError):
+        # Same guard as the client unpack above, and it matters more here:
+        # _peer_label runs BEFORE the app is awaited, so a raise fails the
+        # REQUEST rather than costing a log line. Rendering the unmarked form
+        # instead would assert "local", the one thing this must not claim
+        # falsely - so say the identity is unreadable and keep the port.
+        return f"{host}:{port} - headers unreadable"
     if identity:
         return f"{host}:{port} via tailscale"
     return f"{host}:{port}"

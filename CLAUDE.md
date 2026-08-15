@@ -207,7 +207,10 @@ DEV_MODE=1 agent-event-bus
 # DEBUG, so on a host with the #145 churn you would take ~1.5 notifications
 # per minute for as long as you watch. This variable turns on peer logging
 # alone. Both work; neither is on by default - it is instrumentation, not a
-# permanent log line.
+# permanent log line. To turn it back off, UNSET it: any non-empty value is
+# truthy, so `=0` still enables it (the repo-wide idiom - see helpers.py,
+# server.py, bridge.py - but this is the one documented with an explicit
+# `=1`, which invites reaching for `=0`).
 #
 # Only register_session carries it: get_events runs every few seconds per
 # session and would drown the log you are reading it from.

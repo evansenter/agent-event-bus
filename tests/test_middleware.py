@@ -1045,6 +1045,20 @@ class TestPeerLogging:
         # all brackets. Name the shape that would actually be wrong.
         assert "[127.0.0.1]" not in line
 
+    def test_malformed_header_entries_do_not_fail_the_request(self, monkeypatch):
+        """_peer_label runs BEFORE the app is awaited, so an exception here
+        fails the request rather than costing a log line - unlike
+        _log_tool_call, which is wrapped and runs after the response. The
+        port survives, and the identity is reported as unreadable rather
+        than rendering the unmarked form, which would assert "local"."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={"client": ("127.0.0.1", 54321), "headers": [(b"only-one-item",)]},
+        )
+
+        assert "from 127.0.0.1:54321 - headers unreadable" in line
+        assert "via tailscale" not in line
+
     def test_empty_identity_header_is_not_treated_as_proxied(self, monkeypatch):
         """TailscaleAuthMiddleware treats an empty value as no identity at
         all (`if not tailscale_user`), so keying the marker on presence would
