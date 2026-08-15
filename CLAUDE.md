@@ -102,6 +102,9 @@ src/agent_event_bus/
 
 docs/BRIDGE.md     # Bridge operator docs - deliberately NOT in guide.md, which
                    # is served as an MCP resource into every session that reads it
+docs/PEER-LOGGING.md  # AGENT_EVENT_BUS_LOG_PEER operator notes (#145). Out of
+                      # CLAUDE.md for the same reason: temporary
+                      # instrumentation should not cost tokens every session
 ```
 
 ## MCP Tools
@@ -198,58 +201,12 @@ AGENT_EVENT_BUS_LOG=/path/to/custom.log AGENT_EVENT_BUS_ERR=/path/to/custom.err 
 DEV_MODE=1 agent-event-bus
 
 # "Which process is registering?" (#145). Appends the caller's peer to the
-# register_session log line:
-#     register_session(name="x") → session=brave-trex from 127.0.0.1:54321
-# Then, while the calls are live: `lsof -i :54321`. The PORT is the
-# identifying half of a DIRECT connection - the bus listens on loopback, so
-# the address alone rarely narrows anything.
-#
-# Prefer this over DEV_MODE=1 for a live diagnosis: DEV_MODE also fires a
-# desktop notification per tool call (_dev_notify) and drops the logger to
-# DEBUG, so on a host with the #145 churn you would take ~1.5 notifications
-# per minute for as long as you watch. This variable turns on peer logging
-# alone. Both work; neither is on by default - it is instrumentation, not a
-# permanent log line. To turn it back off, UNSET it: any non-empty value is
-# truthy, so `=0` still enables it (the repo-wide idiom - see helpers.py,
-# server.py, bridge.py - but this is the one documented with an explicit
-# `=1`, which invites reaching for `=0`).
-#
-# WHERE TO WATCH: `agent-event-bus.log` (`make logs`), NOT the console. The
-# console handler is created only under DEV_MODE (server.py), so a foreground
-# run with this variable alone prints nothing to the terminal - the lines are
-# there, in the file, at INFO. That is the trade the paragraph above names
-# from the other side: DEV_MODE buys you console output and charges you the
-# notification per tool call.
-#
-# Only register_session carries it: get_events runs every few seconds per
-# session and would drown the log you are reading it from.
-#
-# The five forms a peer can take: `127.0.0.1:54321` (direct - the port names
-# the caller), `... via tailscale` (see below), `unknown peer` (the server
-# reported no peer - nothing to chase), `unknown peer (unparseable)` (a peer
-# EXISTS and this label could not render it - a bug here, not a dead end;
-# note the previous form is a prefix of this one, so match the longer first),
-# and `... - headers unreadable` (the port is good, the identity check
-# failed, so a MISSING `via tailscale` there is not evidence of a local
-# caller).
-#
-# CAVEAT - `tailscale serve`: a proxied request is terminated by the LOCAL
-# tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled
-# while the real caller is somewhere on the tailnet. Those lines are marked
-# `from 127.0.0.1:54321 via tailscale` (Tailscale's identity header is the
-# only thing in the ASGI scope that distinguishes them, and loopback bypasses
-# auth - so the marker narrows the candidates, it does not authenticate).
-# An unmarked loopback peer is a local process as far as anything in the
-# scope can tell: `tailscale serve` is the only proxy this deployment puts
-# in front of the bus, but nothing here proves the absence of another.
-#
-# CAVEAT - the SUPERVISED bus does not see this. The line below is a
-# foreground invocation; `scripts/com.evansenter.agent-event-bus.plist`
-# templates only PATH, PYTHONPATH, _ICON, _LOG and _ERR, so neither this
-# variable nor DEV_MODE reaches a launchd-managed server. On the bus host,
-# either add it to the plist's EnvironmentVariables and reload the
-# LaunchAgent, or stop the service and run the bus in the foreground for the
-# duration of the diagnosis.
+# register_session log line, so `lsof -i :PORT` can name the process. Prefer
+# it over DEV_MODE for a live diagnosis (DEV_MODE also fires a desktop
+# notification per tool call). Lines land in agent-event-bus.log, not the
+# console; neither switch reaches the supervised bus (launchd or systemd).
+# To disable, UNSET it - `=0` still enables it. Temporary instrumentation -
+# full operator notes, label vocabulary and caveats in docs/PEER-LOGGING.md.
 AGENT_EVENT_BUS_LOG_PEER=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)
@@ -273,5 +230,6 @@ Notifications: Uses terminal-notifier if installed (`brew install terminal-notif
 
 - **Usage patterns, event types, channels**: `agent-event-bus://guide` or `src/agent_event_bus/guide.md`
 - **Re-awakening bridge (operators)**: `docs/BRIDGE.md`
+- **Peer logging / "which process is registering?" (#145)**: `docs/PEER-LOGGING.md`
 - **CLI usage**: `agent-event-bus-cli --help`
 - **Installation**: `README.md`
