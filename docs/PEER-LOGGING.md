@@ -33,11 +33,17 @@ a dangling pointer:
   `::test_explicit_null_headers_does_not_raise` **stay** — they pin the
   crash fix above, not the peer label
 
-`CLAUDE.md` — four references, not one:
+`CLAUDE.md` — several references, not one (no count here: the number is the
+part that goes stale when the next one is added):
 - the `AGENT_EVENT_BUS_LOG_PEER` block in Operations
+- the `(also turns on peer logging below)` parenthetical on the `DEV_MODE=1`
+  line — it dangles twice over, since "below" points at a block that is gone
+  and the side effect it describes disappears with `_peer_logging_enabled()`
 - `_LOG_PEER` in the environment-variable list (Naming Conventions)
 - the `docs/PEER-LOGGING.md` line in the Architecture tree
 - the See Also entry
+
+Grep `LOG_PEER` and `PEER-LOGGING` across the repo before calling it done.
 
 `docs/PEER-LOGGING.md`
 - this file
@@ -102,6 +108,11 @@ per session and would drown the log you are reading it from.
 
 `unknown peer` is a prefix of `unknown peer (unparseable)` and the two carry
 opposite meanings, so match the longer string first.
+
+IPv6 hosts are **bracketed** — `[::1]:54321`, `[fd7a:115c:a1e0::1]:54321` —
+which is the form `lsof`/`ss` print back. Unbracketed, there would be no way
+to see where the address ends and the port begins, and the port is the half
+you came for.
 
 ## Caveats
 
