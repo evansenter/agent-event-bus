@@ -613,22 +613,40 @@ _PUBLISH_HINT = (
     "session - this id will not come back on its own."
 )
 
+_UNREGISTER_HINT = (
+    "This session was already unregistered or timed out; there is nothing left "
+    "to clean up. Call register_session to start a new one."
+)
+
+# What a tool does when it meets a deleted session, and the only input the
+# hint is derived from. Three, not a bool, because unregister is neither a
+# refused read nor a stored write: nothing was lost and nothing was written,
+# the caller simply asked for something already done.
+_Disposition = Literal["refused", "flagged", "already_gone"]
+
+_DISPOSITION_HINTS: dict[str, str] = {
+    "refused": _READ_HINT,
+    "flagged": _PUBLISH_HINT,
+    "already_gone": _UNREGISTER_HINT,
+}
+
 
 def _deleted_session_notice(
     session: Session | None,
     tool: str,
     *,
-    rejected: bool,
+    disposition: _Disposition,
 ) -> dict | None:
     """Warn once and describe `session` if it is soft-deleted (#140, #144).
 
-    `tool` only names the caller in the warning. `rejected` says which half of
-    the contract applies: reads refuse (the `error` key) while publishes store
-    and flag, so the fields a client branches on - `session_deleted` and the
-    identity of the dead session - are shaped here once rather than twice.
-    The hint is derived from it rather than passed in, so there is no way to
-    hand a publisher "or stop polling" or tell a refused read its event was
-    stored.
+    `tool` only names the caller in the warning. `disposition` says which part
+    of the contract applies: reads refuse (the `error` key), publishes store
+    and flag, and an unregister of an already-gone session reports that it is
+    already gone. The fields a client branches on - `session_deleted` and the
+    identity of the dead session - are shaped here once rather than three
+    times. The hint is derived from it rather than passed in, so there is no
+    way to hand a publisher "or stop polling", tell a refused read its event
+    was stored, or promise an unregister caller anything is left to clean up.
 
     A deleted session's cursor and heartbeat are both frozen (every write is
     guarded by `deleted_at IS NULL`), so an orphaned poller re-asks from the
@@ -652,12 +670,20 @@ def _deleted_session_notice(
     # one get_events line and never learns the acks are failing too. Still
     # bounded (sessions x deletions x tools), still not the 100k-line problem
     # the set exists to prevent.
+    #
+    # "already_gone" is deliberately unwarned. The warning exists to surface an
+    # orphaned client still WORKING the bus; unregistering is one winding down,
+    # the single call from a dead session an operator does not need to be told
+    # about, and a double unregister is normal besides. Warning here would flag
+    # the well-behaved caller and dilute the signal. It also does not consume
+    # the warn-once slot, so a later poll or publish from the same session
+    # still warns.
     warn_key = (session_id, deleted_at_str, tool)
-    if warn_key not in _warned_deleted_sessions:
+    if disposition != "already_gone" and warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
-        disposition = "rejecting calls from" if rejected else "storing events from"
+        verb = "rejecting calls from" if disposition == "refused" else "storing events from"
         logger.warning(
-            f"{tool}: {disposition} deleted session {session.display_id} "
+            f"{tool}: {verb} deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
             f"client is still calling the bus. Further calls are logged "
             f"per-call by the request middleware."
@@ -669,11 +695,13 @@ def _deleted_session_notice(
         "session_id": session_id,
         "display_id": session.display_id,
         "deleted_at": deleted_at_str,
-        "hint": _READ_HINT if rejected else _PUBLISH_HINT,
+        "hint": _DISPOSITION_HINTS[disposition],
     }
     # First key, so the refusal reads as an error before anything else - the
-    # middleware and the CLI both branch on it.
-    return {"error": "Session deleted", **notice} if rejected else notice
+    # middleware and the CLI both branch on it. Only "flagged" omits it: that
+    # write SUCCEEDED, and a caller branching on `error` must not read a stored
+    # event as a failed one.
+    return notice if disposition == "flagged" else {"error": "Session deleted", **notice}
 
 
 def _deleted_session_error(session: Session | None, tool: str = "get_events") -> dict | None:
@@ -683,7 +711,7 @@ def _deleted_session_error(session: Session | None, tool: str = "get_events") ->
     re-deriving the contract - a second copy would drift on the response shape
     clients branch on.
     """
-    return _deleted_session_notice(session, tool, rejected=True)
+    return _deleted_session_notice(session, tool, disposition="refused")
 
 
 def _deleted_session_flag(session: Session | None) -> dict | None:
@@ -695,7 +723,21 @@ def _deleted_session_flag(session: Session | None) -> dict | None:
     fire-and-forget hooks with neither retry nor error handling. Carries no
     `error` key for that reason - the write succeeded.
     """
-    return _deleted_session_notice(session, "publish_event", rejected=False)
+    return _deleted_session_notice(session, "publish_event", disposition="flagged")
+
+
+def _deleted_session_gone(session: Session | None) -> dict | None:
+    """Report an unregister of a session that is already gone (#144).
+
+    The third session-scoped tool that can meet a deleted id, and the last
+    hole in the contract's coverage: this path reported "Session not found"
+    for a row that exists and that the bus itself deleted - the one
+    distinction #140 is built on, returned as its opposite. It was never
+    silent (the call already failed), so nothing was lost; it just named the
+    wrong reason, and a client branching on `session_deleted` got an answer
+    from three tools out of four.
+    """
+    return _deleted_session_notice(session, "unregister_session", disposition="already_gone")
 
 
 def _event_to_dict(e: Event) -> dict:
@@ -1034,7 +1076,13 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
         _dev_notify("unregister_session", "no identifier provided")
         return {"error": "Must provide either session_id or client_id"}
 
-    session = storage.get_session(session_id)
+    # include_deleted, so an id the bus deleted is told apart from one it never
+    # had. The active-only lookup collapsed both into "Session not found".
+    session = _load_polling_session(session_id)
+    gone = _deleted_session_gone(session)
+    if gone:
+        _dev_notify("unregister_session", f"{session.display_id} already deleted")
+        return gone
     if not session:
         _dev_notify("unregister_session", f"{session_id} not found")
         return {"error": "Session not found", "session_id": session_id}
@@ -1060,6 +1108,8 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
 @mcp.tool()
 async def unregister_session(session_id: str | None = None, client_id: str | None = None) -> dict:
     """Unregister from event bus. session_id takes precedence if both given.
+
+    An already-deleted session_id reports "Session deleted", not "not found".
 
     Args:
         session_id: Your session ID
