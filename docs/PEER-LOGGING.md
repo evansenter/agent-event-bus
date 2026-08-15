@@ -43,7 +43,15 @@ part that goes stale when the next one is added):
 - the `docs/PEER-LOGGING.md` line in the Architecture tree
 - the See Also entry
 
-Grep `LOG_PEER` and `PEER-LOGGING` across the repo before calling it done.
+Before calling it done, grep for every name — the identifiers match neither
+`LOG_PEER` nor `PEER-LOGGING`, so a narrower grep comes back clean over a
+half-finished removal and reads as confirmation:
+
+```bash
+grep -rE "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix" .
+```
+
+This, not the bullet list, is the part that does not rot.
 
 `docs/PEER-LOGGING.md`
 - this file
@@ -137,15 +145,31 @@ the absence of another.
 
 Both service templates carry the same short set of variables (`PYTHONPATH`,
 `AGENT_EVENT_BUS_ICON`, `_LOG`, `_ERR`; the plist adds `PATH`), so neither
-`AGENT_EVENT_BUS_LOG_PEER` nor `DEV_MODE` reaches a supervised server:
+`AGENT_EVENT_BUS_LOG_PEER` nor `DEV_MODE` reaches a supervised server.
 
-| Platform | File | Add |
+The simplest route is to **not use the service at all**: stop it and run the
+bus in the foreground for the duration of the diagnosis.
+
+To keep it supervised, note that a reload acts on the **installed** unit, not
+on the repo template — editing `scripts/…` alone changes nothing until an
+install regenerates the copy the service manager actually reads:
+
+| | macOS (launchd) | Linux (systemd) |
 |---|---|---|
-| macOS (launchd) | `scripts/com.evansenter.agent-event-bus.plist` | a key in `EnvironmentVariables`, then reload the LaunchAgent |
-| Linux (systemd) | `scripts/agent-event-bus.service` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1`, then `systemctl --user daemon-reload` |
+| **Template** (in-repo) | `scripts/com.evansenter.agent-event-bus.plist` | `scripts/agent-event-bus.service` |
+| **Installed** (what runs) | `~/Library/LaunchAgents/com.evansenter.agent-event-bus.plist` | `~/.config/systemd/user/agent-event-bus.service` |
+| **What to add** | a key in `EnvironmentVariables` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1` |
+| **Apply an installed-unit edit** | `launchctl unload` + `load` (restarts the process) | `systemctl --user daemon-reload` **and** `systemctl --user restart agent-event-bus` |
 
-Or, on either: stop the service and run the bus in the foreground for the
-duration of the diagnosis.
+Two paths, and they differ in what a reinstall does to them:
 
-Note that `make install-server` regenerates both from their templates, so a
-hand-edit does not survive a reinstall.
+- **Edit the template, then `make install-server`** — regenerates the
+  installed unit and restarts. Slower, but the change survives future
+  reinstalls, which matters if the diagnosis runs long.
+- **Edit the installed unit, then apply as above** — faster, and wiped the
+  next time `make install-server` regenerates from the template.
+
+On systemd, `daemon-reload` alone is not enough: it re-reads unit files while
+the running service keeps its old environment, so the log never grows a
+`from …` suffix and the switch looks broken. `make restart` covers both
+platforms and is equivalent to the restart half.
