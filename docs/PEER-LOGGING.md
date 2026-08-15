@@ -128,7 +128,7 @@ per session and would drown the log you are reading it from.
 | `unknown peer` | The server reported no peer — nothing to chase |
 | `unknown peer (unparseable)` | A peer **exists** and the label could not render it — a bug on that line, not a dead end |
 | `... - headers unreadable` | The port is good, the identity check failed — so a *missing* `via tailscale` here is **not** evidence of a local caller |
-| *no `from …` at all* | The switch is not reaching the process — the likeliest first observation. Either you are watching the console instead of the log (see [Where to watch](#where-to-watch)), or the bus is supervised and never saw the variable (see [the supervised-bus caveat](#the-supervised-bus-does-not-see-either-switch--on-either-platform)) |
+| *no `from …` at all* | Check the tool name first: only `register_session` carries a peer, so unsuffixed `get_events` lines are normal and mean nothing is wrong (see [Scope](#scope)). Otherwise the switch is not reaching the process — either you are watching the console instead of the log (see [Where to watch](#where-to-watch)), or the bus is supervised and never saw the variable (see [the supervised-bus caveat](#the-supervised-bus-does-not-see-either-switch--on-either-platform)) |
 
 `unknown peer` is a prefix of `unknown peer (unparseable)` and the two carry
 opposite meanings, so match the longer string first.
