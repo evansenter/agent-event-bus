@@ -43,18 +43,24 @@ part that goes stale when the next one is added):
 - the `docs/PEER-LOGGING.md` line in the Architecture tree
 - the See Also entry
 
-Before calling it done, grep for every name — the identifiers match neither
-`LOG_PEER` nor `PEER-LOGGING`, so a narrower grep comes back clean over a
-half-finished removal and reads as confirmation:
-
-```bash
-grep -rE "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix" .
-```
-
-This, not the bullet list, is the part that does not rot.
-
 `docs/PEER-LOGGING.md`
 - this file
+
+Then, last, grep for every name — the identifiers match neither `LOG_PEER` nor
+`PEER-LOGGING`, so a narrower grep comes back clean over a half-finished
+removal and reads as confirmation:
+
+```bash
+grep -rE "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix|_log_tool_call" .
+```
+
+`_log_tool_call` is in the list to put its **signature** in view: if a removal
+takes `_peer_label` and `peer_suffix` but leaves the `peer` parameter behind,
+the only surviving token is the bare word `peer`, which is useless to grep —
+so that one leftover is visible here or not at all. Its handful of hits are
+readable by eye.
+
+This, not the bullet list, is the part that does not rot.
 
 ## Turning it on
 

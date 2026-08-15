@@ -103,8 +103,8 @@ src/agent_event_bus/
 docs/BRIDGE.md     # Bridge operator docs - deliberately NOT in guide.md, which
                    # is served as an MCP resource into every session that reads it
 docs/PEER-LOGGING.md  # AGENT_EVENT_BUS_LOG_PEER operator notes (#145). Out of
-                   # CLAUDE.md for the same reason: temporary instrumentation
-                   # should not cost tokens in every session
+                      # CLAUDE.md for the same reason: temporary
+                      # instrumentation should not cost tokens every session
 ```
 
 ## MCP Tools
