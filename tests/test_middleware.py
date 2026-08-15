@@ -303,6 +303,56 @@ class TestFormatResult:
         assert "Session deleted" in result
         assert "session=" not in result
 
+    def test_deleted_publisher_is_named_on_a_stored_event(self):
+        """#144 stores the event and flags it, so there is no "error" key to
+        catch it - and the generic session_id branch would render an orphaned
+        publisher as an ordinary register."""
+        result = _format_result(
+            {
+                "event_id": 4211,
+                "channel": "all",
+                "session_deleted": True,
+                "session_id": "stale-id",
+                "display_id": "grand-bison",
+            }
+        )
+        assert "event #4211" in result
+        assert "grand-bison" in result
+        assert "session=" not in result
+
+    def test_normal_publish_is_unchanged(self):
+        result = _format_result({"event_id": 7, "channel": "all"})
+        assert "event #7" in result
+        assert "deleted" not in result
+
+    def test_real_flagged_publish_result_renders_as_deleted(self):
+        """The other tests here hand-build the dict, so nothing ties this
+        renderer to the shape _publish_event_impl actually produces: rename a
+        key there and the server tests still pass (they assert on the
+        response), these still pass (they assert on a literal), and `make logs`
+        quietly falls back to rendering an orphaned publisher as a register.
+        This is the one assertion that spans both."""
+        from agent_event_bus import server
+
+        reg = server._register_session_impl(name="log-publish", client_id="log-publish-client")
+        server.storage.delete_session(reg["session_id"])
+
+        published = server._publish_event_impl(
+            event_type="note", payload="orphaned", session_id=reg["session_id"]
+        )
+
+        rendered = _format_result(published)
+        assert "from deleted" in rendered
+        assert reg["display_id"] in rendered
+
+    def test_flagged_call_without_event_details_still_names_the_session(self):
+        """The branch is keyed on session_deleted, not on session_deleted plus
+        event_id: a flagging disposition carries no "error" to catch it, so
+        anything missing this guard renders as an ordinary register."""
+        result = _format_result({"session_deleted": True, "display_id": "grand-bison"})
+        assert "grand-bison" in result
+        assert "session=" not in result
+
     def test_structured_content_unwrapping(self):
         """FastMCP structuredContent wrapper is unwrapped."""
         wrapped = {
