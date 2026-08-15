@@ -51,8 +51,14 @@ Then, last, grep for every name — the identifiers match neither `LOG_PEER` nor
 removal and reads as confirmation:
 
 ```bash
-grep -rE "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix|_log_tool_call" .
+git grep -E "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix|_log_tool_call"
 ```
+
+`git grep`, not `grep -r`: the latter descends into ignored artifacts, and
+`htmlcov/` is a rendered copy of the source — so a stale coverage report keeps
+reporting `_peer_label` long after a correct removal, and the operator goes
+hunting for a leftover that is not there. Tracked files are exactly the set
+the checklist above enumerates, and stay so as new ignored artifacts appear.
 
 `_log_tool_call` is in the list to put its **signature** in view: if a removal
 takes `_peer_label` and `peer_suffix` but leaves the `peer` parameter behind,
