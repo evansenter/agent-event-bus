@@ -1109,6 +1109,11 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
         # race - reporting success here would be this PR's own bug arriving
         # through the TOCTOU door, and it would publish a SECOND
         # session_unregistered event for one session ending.
+        # Announced like every other exit from this function. _deleted_session_gone
+        # cannot cover for it: its _dev_notify sits inside the warn block, which
+        # already_gone deliberately skips - so without this line the one outcome
+        # an operator most wants surfaced is the only silent one.
+        _dev_notify("unregister_session", f"{session.display_id} deleted concurrently")
         raced = _deleted_session_gone(_load_polling_session(session_id))
         return raced or {"error": "Session not found", "session_id": session_id}
 

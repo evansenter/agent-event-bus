@@ -1870,21 +1870,40 @@ class TestDeletedSessionUnregister:
         assert result["error"] == "Session not found"
         assert "session_deleted" not in result
 
-    def test_a_live_client_id_still_wins_over_a_deleted_row(self):
-        """include_deleted widens the lookup, so the ordering that puts active
-        rows first is now load-bearing: re-registering under the same
-        client_id must still unregister the LIVE session."""
-        machine = socket.gethostname()
-        register_session(name="unreg-revive", machine=machine, client_id="unreg-revive-cid")
-        unregister_session(client_id="unreg-revive-cid")
-        second = register_session(
-            name="unreg-revive", machine=machine, client_id="unreg-revive-cid"
-        )
+    def test_a_live_row_wins_over_a_deleted_one_sharing_a_client_id(self):
+        """include_deleted widens the lookup, so find_session_by_client's
+        `ORDER BY deleted_at IS NOT NULL` is now load-bearing: with both a
+        deleted and a live row under one client_id, unregister must take the
+        LIVE one.
 
-        result = unregister_session(client_id="unreg-revive-cid")
+        Built through storage directly, NOT through register_session: that
+        revives a deleted row in place (add_session is INSERT OR REPLACE keyed
+        on id, and `id` IS the client_id when one is given), so it can never
+        produce the two-row state this ordering exists for - and a test
+        written that way stays green with the ORDER BY deleted.
+        """
+        machine = socket.gethostname()
+        now = datetime.now()
+        for sid in ("unreg-order-old", "unreg-order-live"):
+            server.storage.add_session(
+                Session(
+                    id=sid,
+                    display_id=f"dino-{sid.rsplit('-', 1)[-1]}",
+                    name="unreg-order",
+                    machine=machine,
+                    cwd="/x",
+                    repo="x",
+                    registered_at=now,
+                    last_heartbeat=now,
+                    client_id="unreg-order-cid",
+                )
+            )
+        assert server.storage.delete_session("unreg-order-old")
+
+        result = unregister_session(client_id="unreg-order-cid")
 
         assert result["success"] is True
-        assert result["session_id"] == second["session_id"]
+        assert result["session_id"] == "unreg-order-live"
 
     def test_losing_the_delete_race_does_not_report_success(self):
         """delete_session is guarded by `deleted_at IS NULL`, so a concurrent

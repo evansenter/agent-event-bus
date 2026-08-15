@@ -225,7 +225,15 @@ def cmd_unregister(args):
     result = call_tool("unregister_session", arguments, url=args.url)
 
     if "error" in result:
-        print(f"Error: {result['error']}", file=sys.stderr)
+        # The hint, like cmd_publish/cmd_events/cmd_ack. This is the surface
+        # shutdown hooks actually call, and the deleted-session hint is the
+        # actionable half - without it the caller gets a better error string
+        # and nothing to do about it. Exit code unchanged: it errored before,
+        # it errors now, only the reason is right.
+        message = f"Error: {result['error']}"
+        if result.get("hint"):
+            message += f"\n{result['hint']}"
+        print(message, file=sys.stderr)
         sys.exit(1)
 
     print(json.dumps(result, indent=2))
