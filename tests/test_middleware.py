@@ -983,11 +983,17 @@ class TestPeerLogging:
         line = self._run(monkeypatch, scope_extra={})
 
         assert "from unknown peer" in line
+        # The server said there is no peer - expected, nothing to chase. Not
+        # the same event as a peer this label could not render.
+        assert "unparseable" not in line
 
     def test_malformed_client_does_not_break_logging(self, monkeypatch):
+        """Distinguished from the absent-peer case: here a peer exists and
+        rendering it failed, which is something to chase (and a bug on that
+        line) rather than a dead end."""
         line = self._run(monkeypatch, scope_extra={"client": "127.0.0.1"})
 
-        assert "from unknown peer" in line
+        assert "from unknown peer (unparseable)" in line
         assert "register_session" in line
 
     def test_the_no_args_log_branch_carries_the_peer_too(self, monkeypatch):

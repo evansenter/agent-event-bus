@@ -212,8 +212,21 @@ DEV_MODE=1 agent-event-bus
 # server.py, bridge.py - but this is the one documented with an explicit
 # `=1`, which invites reaching for `=0`).
 #
+# WHERE TO WATCH: `agent-event-bus.log` (`make logs`), NOT the console. The
+# console handler is created only under DEV_MODE (server.py), so a foreground
+# run with this variable alone prints nothing to the terminal - the lines are
+# there, in the file, at INFO. That is the trade the paragraph above names
+# from the other side: DEV_MODE buys you console output and charges you the
+# notification per tool call.
+#
 # Only register_session carries it: get_events runs every few seconds per
 # session and would drown the log you are reading it from.
+#
+# The four forms a peer can take: `127.0.0.1:54321` (direct - the port names
+# the caller), `... via tailscale` (see below), `unknown peer` (the server
+# reported no peer - nothing to chase), and `... - headers unreadable` (the
+# port is good, the identity check failed, so a MISSING `via tailscale` there
+# is not evidence of a local caller).
 #
 # CAVEAT - `tailscale serve`: a proxied request is terminated by the LOCAL
 # tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled

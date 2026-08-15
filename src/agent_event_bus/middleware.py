@@ -459,7 +459,11 @@ def _peer_label(scope) -> str | None:
     try:
         host, port = client
     except (TypeError, ValueError):
-        return "unknown peer"
+        # Distinct from the branch above: there, the server told us there is
+        # no peer (expected, nothing to chase). Here it handed over a shape
+        # this label did not anticipate - the peer exists and rendering it
+        # failed, which is a bug on this line rather than a dead end.
+        return "unknown peer (unparseable)"
 
     # Bracket an IPv6 host. `from ::1:54321` gives a reader no way to see
     # where the address ends and the port begins, and the port is the half
