@@ -19,6 +19,7 @@ from agent_event_bus.bridge import (
     verify_signature,
 )
 from agent_event_bus.server import SIGNATURE_HEADER, _compute_signature
+from agent_event_bus.wake import MuxTarget
 
 
 def sign(body: bytes, secret: str) -> str:
@@ -260,15 +261,32 @@ class TestBusTimingContract:
         """The bus's per-attempt clock (WEBHOOK_TIMEOUT) starts before the
         bridge's, so a bridge-side bound at or above it guarantees the bus
         times out and retries instead of ever seeing the bounded response
-        (500 for a stuck spool lock, 200 for a failed tmux wake). Pin the
+        (500 for a stuck spool lock, 200 for a failed wake). Pin the
         headroom - including the sum, since one request can hit lock
-        contention AND a slow tmux."""
+        contention AND a slow multiplexer.
+
+        MUX_TIMEOUT is a total budget, but it is not the true worst case:
+        _mux_wake floors each call's slice at MUX_CALL_MIN_TIMEOUT, so a
+        multi-call backend whose FIRST call eats the whole budget still gets
+        that floor for each remaining call. The real bound is therefore
+        MUX_TIMEOUT + (calls - 1) x MUX_CALL_MIN_TIMEOUT, and that is what
+        has to fit - asserting the budget alone would leave the overrun the
+        floor introduces unmeasured."""
         from agent_event_bus.server import WEBHOOK_TIMEOUT
 
         spool_deadline = bridge.SPOOL_LOCK_ATTEMPTS * bridge.SPOOL_LOCK_RETRY_SECONDS
+        # Derived from the injector itself rather than hardcoded at 2, so a
+        # backend added with more calls re-checks this bound instead of
+        # silently invalidating it.
+        max_calls = max(
+            len(bridge.Injector._wake_argv(MuxTarget(mux="tmux", pane="%0"))),
+            len(bridge.Injector._wake_argv(MuxTarget(mux="zellij", pane="0", session="s"))),
+        )
+        worst_case_injection = bridge.MUX_TIMEOUT + (max_calls - 1) * bridge.MUX_CALL_MIN_TIMEOUT
+
         assert spool_deadline < WEBHOOK_TIMEOUT
-        assert bridge.MUX_TIMEOUT < WEBHOOK_TIMEOUT
-        assert spool_deadline + bridge.MUX_TIMEOUT < WEBHOOK_TIMEOUT
+        assert worst_case_injection < WEBHOOK_TIMEOUT
+        assert spool_deadline + worst_case_injection < WEBHOOK_TIMEOUT
 
 
 class TestImportHygiene:
@@ -2654,14 +2672,27 @@ class TestEnvValidation:
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
         assert config.backend == "mux"
 
-    def test_mux_backend_without_any_binary_is_refused(self, monkeypatch):
-        """A mux backend on a box with no multiplexer at all would degrade
-        every wake to spool-mux-failed for the daemon's lifetime - one named
-        startup error beats discovering it per-DM."""
+    def test_mux_backend_without_any_binary_warns_but_starts(self, monkeypatch, caplog):
+        """MUST NOT refuse. `mux` is the checked-in plist default, so a
+        SystemExit here is a launchd crash loop (KeepAlive, ThrottleInterval
+        10) on any host without a multiplexer - taking out a previously
+        working spool bridge entirely: no listener, no webhook registration,
+        no spool lines. That is strictly worse than the condition it reports,
+        and it would contradict the default's justification, that an operator
+        who has not opted into injection pays nothing for it.
+
+        Nothing is lost: the old refusal's value was "one startup message
+        beats discovering it per-DM", and the WARNING is that message."""
+        import logging
+
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "mux")
         monkeypatch.setattr(bridge.shutil, "which", lambda _: None)
-        with pytest.raises(SystemExit, match="none of tmux, zellij"):
-            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+        assert config.backend == "mux"
+        assert "none of tmux, zellij" in caplog.text
 
     def test_mux_backend_accepts_a_single_available_binary(self, monkeypatch):
         """ANY supported mux satisfies the preflight, not all of them: which

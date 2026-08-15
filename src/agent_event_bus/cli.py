@@ -552,6 +552,24 @@ def cmd_panes(args):
     session_id = _resolve_wake_session_id(args)
     wake_dir = Path(args.wake_dir) if args.wake_dir else wake_dir_from_env()
 
+    # Both verbs run at a session lifecycle boundary, and reaching either one
+    # PROVES no turn is in flight - so both clear the turn-state marker.
+    #
+    # Not a convenience. The idle gate's no-TTL argument rests on the marker
+    # self-healing at SessionStart, and wiring that only into a separate
+    # `wake-state idle` call would make the invariant depend on an operator
+    # remembering a second command: a session hard-killed mid-turn and then
+    # resumed would map its pane correctly and still sit gated `spool-busy`
+    # while idle, until its human happened to complete a turn. At SessionEnd
+    # it also stops the marker leaking - `wake.py` deliberately names it
+    # outside the `<sid>.jsonl*` glob the spool-pruning follow-up will sweep,
+    # so nothing else would ever collect it.
+    #
+    # Before the target detection below, not after: `set` returns early
+    # outside a multiplexer, and clearing turn state does not depend on
+    # having a pane to wake.
+    clear_busy(wake_dir, session_id)
+
     if args.panes_command == "set":
         if args.mux:
             target = MuxTarget(mux=args.mux, pane=args.pane, session=args.mux_session)

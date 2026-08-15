@@ -1956,29 +1956,44 @@ def config_from_args(args: argparse.Namespace) -> BridgeConfig:
     except BridgeConfigError as e:
         raise SystemExit(str(e)) from None
     # Preflight the binaries (CLI path only - embedders manage their own
-    # runtime env): a mux backend on a box with NO multiplexer would degrade
-    # every wake to spool-mux-failed for the daemon's lifetime - one
-    # startup message beats discovering it per-DM, and the check is
-    # PATH-sensitive, so it names the fix. A mux that breaks LATER is
-    # still handled (and bounded) by the wake-failure guard.
+    # runtime env). PATH-sensitive, so the message names the fix: a
+    # supervisor's minimal PATH can hide a binary your shell sees.
     #
     # ANY supported mux satisfies it, not all of them: which one a given
     # delivery needs is a property of that session's panes.json entry, not of
-    # the daemon, so a tmux-only host must not be refused for lacking zellij.
+    # the daemon, so a tmux-only host must not be warned about lacking zellij.
     # A mapping naming an absent binary is a per-entry OSError on the
     # wake-failure arm.
+    #
+    # WARNS rather than refuses, and that is deliberate. The tmux-only
+    # ancestor of this check raised SystemExit, which was defensible when the
+    # backend was something an operator typed - but `mux` is now the CHECKED-IN
+    # plist default, so a refusal here is a launchd crash loop (KeepAlive,
+    # ThrottleInterval 10) on any host without a multiplexer. That would take
+    # out a previously-working spool bridge entirely: no listener, no webhook
+    # registration, no spool lines. Strictly worse than the condition it
+    # reports, and it would contradict this default's whole justification -
+    # that an operator who has not opted into injection pays nothing for it.
+    #
+    # Nothing is lost by warning. The value of the old refusal was "one startup
+    # message beats discovering it per-DM", and a startup WARNING is that
+    # message. Meanwhile the daemon keeps binding, registering, spooling and
+    # answering /health - and with no multiplexer there is also nothing to
+    # WRITE a panes.json, so every delivery lands on spool-unmapped anyway.
     if config.backend == "mux":
         available = [mux for mux in SUPPORTED_MUXES if shutil.which(mux) is not None]
-        if not available:
-            raise SystemExit(
+        if available:
+            # Which ones are present is the first thing to check when wakes
+            # fail for one mux and not the other, and PATH differences between
+            # a supervisor and a shell are exactly why that happens.
+            logger.info(f"Wake injection available via: {', '.join(available)}")
+        else:
+            logger.warning(
                 f"Backend is mux but none of {', '.join(SUPPORTED_MUXES)} is on PATH "
                 "of THIS process (a supervisor's minimal PATH can hide a binary "
-                "your shell sees; check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND)"
+                "your shell sees; check --backend / AGENT_EVENT_BUS_BRIDGE_BACKEND). "
+                "Continuing: events are still spooled, but nothing will be woken."
             )
-        # Which ones are present is the first thing to check when wakes fail
-        # for one mux and not the other, and PATH differences between a
-        # supervisor and a shell are exactly why that happens.
-        logger.info(f"Wake injection available via: {', '.join(available)}")
     # One derivation for the warning block below - the refusals above
     # already validated both URLs, so these cannot raise
     hook = bridge_hook_url(config)

@@ -40,7 +40,13 @@
 
              Injection is additionally gated on the session being between
              turns (a <session_id>.busy marker), so a wake never lands
-             mid-turn where a permission dialog could consume it. -->
+             mid-turn where a permission dialog could consume it.
+
+             Safe on a host with NO multiplexer too: the startup check warns
+             rather than exiting, precisely because this is a checked-in
+             default. A fatal check here would be a crash loop under the
+             KeepAlive below, killing a working spool bridge on a machine
+             whose operator never asked for injection. -->
         <key>AGENT_EVENT_BUS_BRIDGE_BACKEND</key>
         <string>mux</string>
         <!-- AGENT_EVENT_BUS_URL is deliberately NOT set: unset means the

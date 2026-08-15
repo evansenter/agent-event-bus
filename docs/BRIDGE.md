@@ -231,12 +231,18 @@ addressed to its `session_id` - see **Verifying a wake** below.
   The woken session reads the actual event from the bus (or the spool), as
   quoted data it can judge.
 
-  Requires **at least one** supported multiplexer on the daemon's PATH at
-  startup - the bridge REFUSES TO START with none, and logs which it found.
-  It does not require *all* of them: which one a delivery needs is a property
-  of that session's `panes.json` entry, not of the daemon, so a tmux-only
-  host is not refused for lacking zellij (a mapping naming an absent binary
-  degrades per-wake instead). The check is PATH-sensitive: a supervisor's
+  At startup the bridge logs which supported multiplexers it found, and
+  **warns without refusing** when it finds none. It deliberately does not
+  exit: `mux` is the checked-in plist default, so a refusal would be a
+  launchd crash loop on any host without a multiplexer - killing a
+  previously-working spool bridge outright (no listener, no webhook
+  registration, no spool lines), which is worse than the condition it
+  reports. With no multiplexer there is also nothing to *write* a
+  `panes.json`, so every delivery lands on `spool-unmapped` regardless.
+  It does not require *all* of them either: which one a delivery needs is a
+  property of that session's `panes.json` entry, not of the daemon, so a
+  tmux-only host is not warned about lacking zellij (a mapping naming an
+  absent binary degrades per-wake instead). The check is PATH-sensitive: a supervisor's
   minimal PATH (launchd defaults to `/usr/bin:/bin:/usr/sbin:/sbin`) can hide
   a Homebrew binary your shell sees, so put it on the *daemon's* PATH, not
   just yours. A multiplexer that breaks *later* degrades per-wake to spool.
@@ -276,6 +282,12 @@ agent-event-bus-cli panes clear --session-id "$SESSION_ID"
 agent-event-bus-cli wake-state busy --session-id "$SESSION_ID"
 agent-event-bus-cli wake-state idle --session-id "$SESSION_ID"
 ```
+
+Both `panes` verbs also clear the turn-state marker, because reaching either
+lifecycle boundary proves no turn is in flight. That is what makes the idle
+gate's self-heal below hold for anyone following this contract, rather than
+depending on a separate `wake-state idle` call at SessionStart that an
+operator might not wire.
 
 `--session-id` falls back to `AGENT_EVENT_BUS_SESSION_ID` then
 `CLAUDE_CODE_SESSION_ID`. Claude Code's session id *is* the bus session id: the
@@ -348,10 +360,11 @@ injected text plus a newline to answer it.
 The marker has **no staleness window**, deliberately. It outlives its session
 only when SessionEnd never ran (hard kill, crash, reboot), and then the session
 is gone, so declining to inject is correct rather than a bug - the alternative
-is typing into whatever now owns the pane. A resumed session clears it at
-SessionStart; a Stop hook that timed out and orphaned one on a live session has
-it cleared by the next turn's Stop. Both self-heal, so a TTL would buy nothing
-and would open a mid-turn injection window on any turn that ran longer than it.
+is typing into whatever now owns the pane. A resumed session clears it via
+`panes set` at SessionStart; a Stop hook that timed out and orphaned one on a
+live session has it cleared by the next turn's Stop. Both self-heal, so a TTL
+would buy nothing and would open a mid-turn injection window on any turn that
+ran longer than it.
 
 **Failure modes this does not solve**, stated rather than papered over:
 

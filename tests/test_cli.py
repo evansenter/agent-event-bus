@@ -1512,6 +1512,53 @@ class TestCmdPanes:
         assert json.loads(capsys.readouterr().out)["removed"] == ["sid-1"]
         assert json.loads((tmp_path / "panes.json").read_text()) == {}
 
+    def test_set_clears_a_stale_busy_marker(self, tmp_path, monkeypatch):
+        """The idle gate's no-TTL argument RESTS on this. Without it, a
+        session hard-killed mid-turn and then resumed maps its pane correctly
+        and still sits gated `spool-busy` while idle, until its human happens
+        to complete a turn - and nothing anywhere reports it.
+
+        It lives in `panes set` rather than in a separate `wake-state idle`
+        call at SessionStart so the invariant holds for anyone following the
+        documented contract, instead of depending on a second command they
+        might not wire."""
+        from agent_event_bus import wake
+
+        monkeypatch.setenv("TMUX_PANE", "%1")
+        wake.set_busy(tmp_path, "sid-1")
+
+        cli.cmd_panes(panes_args("set", tmp_path))
+
+        assert wake.is_busy(tmp_path, "sid-1") is False
+
+    def test_set_clears_the_marker_even_outside_a_multiplexer(self, tmp_path, monkeypatch):
+        """The clear must precede the target detection: `set` returns early
+        with no pane to map, but turn state does not depend on having one."""
+        from agent_event_bus import wake
+
+        for var in ("TMUX_PANE", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME"):
+            monkeypatch.delenv(var, raising=False)
+        wake.set_busy(tmp_path, "sid-1")
+
+        cli.cmd_panes(panes_args("set", tmp_path))
+
+        assert wake.is_busy(tmp_path, "sid-1") is False
+
+    def test_clear_also_removes_the_busy_marker(self, tmp_path, monkeypatch):
+        """Otherwise the marker leaks: a session that ends without its Stop
+        hook firing leaves one behind forever, and wake.py deliberately names
+        it outside the `<sid>.jsonl*` glob the spool-pruning follow-up will
+        sweep, so nothing else would ever collect it."""
+        from agent_event_bus import wake
+
+        monkeypatch.setenv("TMUX_PANE", "%1")
+        cli.cmd_panes(panes_args("set", tmp_path))
+        wake.set_busy(tmp_path, "sid-1")
+
+        cli.cmd_panes(panes_args("clear", tmp_path))
+
+        assert wake.is_busy(tmp_path, "sid-1") is False
+
     def test_missing_session_id_exits_2(self, tmp_path, monkeypatch):
         """Exit 2, not 1: "you didn't tell me which session" is a wiring bug a
         hook should surface, and needs a different fix from a bus or
