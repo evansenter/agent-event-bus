@@ -46,9 +46,12 @@ part that goes stale when the next one is added):
 `docs/PEER-LOGGING.md`
 - this file
 
-Then, last, grep for every name — the identifiers match neither `LOG_PEER` nor
-`PEER-LOGGING`, so a narrower grep comes back clean over a half-finished
-removal and reads as confirmation:
+Then, last, grep for every name. This step is self-erasing — it runs after
+this file is gone, because deleting it changes the output — so copy the
+command out first, or recover it with `git show HEAD:docs/PEER-LOGGING.md`.
+
+The identifiers match neither `LOG_PEER` nor `PEER-LOGGING`, so a narrower
+grep comes back clean over a half-finished removal and reads as confirmation:
 
 ```bash
 git grep -E "LOG_PEER|PEER-LOGGING|_peer_label|_peer_logging_enabled|PEER_LOGGED_TOOLS|peer_suffix|_log_tool_call"
@@ -125,6 +128,7 @@ per session and would drown the log you are reading it from.
 | `unknown peer` | The server reported no peer — nothing to chase |
 | `unknown peer (unparseable)` | A peer **exists** and the label could not render it — a bug on that line, not a dead end |
 | `... - headers unreadable` | The port is good, the identity check failed — so a *missing* `via tailscale` here is **not** evidence of a local caller |
+| *no `from …` at all* | The switch is not reaching the process — the likeliest first observation. Either you are watching the console instead of the log (see [Where to watch](#where-to-watch)), or the bus is supervised and never saw the variable (see [the supervised-bus caveat](#the-supervised-bus-does-not-see-either-switch--on-either-platform)) |
 
 `unknown peer` is a prefix of `unknown peer (unparseable)` and the two carry
 opposite meanings, so match the longer string first.
@@ -170,7 +174,7 @@ install regenerates the copy the service manager actually reads:
 |---|---|---|
 | **Template** (in-repo) | `scripts/com.evansenter.agent-event-bus.plist` | `scripts/agent-event-bus.service` |
 | **Installed** (what runs) | `~/Library/LaunchAgents/com.evansenter.agent-event-bus.plist` | `~/.config/systemd/user/agent-event-bus.service` |
-| **What to add** | a key in `EnvironmentVariables` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1` |
+| **What to add** | a key in `EnvironmentVariables` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1`, under `[Service]` — beside the four already there |
 | **Apply an installed-unit edit** | `launchctl unload` + `load` (restarts the process) | `systemctl --user daemon-reload` **and** `systemctl --user restart agent-event-bus` |
 
 Two paths, and they differ in what a reinstall does to them:
