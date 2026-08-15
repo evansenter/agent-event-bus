@@ -48,7 +48,9 @@ part that goes stale when the next one is added):
 
 Then, last, grep for every name. This step is self-erasing — it runs after
 this file is gone, because deleting it changes the output — so copy the
-command out first, or recover it with `git show HEAD:docs/PEER-LOGGING.md`.
+command out first. To recover it afterwards, mind which side of the commit
+you are on: `git show HEAD:docs/PEER-LOGGING.md` while the deletion is still
+uncommitted, `git show HEAD~1:docs/PEER-LOGGING.md` once it has landed.
 
 The identifiers match neither `LOG_PEER` nor `PEER-LOGGING`, so a narrower
 grep comes back clean over a half-finished removal and reads as confirmation:
@@ -174,7 +176,7 @@ install regenerates the copy the service manager actually reads:
 |---|---|---|
 | **Template** (in-repo) | `scripts/com.evansenter.agent-event-bus.plist` | `scripts/agent-event-bus.service` |
 | **Installed** (what runs) | `~/Library/LaunchAgents/com.evansenter.agent-event-bus.plist` | `~/.config/systemd/user/agent-event-bus.service` |
-| **What to add** | a key in `EnvironmentVariables` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1`, under `[Service]` — beside the four already there |
+| **What to add** | a key in `EnvironmentVariables` | `Environment=AGENT_EVENT_BUS_LOG_PEER=1`, under `[Service]` — beside the other `Environment=` lines |
 | **Apply an installed-unit edit** | `launchctl unload` + `load` (restarts the process) | `systemctl --user daemon-reload` **and** `systemctl --user restart agent-event-bus` |
 
 Two paths, and they differ in what a reinstall does to them:
