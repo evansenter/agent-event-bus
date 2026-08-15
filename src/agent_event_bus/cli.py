@@ -327,6 +327,23 @@ def cmd_publish(args):
     result = call_tool("publish_event", arguments, url=args.url)
     print(json.dumps(result, indent=2))
 
+    if result.get("session_deleted"):
+        # Exit status stays 0 and the event id is real: #144 stores the event
+        # and flags it. The warning goes to stderr because the callers this
+        # actually reaches are hooks that discard stdout, and it names the id
+        # the operator would grep for.
+        #
+        # Only the preamble is written here - naming the id an operator would
+        # grep for is the CLI-specific half. The rest is the server's `hint`,
+        # echoed rather than reworded: a second wording of one contract drifts,
+        # and this one had already dropped "will not come back on its own",
+        # which is what makes re-registering mandatory rather than optional.
+        name = result.get("display_id") or session_id
+        warning = f"Warning: session {name} was deleted at {result.get('deleted_at')}."
+        if result.get("hint"):
+            warning += f" {result['hint']}"
+        print(warning, file=sys.stderr)
+
 
 def cmd_events(args):
     """Get recent events."""

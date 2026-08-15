@@ -338,7 +338,43 @@ knows it deleted are an error. The one exception predates this: `resume=True`
 with an unknown id returns `{"error": "Session not found"}`, since there is no
 cursor to resume from.
 
-**Finding orphaned pollers** on a bus host:
+**Publishing goes the other way**: `publish_event` with a deleted `session_id`
+still stores the event, and flags the response instead of failing it.
+
+```
+publish_event(event_type="task_completed", payload="done", session_id="stale-id")
+→ {
+    event_id: 4211,          # the event landed, under the deleted id
+    event_type: "task_completed",
+    channel: "all",
+    signal_level: "info",
+    session_deleted: true,   # ...but this session is gone
+    session_id: "stale-id",
+    display_id: "grand-bison",
+    deleted_at: "2026-03-21T11:04:00",
+    hint: "..."
+  }
+```
+
+There is **no `error` key** here — a client branching on `error` must not read
+this as a failed write. Branch on `session_deleted` instead. The asymmetry with
+reads is deliberate: a rejected poll costs one empty loop iteration, while a
+rejected publish loses the event outright, and the most common publishers are
+fire-and-forget hooks with no retry and no error handling. The event keeps its
+original attribution rather than falling back to `anonymous`, so which dead
+session published stays on the record.
+
+Attribution costs downstream consumers nothing: deletion is *soft*, so the row
+stays in `sessions` and `events.session_id` still joins against `sessions.id`.
+A consumer only loses these events if it filters on `deleted_at IS NULL` — the
+events point at a real row that `list_sessions` happens not to return.
+
+**Handling it** is the same as for a poll: `register_session` (same `client_id`
+to revive) and publish under the live id from then on. Nothing needs re-sending
+— the flagged event is already stored. The CLI exits **0** and prints the
+warning to stderr, since the publish succeeded.
+
+**Finding orphaned pollers and publishers** on a bus host:
 
 ```sql
 SELECT display_id, last_cursor, deleted_at FROM sessions WHERE deleted_at IS NOT NULL;
@@ -349,10 +385,41 @@ every call with the caller's name, so an orphaned poller's rejections read:
 
 ```
 [grand-bison] get_events(order=asc, limit=20, resume=true) → ERROR: Session deleted
+[grand-bison] publish_event(...) → event #4211 [all] from deleted grand-bison
 ```
 
-Recent hits mean the poller is still running. The server also logs one
-`WARNING` naming the session the first time it is rejected after a restart.
+Recent hits mean the client is still running. The server also logs one
+`WARNING` naming the session the first time it polls, and one the first time it
+publishes, after a restart.
+
+Events published after a deletion are also queryable directly:
+
+```sql
+SELECT s.id, s.display_id, COUNT(e.id) AS events_after_deletion
+FROM sessions s
+JOIN events e ON e.session_id = s.id
+             AND e.timestamp > s.deleted_at
+             AND e.event_type != 'session_unregistered'
+WHERE s.deleted_at IS NOT NULL
+GROUP BY s.id;
+```
+
+The `session_unregistered` exclusion is what makes this query readable:
+`unregister_session` soft-deletes the session *first* and then writes its
+bookkeeping event under the same id, so without it every session that ever
+exited cleanly comes back with `events_after_deletion = 1` and the actual
+orphan is buried among them. (That event is written straight to storage, so it
+is never itself flagged.) Sessions swept by the heartbeat timeout write no
+event at all, and so appear here only for real post-deletion publishes. The
+exclusion is keyed on `event_type`, so a genuine post-deletion publish that
+happens to *be* a `session_unregistered` event hides here too — the right
+trade for a detection query, but worth knowing before the output surprises you.
+
+Group by `s.id`, not `display_id`: display names are drawn at random with no
+uniqueness constraint, so two sessions on a long-lived host can share one
+(~50% odds by the sixtieth session). Grouping on the name would sum their
+counts into a single row and leave you unable to tell one orphan publishing
+three times from three sessions publishing once.
 
 ## Structured Payload Fields
 

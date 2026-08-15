@@ -260,6 +260,46 @@ class TestCmdPublish:
         )
 
     @patch("agent_event_bus.cli.call_tool")
+    def test_publish_warns_but_succeeds_for_a_deleted_session(self, mock_call, capsys):
+        """#144: the event was stored, so the exit status stays 0 - but the
+        warning has to reach stderr, since the hooks this affects discard
+        stdout and would otherwise never see the flag.
+
+        Driven by a real flagged publish rather than a hand-built dict:
+        cmd_publish reads display_id, deleted_at, hint, and session_deleted by
+        name, so a mock of its own invention would keep passing while a renamed
+        key sent the real CLI down `result.get("display_id") or session_id` and
+        printed a raw UUID - losing the greppable name that is the whole reason
+        the CLI writes a preamble at all.
+        """
+        from agent_event_bus import server
+        from agent_event_bus.server import _PUBLISH_HINT
+
+        reg = server._register_session_impl(name="cli-orphan", client_id="cli-orphan-client")
+        server.storage.delete_session(reg["session_id"])
+        mock_call.return_value = server._publish_event_impl(
+            event_type="note", payload="orphaned", session_id=reg["session_id"]
+        )
+
+        cli.cmd_publish(make_publish_args(session_id=reg["session_id"]))
+
+        captured = capsys.readouterr()
+        assert reg["display_id"] in captured.err
+        # The server's hint verbatim, not a second wording of it - the CLI
+        # writes only the preamble naming the id to grep for
+        assert _PUBLISH_HINT in captured.err
+        # The event id still lands on stdout for anything parsing the result
+        assert str(mock_call.return_value["event_id"]) in captured.out
+
+    @patch("agent_event_bus.cli.call_tool")
+    def test_publish_is_silent_for_a_live_session(self, mock_call, capsys):
+        mock_call.return_value = {"event_id": 1}
+
+        cli.cmd_publish(make_publish_args(session_id="live-id"))
+
+        assert capsys.readouterr().err == ""
+
+    @patch("agent_event_bus.cli.call_tool")
     def test_publish_with_channel(self, mock_call):
         """Test publish with channel."""
         mock_call.return_value = {"event_id": 1}
