@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from starlette.testclient import TestClient
 
-from agent_event_bus import bridge
+from agent_event_bus import bridge, wake
 from agent_event_bus.bridge import (
     BridgeConfig,
     Injector,
@@ -19,6 +19,7 @@ from agent_event_bus.bridge import (
     verify_signature,
 )
 from agent_event_bus.server import SIGNATURE_HEADER, _compute_signature
+from agent_event_bus.wake import MuxTarget
 
 
 def sign(body: bytes, secret: str) -> str:
@@ -260,15 +261,32 @@ class TestBusTimingContract:
         """The bus's per-attempt clock (WEBHOOK_TIMEOUT) starts before the
         bridge's, so a bridge-side bound at or above it guarantees the bus
         times out and retries instead of ever seeing the bounded response
-        (500 for a stuck spool lock, 200 for a failed tmux wake). Pin the
+        (500 for a stuck spool lock, 200 for a failed wake). Pin the
         headroom - including the sum, since one request can hit lock
-        contention AND a slow tmux."""
+        contention AND a slow multiplexer.
+
+        MUX_TIMEOUT is a total budget, but it is not the true worst case:
+        _mux_wake floors each call's slice at MUX_CALL_MIN_TIMEOUT, so a
+        multi-call backend whose FIRST call eats the whole budget still gets
+        that floor for each remaining call. The real bound is therefore
+        MUX_TIMEOUT + (calls - 1) x MUX_CALL_MIN_TIMEOUT, and that is what
+        has to fit - asserting the budget alone would leave the overrun the
+        floor introduces unmeasured."""
         from agent_event_bus.server import WEBHOOK_TIMEOUT
 
         spool_deadline = bridge.SPOOL_LOCK_ATTEMPTS * bridge.SPOOL_LOCK_RETRY_SECONDS
+        # Derived from the injector itself rather than hardcoded at 2, so a
+        # backend added with more calls re-checks this bound instead of
+        # silently invalidating it.
+        max_calls = max(
+            len(bridge.Injector._wake_argv(MuxTarget(mux="tmux", pane="%0"))),
+            len(bridge.Injector._wake_argv(MuxTarget(mux="zellij", pane="0", session="s"))),
+        )
+        worst_case_injection = bridge.MUX_TIMEOUT + (max_calls - 1) * bridge.MUX_CALL_MIN_TIMEOUT
+
         assert spool_deadline < WEBHOOK_TIMEOUT
-        assert bridge.TMUX_TIMEOUT < WEBHOOK_TIMEOUT
-        assert spool_deadline + bridge.TMUX_TIMEOUT < WEBHOOK_TIMEOUT
+        assert worst_case_injection < WEBHOOK_TIMEOUT
+        assert spool_deadline + worst_case_injection < WEBHOOK_TIMEOUT
 
 
 class TestImportHygiene:
@@ -1095,7 +1113,7 @@ class TestInjectorCooldown:
             raise bridge.subprocess.CalledProcessError(1, cmd)
 
         with patch.object(bridge.subprocess, "run", tmux_fail):
-            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
+            assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
 
         with patch.object(bridge.subprocess, "run", tmux_ok):
             assert injector.deliver("target-1", make_event()) == "tmux"
@@ -1267,7 +1285,7 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run") as mock_run:
             action = injector.deliver("target-1", make_event())
 
-        # Distinct from "spool" AND from "spool-tmux-failed": unmapped is
+        # Distinct from "spool" AND from "spool-mux-failed": unmapped is
         # the normal outcome for a foreign-machine session (webhooks have no
         # machine scoping), so it must not read as a broken tmux setup. The
         # distinct return value is what a direct /hook caller sees; the
@@ -1287,7 +1305,7 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run", fake_run):
             action = injector.deliver("target-1", make_event())
 
-        assert action == "spool-tmux-failed"
+        assert action == "spool-mux-failed"
 
     def test_tmux_oserror_falls_back_to_spool(self, tmp_path):
         """A non-executable tmux binary (PermissionError) must degrade to
@@ -1299,7 +1317,7 @@ class TestTmuxBackend:
             raise PermissionError("tmux not executable")
 
         with patch.object(bridge.subprocess, "run", tmux_perm):
-            assert injector.deliver("target-1", make_event()) == "spool-tmux-failed"
+            assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
 
     def test_persistent_tmux_failure_warns_once(self, tmp_path, caplog):
         """A missing or broken tmux binary fails every wake with the same
@@ -1406,7 +1424,7 @@ class TestTmuxBackend:
 
     def test_fifo_panes_json_does_not_hang(self, tmp_path):
         """A planted FIFO with NO writer must not park the delivery worker
-        forever (this path has no TMUX_TIMEOUT). O_NONBLOCK makes the read
+        forever (this path has no MUX_TIMEOUT). O_NONBLOCK makes the read
         return EOF promptly; the delivery degrades to spool, not a hang."""
         injector, config = make_tmux_injector(tmp_path)
         (config.wake_dir / "panes.json").unlink()
@@ -1713,7 +1731,7 @@ class TestTmuxBackend:
             assert len(injector2._warned_wake_fail_keys) <= 2  # cap held
             with patch.object(bridge.subprocess, "run", raiser(PermissionError("a"))):
                 injector2.deliver("t1", make_event())  # re-warns after clear
-        assert len(warnings("tmux wake failed")) == 4
+        assert len(warnings("Wake injection failed")) == 4
 
     def test_unreadable_panes_json_degrades_to_spool(self, tmp_path):
         config = BridgeConfig(wake_dir=tmp_path / "wake", backend="tmux")
@@ -1723,6 +1741,283 @@ class TestTmuxBackend:
         with patch.object(bridge.subprocess, "run") as mock_run:
             assert injector.deliver("target-1", make_event()) == "spool-unmapped"
         mock_run.assert_not_called()
+
+
+def make_mux_injector(tmp_path, entries, cooldown=30.0):
+    """A mux-backend injector with the given raw panes.json entries."""
+    config = BridgeConfig(wake_dir=tmp_path / "wake", backend="mux", cooldown_seconds=cooldown)
+    config.wake_dir.mkdir(parents=True)
+    (config.wake_dir / "panes.json").write_text(json.dumps(entries))
+    return Injector(config), config
+
+
+def capture_run():
+    """A subprocess.run stand-in that records argv and succeeds."""
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    return commands, fake_run
+
+
+class TestZellijBackend:
+    def test_zellij_entry_types_then_submits(self, tmp_path):
+        """Two calls, and the second one is the whole point. zellij's
+        write-chars types without submitting - there is no send-keys
+        equivalent that does both - so dropping the `write 13` would leave the
+        prompt sitting in the input box: a wake that wakes nobody while the
+        action, the log line and the bus response all report success."""
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "tenacious-lemur"}}
+        )
+        commands, fake_run = capture_run()
+
+        with patch.object(bridge.subprocess, "run", fake_run):
+            assert injector.deliver("target-1", make_event()) == "zellij"
+
+        assert commands == [
+            [
+                "zellij",
+                "--session",
+                "tenacious-lemur",
+                "action",
+                "write-chars",
+                "-p",
+                "0",
+                bridge.WAKE_PROMPT,
+            ],
+            ["zellij", "--session", "tenacious-lemur", "action", "write", "-p", "0", "13"],
+        ]
+
+    def test_session_name_is_passed_as_one_argv_element(self, tmp_path):
+        """Session names are auto-generated per zellij session and may contain
+        ':' - which is exactly why the mapping value is an object rather than
+        a "zellij:<session>:<pane>" string. Passing it as its own argv element
+        keeps that harmless."""
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "has:colon"}}
+        )
+        commands, fake_run = capture_run()
+
+        with patch.object(bridge.subprocess, "run", fake_run):
+            injector.deliver("target-1", make_event())
+
+        assert commands[0][2] == "has:colon"
+
+    def test_zellij_entry_without_session_degrades_and_warns(self, tmp_path, caplog):
+        import logging
+
+        injector, _ = make_mux_injector(tmp_path, {"target-1": {"mux": "zellij", "pane": "0"}})
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run") as mock_run:
+                assert injector.deliver("target-1", make_event()) == "spool-unmapped"
+
+        mock_run.assert_not_called()
+        assert "session name" in caplog.text
+
+    def test_a_failed_submit_reports_failure(self, tmp_path):
+        """If the submit call fails after the type call succeeded, the action
+        must be the failure arm - not "zellij". The prompt is sitting in the
+        pane unsubmitted, which is not a wake."""
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "s"}}
+        )
+        calls = []
+
+        def fail_second(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 2:
+                raise bridge.subprocess.CalledProcessError(1, cmd)
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        with patch.object(bridge.subprocess, "run", fail_second):
+            assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
+
+    def test_injection_budget_is_total_not_per_call(self, tmp_path):
+        """MUX_TIMEOUT must bound the whole injection, not each call. A
+        per-call bound would make zellij's worst case 2 x MUX_TIMEOUT, which
+        with the spool lock deadline exceeds the bus's 5s webhook timeout -
+        the exact timeout-plus-retry (and duplicate spool line) the constant
+        exists to prevent."""
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "s"}}
+        )
+        timeouts = []
+
+        def slow_run(cmd, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            time.sleep(0.05)
+
+            class Result:
+                returncode = 0
+
+            return Result()
+
+        with patch.object(bridge.subprocess, "run", slow_run):
+            injector.deliver("target-1", make_event())
+
+        assert sum(timeouts) <= 2 * bridge.MUX_TIMEOUT
+        assert timeouts[1] < timeouts[0]  # the second call spends what is left
+
+    def test_failure_warning_carries_the_multiplexer_stderr(self, tmp_path, caplog):
+        """capture_output=True means the reason is on e.stderr while `{e}`
+        renders only argv and an exit code. The likeliest zellij failure is a
+        CLI-surface mismatch - a build that does not take
+        `action write-chars -p` - which zellij explains on stderr and nothing
+        else here would, making the difference between a diagnosable and an
+        undiagnosable spool-mux-failed."""
+        import logging
+
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "s"}}
+        )
+
+        def fail(cmd, **kwargs):
+            raise bridge.subprocess.CalledProcessError(
+                1, cmd, stderr=b"error: Found argument '-p' which wasn't expected"
+            )
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", fail):
+                assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
+
+        assert "which wasn't expected" in caplog.text
+
+    def test_a_failure_with_no_stderr_still_logs(self, tmp_path, caplog):
+        """The stderr lookup must not itself become a failure path - OSError
+        (a missing binary) carries no stderr attribute at all."""
+        import logging
+
+        injector, _ = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+
+        def fail(cmd, **kwargs):
+            raise FileNotFoundError("no tmux")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", fail):
+                assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
+
+        assert "no tmux" in caplog.text
+
+    def test_both_muxes_can_be_mapped_at_once(self, tmp_path):
+        """One bridge serves every session on the host, and nothing says they
+        share a multiplexer. The backend is chosen per entry, not per daemon."""
+        injector, _ = make_mux_injector(
+            tmp_path,
+            {
+                "tmux-session": {"mux": "tmux", "pane": "%3"},
+                "zellij-session": {"mux": "zellij", "pane": "0", "session": "s"},
+                "legacy-session": "%9",
+            },
+            cooldown=0.0,
+        )
+        commands, fake_run = capture_run()
+
+        with patch.object(bridge.subprocess, "run", fake_run):
+            assert injector.deliver("tmux-session", make_event()) == "tmux"
+            assert injector.deliver("zellij-session", make_event()) == "zellij"
+            assert injector.deliver("legacy-session", make_event()) == "tmux"
+
+        assert commands[0][0] == "tmux"
+        assert commands[1][0] == "zellij"
+        assert commands[3] == ["tmux", "send-keys", "-t", "%9", bridge.WAKE_PROMPT, "Enter"]
+
+
+class TestIdleGate:
+    """Injection happens only BETWEEN turns. Mid-turn it is redundant - a Stop
+    hook surfaces directed events at end-of-turn - and it is the one window
+    where a permission dialog can be on screen to consume the keystrokes."""
+
+    def test_busy_session_is_spooled_not_injected(self, tmp_path):
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        wake.set_busy(config.wake_dir, "target-1")
+
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            assert injector.deliver("target-1", make_event()) == "spool-busy"
+
+        mock_run.assert_not_called()
+        # The durable path is unconditional - gating suppresses the wake, not
+        # the record of it, so the Stop hook's bus peek is not the only copy.
+        assert (config.wake_dir / "target-1.jsonl").exists()
+
+    def test_idle_session_is_injected(self, tmp_path):
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        wake.set_busy(config.wake_dir, "target-1")
+        wake.clear_busy(config.wake_dir, "target-1")
+
+        with patch.object(bridge.subprocess, "run", capture_run()[1]):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_the_gate_is_per_session(self, tmp_path):
+        injector, config = make_mux_injector(
+            tmp_path,
+            {"busy-one": {"mux": "tmux", "pane": "%1"}, "idle-one": {"mux": "tmux", "pane": "%2"}},
+        )
+        wake.set_busy(config.wake_dir, "busy-one")
+
+        with patch.object(bridge.subprocess, "run", capture_run()[1]):
+            assert injector.deliver("busy-one", make_event()) == "spool-busy"
+            assert injector.deliver("idle-one", make_event()) == "tmux"
+
+    def test_busy_does_not_burn_the_cooldown(self, tmp_path):
+        """A busy session is the normal mid-turn state, not a wake. If it
+        consumed the cooldown window, the first delivery after the turn ended
+        would be suppressed as a repeat - turning a routine state into a
+        missed wake."""
+        injector, config = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}}, cooldown=300.0
+        )
+        wake.set_busy(config.wake_dir, "target-1")
+
+        with patch.object(bridge.subprocess, "run", capture_run()[1]):
+            assert injector.deliver("target-1", make_event()) == "spool-busy"
+            wake.clear_busy(config.wake_dir, "target-1")
+            assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_a_stale_marker_no_longer_latches_the_gate(self, tmp_path):
+        """End-to-end for the interrupt case: a user pressing Esc ends the
+        turn without firing Stop, so the marker persists on a session that is
+        alive, mapped and genuinely idle. Before the ageing window that was a
+        permanent gate - every DM spool-busy, forever, with no warning on
+        either side."""
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        config.busy_ttl_seconds = 60.0
+        wake.set_busy(config.wake_dir, "target-1")
+        old = time.time() - 3600
+        os.utime(wake.busy_path(config.wake_dir, "target-1"), (old, old))
+
+        with patch.object(bridge.subprocess, "run", capture_run()[1]):
+            assert injector.deliver("target-1", make_event()) == "tmux"
+
+    def test_a_refreshed_marker_still_gates(self, tmp_path):
+        """The other half: ageing must not cut short a turn that is still
+        running and still marking itself busy."""
+        injector, config = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+        config.busy_ttl_seconds = 60.0
+        wake.set_busy(config.wake_dir, "target-1")
+
+        with patch.object(bridge.subprocess, "run") as mock_run:
+            assert injector.deliver("target-1", make_event()) == "spool-busy"
+        mock_run.assert_not_called()
+
+    def test_gate_does_not_apply_to_the_spool_backend(self, tmp_path):
+        """The spool backend never injects, so it has nothing to gate - and a
+        busy marker must not change what it records."""
+        config = BridgeConfig(wake_dir=tmp_path / "wake", backend="spool")
+        injector = Injector(config)
+        wake.set_busy(config.wake_dir, "target-1")
+        assert injector.deliver("target-1", make_event()) == "spool"
 
 
 class TestBusRegistration:
@@ -2425,22 +2720,56 @@ class TestEnvValidation:
         with pytest.raises(SystemExit, match="AGENT_EVENT_BUS_BRIDGE_BACKEND"):
             bridge.config_from_args(bridge.build_parser().parse_args([]))
 
-    def test_env_backend_tmux_is_accepted(self, monkeypatch):
+    def test_env_backend_tmux_is_accepted_as_mux_alias(self, monkeypatch):
+        """ "tmux" was this backend's name before it drove zellij too, and it
+        is baked into already-installed plists. It must keep working, and it
+        must normalize - an un-normalized "tmux" would fall through
+        deliver()'s `!= "mux"` check and silently behave as spool."""
         monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmux")
         # The preflight consults the real PATH; this test is about env
-        # parsing, not about tmux being installed on the test box
+        # parsing, not about a multiplexer being installed on the test box
         monkeypatch.setattr(bridge.shutil, "which", lambda _: "/usr/bin/tmux")
         config = bridge.config_from_args(bridge.build_parser().parse_args([]))
-        assert config.backend == "tmux"
+        assert config.backend == "mux"
 
-    def test_tmux_backend_without_binary_is_refused(self, monkeypatch):
-        """A tmux backend on a box without tmux would degrade every wake to
-        spool-tmux-failed for the daemon's lifetime - one named startup
-        error beats discovering it per-DM."""
-        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "tmux")
+    def test_env_backend_mux_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "mux")
+        monkeypatch.setattr(bridge.shutil, "which", lambda _: "/usr/bin/zellij")
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.backend == "mux"
+
+    def test_mux_backend_without_any_binary_warns_but_starts(self, monkeypatch, caplog):
+        """MUST NOT refuse. `mux` is the checked-in plist default, so a
+        SystemExit here is a launchd crash loop (KeepAlive, ThrottleInterval
+        10) on any host without a multiplexer - taking out a previously
+        working spool bridge entirely: no listener, no webhook registration,
+        no spool lines. That is strictly worse than the condition it reports,
+        and it would contradict the default's justification, that an operator
+        who has not opted into injection pays nothing for it.
+
+        Nothing is lost: the old refusal's value was "one startup message
+        beats discovering it per-DM", and the WARNING is that message."""
+        import logging
+
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "mux")
         monkeypatch.setattr(bridge.shutil, "which", lambda _: None)
-        with pytest.raises(SystemExit, match="tmux binary"):
-            bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+
+        assert config.backend == "mux"
+        assert "none of tmux, zellij" in caplog.text
+
+    def test_mux_backend_accepts_a_single_available_binary(self, monkeypatch):
+        """ANY supported mux satisfies the preflight, not all of them: which
+        one a delivery needs is a property of that session's panes.json
+        entry, so a tmux-only host must not be refused for lacking zellij."""
+        monkeypatch.setenv("AGENT_EVENT_BUS_BRIDGE_BACKEND", "mux")
+        monkeypatch.setattr(
+            bridge.shutil, "which", lambda name: "/usr/bin/tmux" if name == "tmux" else None
+        )
+        config = bridge.config_from_args(bridge.build_parser().parse_args([]))
+        assert config.backend == "mux"
 
     def test_empty_backend_and_bus_url_env_fall_back_to_defaults(self, monkeypatch):
         """The last two env vars without the `or DEFAULT` normalization: an

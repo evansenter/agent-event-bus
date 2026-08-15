@@ -15,6 +15,10 @@ Usage:
                          [--min-level lifecycle|info|actionable]
     agent-event-bus-cli ack --cursor N [--session-id ID] [--allow-rewind] [--json]
     agent-event-bus-cli notify --title TITLE --message MSG [--sound]
+    agent-event-bus-cli panes set [--session-id ID] [--mux tmux|zellij --pane ID
+                         [--mux-session NAME]] [--wake-dir DIR] [--json]
+    agent-event-bus-cli panes clear [--session-id ID] [--keep-pane-entries]
+    agent-event-bus-cli wake-state busy|idle [--session-id ID] [--wake-dir DIR]
     agent-event-bus-cli webhook register --url URL [--channel CH] [--event-types T1,T2] [--secret S]
     agent-event-bus-cli webhook list [--all]
     agent-event-bus-cli webhook disable WEBHOOK_ID
@@ -105,8 +109,25 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import requests
+
+# The wake-dir contract. Importing it (rather than re-implementing the write
+# in the shell hook that calls this) is what keeps the writer and the bridge's
+# reader from drifting - a mismatch between them produces no error anywhere,
+# just wakes that never happen.
+from agent_event_bus.wake import (
+    InvalidTargetError,
+    MuxTarget,
+    clear_busy,
+    clear_pane_entry,
+    detect_target,
+    parse_target,
+    set_busy,
+    set_pane_entry,
+    wake_dir_from_env,
+)
 
 DEFAULT_URL = "http://127.0.0.1:8080/mcp"
 HEADERS = {
@@ -500,6 +521,129 @@ def cmd_notify(args):
         sys.exit(1)
 
 
+def _resolve_wake_session_id(args) -> str:
+    """Session id for the wake-dir commands, or exit 2.
+
+    Exit 2 rather than 1 so a hook can tell "you didn't tell me which
+    session" (a wiring bug it should surface) from a bus or filesystem
+    failure. Neither is worth failing a hook over, but they need different
+    fixes.
+    """
+    session_id = args.session_id or _session_id_from_env()
+    if not session_id:
+        print(
+            "No session id: pass --session-id, or set AGENT_EVENT_BUS_SESSION_ID "
+            "/ CLAUDE_CODE_SESSION_ID",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return session_id
+
+
+def cmd_panes(args):
+    """Maintain <wake_dir>/panes.json - the bridge's session -> pane mapping.
+
+    Writing this file is what makes the mux backend able to wake anything;
+    without it every DM resolves to spool-unmapped. It lives here rather than
+    in the session hook because the contract has two halves that must agree
+    (see wake.py), and because the locking half is not expressible in portable
+    shell - macOS ships no flock(1).
+    """
+    session_id = _resolve_wake_session_id(args)
+    wake_dir = Path(args.wake_dir) if args.wake_dir else wake_dir_from_env()
+
+    # Both verbs normally run at a session lifecycle boundary, and reaching
+    # one PROVES no turn is in flight - so both clear the turn-state marker.
+    #
+    # Not a convenience. The idle gate's no-TTL argument rests on the marker
+    # self-healing at SessionStart, and wiring that only into a separate
+    # `wake-state idle` call would make the invariant depend on an operator
+    # remembering a second command: a session hard-killed mid-turn and then
+    # resumed would map its pane correctly and still sit gated `spool-busy`
+    # while idle, until its human happened to complete a turn. At SessionEnd
+    # it also stops the marker leaking - `wake.py` deliberately names it
+    # outside the `<sid>.jsonl*` glob the spool-pruning follow-up will sweep,
+    # so nothing else would ever collect it.
+    #
+    # Before the target detection below, not after: `set` returns early
+    # outside a multiplexer, and clearing turn state does not depend on
+    # having a pane to wake.
+    #
+    # --keep-wake-state exists because ONE SessionStart source breaks the
+    # "proves no turn is in flight" premise: an auto-compaction fires
+    # SessionStart with source=compact in the MIDDLE of a long turn. Clearing
+    # there would leave the session reading idle for the whole remainder of
+    # that turn - reopening precisely the window this gate exists to close.
+    # The caller knows the source and this process cannot, so the decision
+    # has to be a flag.
+    if not getattr(args, "keep_wake_state", False):
+        clear_busy(wake_dir, session_id)
+
+    if args.panes_command == "set":
+        if args.mux:
+            target = MuxTarget(mux=args.mux, pane=args.pane, session=args.mux_session)
+            try:
+                # Validate explicit input through the same parser the bridge
+                # reads with, so a hand-written entry cannot be accepted here
+                # and silently ignored there.
+                target = parse_target(target.to_json())
+            except InvalidTargetError as e:
+                print(f"Invalid target: {e}", file=sys.stderr)
+                sys.exit(2)
+        else:
+            target = detect_target()
+        if target is None:
+            # NOT an error, and specifically NOT a null/empty entry: a session
+            # outside any multiplexer has no pane to wake, and the contract
+            # says omit rather than write a placeholder. An omitted entry
+            # takes the bridge's quiet absent path; a null one warns and asks
+            # an operator to repair something that is working as intended.
+            if args.json:
+                print(json.dumps({"skipped": "no multiplexer detected"}))
+            else:
+                print("No multiplexer detected; pane mapping not written")
+            return
+        result = set_pane_entry(wake_dir, session_id, target)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"Mapped {session_id} -> {target.describe()}")
+            if result["evicted"]:
+                # Worth a line: it means a previous session died in this pane
+                # without its SessionEnd hook running, which is also the
+                # condition that would have had the bridge type into it.
+                print(f"Evicted stale mapping(s) on the same pane: {', '.join(result['evicted'])}")
+        return
+
+    # clear
+    target = None if args.keep_pane_entries else detect_target()
+    result = clear_pane_entry(wake_dir, session_id, target)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(f"Cleared pane mapping(s): {', '.join(result['removed']) or 'none'}")
+
+
+def cmd_wake_state(args):
+    """Mark the session mid-turn (busy) or between turns (idle).
+
+    The bridge injects only into an idle session. Mid-turn injection is
+    redundant - a Stop hook surfaces directed events at end-of-turn - and it
+    is the one window where a permission dialog can be on screen to consume
+    the keystrokes.
+    """
+    session_id = _resolve_wake_session_id(args)
+    wake_dir = Path(args.wake_dir) if args.wake_dir else wake_dir_from_env()
+    if args.state == "busy":
+        set_busy(wake_dir, session_id)
+    else:
+        clear_busy(wake_dir, session_id)
+    if args.json:
+        print(json.dumps({"session_id": session_id, "state": args.state}))
+    else:
+        print(f"Wake state for {session_id}: {args.state}")
+
+
 def cmd_webhook_register(args):
     """Register a webhook."""
     # args.webhook_url is the endpoint to register; args.url stays the bus URL.
@@ -724,6 +868,61 @@ def main():
     p_notify.add_argument("--sound", action="store_true", help="Play sound")
     p_notify.set_defaults(func=cmd_notify)
 
+    # panes (parent command with subcommands) - the bridge's pane mapping
+    p_panes = subparsers.add_parser(
+        "panes", help="Maintain the bridge's session -> terminal pane mapping"
+    )
+    panes_subparsers = p_panes.add_subparsers(dest="panes_command")
+
+    for verb, helptext in (
+        ("set", "Map this session to its terminal pane (SessionStart)"),
+        ("clear", "Remove this session's pane mapping (SessionEnd)"),
+    ):
+        p = panes_subparsers.add_parser(verb, help=helptext)
+        p.add_argument(
+            "--session-id",
+            help="Bus session id (default: AGENT_EVENT_BUS_SESSION_ID, "
+            "then CLAUDE_CODE_SESSION_ID)",
+        )
+        p.add_argument("--wake-dir", help="Override AGENT_EVENT_BUS_WAKE_DIR")
+        p.add_argument("--json", action="store_true", help="JSON output")
+        if verb == "set":
+            # Detection from the environment is the default; the explicit
+            # flags exist for testing and for a wrapper that knows better
+            # than $TMUX_PANE (a session whose pane is not the hook's).
+            p.add_argument("--mux", choices=["tmux", "zellij"], help="Override auto-detection")
+            p.add_argument("--pane", help="Pane id (required with --mux)")
+            p.add_argument(
+                "--mux-session",
+                help="Multiplexer session name (required with --mux zellij)",
+            )
+            p.add_argument(
+                "--keep-wake-state",
+                action="store_true",
+                help="Do not clear the turn-state marker (use when SessionStart "
+                "fires mid-turn, i.e. source=compact)",
+            )
+        else:
+            p.add_argument(
+                "--keep-pane-entries",
+                action="store_true",
+                help="Remove only this session id, not other entries on the same pane",
+            )
+        p.set_defaults(func=cmd_panes)
+
+    # wake-state - the bridge's idle gate
+    p_wake_state = subparsers.add_parser(
+        "wake-state", help="Mark this session mid-turn (busy) or between turns (idle)"
+    )
+    p_wake_state.add_argument("state", choices=["busy", "idle"])
+    p_wake_state.add_argument(
+        "--session-id",
+        help="Bus session id (default: AGENT_EVENT_BUS_SESSION_ID, then CLAUDE_CODE_SESSION_ID)",
+    )
+    p_wake_state.add_argument("--wake-dir", help="Override AGENT_EVENT_BUS_WAKE_DIR")
+    p_wake_state.add_argument("--json", action="store_true", help="JSON output")
+    p_wake_state.set_defaults(func=cmd_wake_state)
+
     # webhook (parent command with subcommands)
     p_webhook = subparsers.add_parser("webhook", help="Manage webhooks")
     webhook_subparsers = p_webhook.add_subparsers(dest="webhook_command")
@@ -772,6 +971,17 @@ def main():
         if args.webhook_command is None:
             p_webhook.print_help()
             sys.exit(1)
+
+    if args.command == "panes":
+        if args.panes_command is None:
+            p_panes.print_help()
+            sys.exit(1)
+        # argparse cannot express "required with --mux", and a --mux without
+        # a --pane would otherwise reach MuxTarget as None and fail there
+        # with a less useful message.
+        if args.panes_command == "set" and args.mux and not args.pane:
+            print("--pane is required with --mux", file=sys.stderr)
+            sys.exit(2)
 
     # The one place that turns a failure into output and an exit code.
     # call_tool and the cmd_* handlers stay quiet about transport failures so
