@@ -289,6 +289,19 @@ gate's self-heal below hold for anyone following this contract, rather than
 depending on a separate `wake-state idle` call at SessionStart that an
 operator might not wire.
 
+**One SessionStart source breaks that premise.** Claude Code fires SessionStart
+with `source=compact` after an auto-compaction, which happens in the *middle*
+of a long turn. Clearing there would leave the session reading idle for the
+whole remainder of that turn - reopening precisely the window the gate exists
+to close. Pass `--keep-wake-state` for that source; only the hook knows it:
+
+```bash
+# SessionStart, source-aware
+args=(--session-id "$SESSION_ID")
+[[ "$SOURCE" == "compact" ]] && args+=(--keep-wake-state)
+agent-event-bus-cli panes set "${args[@]}"
+```
+
 `--session-id` falls back to `AGENT_EVENT_BUS_SESSION_ID` then
 `CLAUDE_CODE_SESSION_ID`. Claude Code's session id *is* the bus session id: the
 SessionStart hook registers with `client_id` = that value, and the bus adopts a

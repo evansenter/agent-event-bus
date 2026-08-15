@@ -255,6 +255,15 @@ def set_pane_entry(wake_dir: Path, session_id: str, target: MuxTarget) -> dict:
             del panes[sid]
         panes[session_id] = entry
         _write_panes_atomic(wake_dir, panes_file, panes)
+    # An evicted id has just been PROVEN dead - something else owns its pane -
+    # so drop its turn-state marker too. Nothing else ever would: BUSY_SUFFIX
+    # is deliberately outside the `<sid>.jsonl*` glob the spool-pruning
+    # follow-up will sweep, and every other unlink path is scoped to the
+    # caller's own session id. Without this the exact case the eviction exists
+    # for - a session killed without its SessionEnd hook - leaks a zero-byte
+    # marker permanently.
+    for sid in evicted:
+        clear_busy(wake_dir, sid)
     return {"session_id": session_id, "entry": entry, "evicted": evicted}
 
 
@@ -279,6 +288,10 @@ def clear_pane_entry(wake_dir: Path, session_id: str, target: MuxTarget | None =
             for sid in removed:
                 del panes[sid]
             _write_panes_atomic(wake_dir, panes_file, panes)
+    # Same reasoning as the eviction sweep in set_pane_entry: an unmapped id
+    # cannot be woken, so retaining its marker is pure leak.
+    for sid in removed:
+        clear_busy(wake_dir, sid)
     return {"session_id": session_id, "removed": removed, "existed": True}
 
 

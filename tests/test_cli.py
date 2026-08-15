@@ -1458,7 +1458,7 @@ def panes_args(command, tmp_path, **overrides):
         "json": True,
     }
     if command == "set":
-        args.update({"mux": None, "pane": None, "mux_session": None})
+        args.update({"mux": None, "pane": None, "mux_session": None, "keep_wake_state": False})
     else:
         args["keep_pane_entries"] = False
     args.update(overrides)
@@ -1558,6 +1558,25 @@ class TestCmdPanes:
         cli.cmd_panes(panes_args("clear", tmp_path))
 
         assert wake.is_busy(tmp_path, "sid-1") is False
+
+    def test_keep_wake_state_preserves_the_marker(self, tmp_path, monkeypatch):
+        """SessionStart is NOT always a between-turns event: an
+        auto-compaction fires it with source=compact in the middle of a long
+        turn. Clearing there would leave the session reading idle for the
+        whole remainder of that turn - reopening exactly the window the gate
+        exists to close. The caller knows the source and this process cannot,
+        so it has to be a flag."""
+        from agent_event_bus import wake
+
+        monkeypatch.setenv("TMUX_PANE", "%1")
+        wake.set_busy(tmp_path, "sid-1")
+
+        cli.cmd_panes(panes_args("set", tmp_path, keep_wake_state=True))
+
+        assert wake.is_busy(tmp_path, "sid-1") is True
+        # The pane mapping is still refreshed - the flag suppresses only the
+        # turn-state clear, not the point of the command.
+        assert "sid-1" in json.loads((tmp_path / "panes.json").read_text())
 
     def test_missing_session_id_exits_2(self, tmp_path, monkeypatch):
         """Exit 2, not 1: "you didn't tell me which session" is a wiring bug a

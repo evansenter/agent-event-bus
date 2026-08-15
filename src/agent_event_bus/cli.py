@@ -552,8 +552,8 @@ def cmd_panes(args):
     session_id = _resolve_wake_session_id(args)
     wake_dir = Path(args.wake_dir) if args.wake_dir else wake_dir_from_env()
 
-    # Both verbs run at a session lifecycle boundary, and reaching either one
-    # PROVES no turn is in flight - so both clear the turn-state marker.
+    # Both verbs normally run at a session lifecycle boundary, and reaching
+    # one PROVES no turn is in flight - so both clear the turn-state marker.
     #
     # Not a convenience. The idle gate's no-TTL argument rests on the marker
     # self-healing at SessionStart, and wiring that only into a separate
@@ -568,7 +568,16 @@ def cmd_panes(args):
     # Before the target detection below, not after: `set` returns early
     # outside a multiplexer, and clearing turn state does not depend on
     # having a pane to wake.
-    clear_busy(wake_dir, session_id)
+    #
+    # --keep-wake-state exists because ONE SessionStart source breaks the
+    # "proves no turn is in flight" premise: an auto-compaction fires
+    # SessionStart with source=compact in the MIDDLE of a long turn. Clearing
+    # there would leave the session reading idle for the whole remainder of
+    # that turn - reopening precisely the window this gate exists to close.
+    # The caller knows the source and this process cannot, so the decision
+    # has to be a flag.
+    if not getattr(args, "keep_wake_state", False):
+        clear_busy(wake_dir, session_id)
 
     if args.panes_command == "set":
         if args.mux:
@@ -886,6 +895,12 @@ def main():
             p.add_argument(
                 "--mux-session",
                 help="Multiplexer session name (required with --mux zellij)",
+            )
+            p.add_argument(
+                "--keep-wake-state",
+                action="store_true",
+                help="Do not clear the turn-state marker (use when SessionStart "
+                "fires mid-turn, i.e. source=compact)",
             )
         else:
             p.add_argument(

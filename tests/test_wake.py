@@ -375,3 +375,38 @@ class TestWakeDirFromEnv:
         assert wake.DEFAULT_WAKE_DIR == Path(
             os.path.expanduser("~/.claude/contrib/agent-event-bus/wake")
         )
+
+
+class TestMarkerLifetimeMatchesMappingLifetime:
+    """A marker for an id nothing maps can never gate a wake again, and
+    nothing else will ever collect it: BUSY_SUFFIX is deliberately outside
+    the `<sid>.jsonl*` glob the spool-pruning follow-up sweeps, and every
+    other unlink path is scoped to the caller's own session id."""
+
+    def test_eviction_clears_the_evicted_sessions_marker(self, tmp_path):
+        """The exact case eviction exists for - a session killed without its
+        SessionEnd hook - would otherwise leak a zero-byte marker forever."""
+        pane = MuxTarget(mux="tmux", pane="%1")
+        wake.set_pane_entry(tmp_path, "dead-session", pane)
+        wake.set_busy(tmp_path, "dead-session")
+
+        wake.set_pane_entry(tmp_path, "live-session", pane)
+
+        assert wake.is_busy(tmp_path, "dead-session") is False
+
+    def test_eviction_does_not_touch_an_unrelated_marker(self, tmp_path):
+        wake.set_pane_entry(tmp_path, "dead-session", MuxTarget(mux="tmux", pane="%1"))
+        wake.set_busy(tmp_path, "elsewhere")
+
+        wake.set_pane_entry(tmp_path, "live-session", MuxTarget(mux="tmux", pane="%1"))
+
+        assert wake.is_busy(tmp_path, "elsewhere") is True
+
+    def test_clear_removes_markers_for_everything_it_unmaps(self, tmp_path):
+        pane = MuxTarget(mux="tmux", pane="%1")
+        wake.set_pane_entry(tmp_path, "stale", pane)
+        wake.set_busy(tmp_path, "stale")
+
+        wake.clear_pane_entry(tmp_path, "mine", pane)
+
+        assert wake.is_busy(tmp_path, "stale") is False

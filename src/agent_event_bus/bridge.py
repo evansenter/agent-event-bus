@@ -167,7 +167,7 @@ MAX_PANES_CHARS = 262_144  # 256 Ki characters
 # means a stuck drainer (SIGSTOP, network mount) - and an unbounded block
 # here parks a threadpool worker per pending event until /hook starves.
 # Raising after the deadline is correct: nothing is durably stored yet, so
-# the bus retry is meaningful (unlike post-spool errors). Like TMUX_TIMEOUT,
+# the bus retry is meaningful (unlike post-spool errors). Like MUX_TIMEOUT,
 # the deadline (attempts x retry) must stay under the bus's WEBHOOK_TIMEOUT
 # (5s per attempt) - and their SUM must too, or a slow-lock-then-slow-tmux
 # request times out bus-side even though each bound individually held.
@@ -707,7 +707,7 @@ class Injector:
             #    worker forever inside a deliver() that already committed its
             #    spool line - each tmux-backend delivery parks one and /hook
             #    starves once they are all consumed. This path has no
-            #    TMUX_TIMEOUT/deadline of its own. On a no-writer FIFO the read
+            #    MUX_TIMEOUT/deadline of its own. On a no-writer FIFO the read
             #    returns EOF (empty -> unparseable); a writer-attached FIFO
             #    with nothing buffered surfaces as a TypeError from the text
             #    layer (raw read returns None), caught below; on a regular file
@@ -820,6 +820,22 @@ class Injector:
             self._warn_panes_once(
                 entry_key,
                 f"panes.json entry for {session_id[:8]}... is unusable ({e}); treating as unmapped",
+            )
+            return None
+        except Exception as e:
+            # The same never-500 backstop BY SHAPE that guards the read above,
+            # extended over the one call that INTERPRETS the externally
+            # maintained data. parse_target raises only InvalidTargetError
+            # today, but it now lives in a shared module cli.py also evolves,
+            # and this method's contract - that no failure reading a
+            # hostile-adjacent file escapes to 500 an already-spooled delivery
+            # - must not rest on a sibling module's exception surface staying
+            # put. Distinct reason key so a genuine bug is not filed under
+            # "misconfigured entry".
+            self._warn_panes_once(
+                f"parse-error:{session_id}",
+                f"Unexpected error validating the panes.json entry for "
+                f"{session_id[:8]}... ({e!r}); treating as unmapped",
             )
             return None
         self._warned_panes_keys.discard(entry_key)  # healthy entry re-arms it
@@ -941,7 +957,21 @@ class Injector:
             # line) issued under precisely the conditions that just proved
             # calls are failing. Named in docs/BRIDGE.md instead.
             key = f"{session_id}:{type(e).__name__}"
-            message = f"Wake injection failed for {session_id[:8]}... ({e}); spooled only"
+            # Include the multiplexer's OWN stderr, not just argv and an exit
+            # code. capture_output=True means the reason is sitting on
+            # e.stderr while `{e}` renders only "Command [...] returned
+            # non-zero exit status N" - and the likeliest zellij failure is a
+            # CLI-surface mismatch (a build that does not take
+            # `action write-chars -p`), which zellij explains on stderr and
+            # nothing else here would. Truncated because a usage dump can run
+            # long, and decoded defensively: this path must not raise.
+            detail = ""
+            stderr = getattr(e, "stderr", None)
+            if stderr:
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode("utf-8", errors="replace")
+                detail = f": {' '.join(str(stderr).split())[:300]}"
+            message = f"Wake injection failed for {session_id[:8]}... ({e}{detail}); spooled only"
             # Same lock as the success-arm comprehension: an unsynchronized
             # add would race its iteration. Logging stays outside the hold.
             with self._lock:

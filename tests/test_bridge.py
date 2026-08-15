@@ -1424,7 +1424,7 @@ class TestTmuxBackend:
 
     def test_fifo_panes_json_does_not_hang(self, tmp_path):
         """A planted FIFO with NO writer must not park the delivery worker
-        forever (this path has no TMUX_TIMEOUT). O_NONBLOCK makes the read
+        forever (this path has no MUX_TIMEOUT). O_NONBLOCK makes the read
         return EOF promptly; the delivery degrades to spool, not a hang."""
         injector, config = make_tmux_injector(tmp_path)
         (config.wake_dir / "panes.json").unlink()
@@ -1869,6 +1869,46 @@ class TestZellijBackend:
 
         assert sum(timeouts) <= 2 * bridge.MUX_TIMEOUT
         assert timeouts[1] < timeouts[0]  # the second call spends what is left
+
+    def test_failure_warning_carries_the_multiplexer_stderr(self, tmp_path, caplog):
+        """capture_output=True means the reason is on e.stderr while `{e}`
+        renders only argv and an exit code. The likeliest zellij failure is a
+        CLI-surface mismatch - a build that does not take
+        `action write-chars -p` - which zellij explains on stderr and nothing
+        else here would, making the difference between a diagnosable and an
+        undiagnosable spool-mux-failed."""
+        import logging
+
+        injector, _ = make_mux_injector(
+            tmp_path, {"target-1": {"mux": "zellij", "pane": "0", "session": "s"}}
+        )
+
+        def fail(cmd, **kwargs):
+            raise bridge.subprocess.CalledProcessError(
+                1, cmd, stderr=b"error: Found argument '-p' which wasn't expected"
+            )
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", fail):
+                assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
+
+        assert "which wasn't expected" in caplog.text
+
+    def test_a_failure_with_no_stderr_still_logs(self, tmp_path, caplog):
+        """The stderr lookup must not itself become a failure path - OSError
+        (a missing binary) carries no stderr attribute at all."""
+        import logging
+
+        injector, _ = make_mux_injector(tmp_path, {"target-1": {"mux": "tmux", "pane": "%1"}})
+
+        def fail(cmd, **kwargs):
+            raise FileNotFoundError("no tmux")
+
+        with caplog.at_level(logging.WARNING, logger="agent-event-bus-bridge"):
+            with patch.object(bridge.subprocess, "run", fail):
+                assert injector.deliver("target-1", make_event()) == "spool-mux-failed"
+
+        assert "no tmux" in caplog.text
 
     def test_both_muxes_can_be_mapped_at_once(self, tmp_path):
         """One bridge serves every session on the host, and nothing says they
