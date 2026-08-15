@@ -27,7 +27,7 @@ Follow these patterns consistently (aligned with agent-session-analytics):
 | Wake spool dir | `~/.claude/contrib/agent-event-bus/wake/` (bridge spool/lock files + `panes.json` + `bridge.singleton.lock` - transient; the DB protection below does NOT extend to it. Safe to hand-clear **while no bridge is running** - clearing it under a live bridge orphans its `bridge.singleton.lock` inode, so a second instance acquires a fresh one) |
 | Bridge hook-lock dir | `$XDG_RUNTIME_DIR/agent-event-bus-bridge-<uid>/`, else the system temp dir (`$TMPDIR`, or `/tmp` when unset; macOS: per-user `/var/folders/.../T`) - zero-byte, uid-scoped `hook.<hash>.lock` files, machine-scoped so a same-URL double-start refuses regardless of `$HOME`. Create-and-verified private (not adopted). Safe to remove when no bridge is running |
 
-**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_WAKE_DIR`; and `_BRIDGE_LOG` / `_BRIDGE_ERR`, which -
+**Environment variables**: `AGENT_EVENT_BUS_*` prefix (e.g., `_DB`, `_LOG`, `_ERR`, `_URL`, `_AUTH_DISABLED`, `_ICON`, `_TESTING`, `_SESSION_ID`, `_LOG_PEER`; bridge: `_BRIDGE_PORT`, `_BRIDGE_BACKEND`, `_BRIDGE_COOLDOWN`, `_BRIDGE_SECRET`, `_BRIDGE_HOOK_URL`, `_BRIDGE_BIND`, `_BRIDGE_ALLOWED_HOSTS`, `_WAKE_DIR`; and `_BRIDGE_LOG` / `_BRIDGE_ERR`, which -
 unlike every other `_BRIDGE_*` name - are **install-time only**: they are read by
 `scripts/install-bridge-launchagent.sh` and baked into the plist, so they must be in
 the environment of `make install-bridge` itself. Setting them for a running bridge
@@ -193,8 +193,63 @@ AGENT_EVENT_BUS_DB=/path/to/db.sqlite agent-event-bus
 # them first) — bare shell assignments below will NOT apply at install time.
 AGENT_EVENT_BUS_LOG=/path/to/custom.log AGENT_EVENT_BUS_ERR=/path/to/custom.err make install-server
 
-# Dev mode console logging
+# Dev mode console logging (also turns on peer logging below)
 DEV_MODE=1 agent-event-bus
+
+# "Which process is registering?" (#145). Appends the caller's peer to the
+# register_session log line:
+#     register_session(name="x") → session=brave-trex from 127.0.0.1:54321
+# Then, while the calls are live: `lsof -i :54321`. The PORT is the
+# identifying half of a DIRECT connection - the bus listens on loopback, so
+# the address alone rarely narrows anything.
+#
+# Prefer this over DEV_MODE=1 for a live diagnosis: DEV_MODE also fires a
+# desktop notification per tool call (_dev_notify) and drops the logger to
+# DEBUG, so on a host with the #145 churn you would take ~1.5 notifications
+# per minute for as long as you watch. This variable turns on peer logging
+# alone. Both work; neither is on by default - it is instrumentation, not a
+# permanent log line. To turn it back off, UNSET it: any non-empty value is
+# truthy, so `=0` still enables it (the repo-wide idiom - see helpers.py,
+# server.py, bridge.py - but this is the one documented with an explicit
+# `=1`, which invites reaching for `=0`).
+#
+# WHERE TO WATCH: `agent-event-bus.log` (`make logs`), NOT the console. The
+# console handler is created only under DEV_MODE (server.py), so a foreground
+# run with this variable alone prints nothing to the terminal - the lines are
+# there, in the file, at INFO. That is the trade the paragraph above names
+# from the other side: DEV_MODE buys you console output and charges you the
+# notification per tool call.
+#
+# Only register_session carries it: get_events runs every few seconds per
+# session and would drown the log you are reading it from.
+#
+# The five forms a peer can take: `127.0.0.1:54321` (direct - the port names
+# the caller), `... via tailscale` (see below), `unknown peer` (the server
+# reported no peer - nothing to chase), `unknown peer (unparseable)` (a peer
+# EXISTS and this label could not render it - a bug here, not a dead end;
+# note the previous form is a prefix of this one, so match the longer first),
+# and `... - headers unreadable` (the port is good, the identity check
+# failed, so a MISSING `via tailscale` there is not evidence of a local
+# caller).
+#
+# CAVEAT - `tailscale serve`: a proxied request is terminated by the LOCAL
+# tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled
+# while the real caller is somewhere on the tailnet. Those lines are marked
+# `from 127.0.0.1:54321 via tailscale` (Tailscale's identity header is the
+# only thing in the ASGI scope that distinguishes them, and loopback bypasses
+# auth - so the marker narrows the candidates, it does not authenticate).
+# An unmarked loopback peer is a local process as far as anything in the
+# scope can tell: `tailscale serve` is the only proxy this deployment puts
+# in front of the bus, but nothing here proves the absence of another.
+#
+# CAVEAT - the SUPERVISED bus does not see this. The line below is a
+# foreground invocation; `scripts/com.evansenter.agent-event-bus.plist`
+# templates only PATH, PYTHONPATH, _ICON, _LOG and _ERR, so neither this
+# variable nor DEV_MODE reaches a launchd-managed server. On the bus host,
+# either add it to the plist's EnvironmentVariables and reload the
+# LaunchAgent, or stop the service and run the bus in the foreground for the
+# duration of the diagnosis.
+AGENT_EVENT_BUS_LOG_PEER=1 agent-event-bus
 
 # Custom notification icon (requires terminal-notifier)
 AGENT_EVENT_BUS_ICON=/path/to/icon.png agent-event-bus

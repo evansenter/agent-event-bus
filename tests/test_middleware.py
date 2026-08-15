@@ -681,6 +681,65 @@ class TestTailscaleAuthMiddleware:
         assert responses[0]["status"] == 200
 
     @pytest.mark.asyncio
+    async def test_explicit_null_client_does_not_raise(self, mock_app):
+        """A unix-socket scope carries client=None, and subscripting the
+        .get default raised TypeError here - a 500 on every request, before
+        any handler ran. It must fall through to the header check like any
+        other untrusted peer instead."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "client": None,
+            "headers": [(b"tailscale-user-login", b"user@example.com")],
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        assert mock_app.called
+        assert responses[0]["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_headers_does_not_raise(self, mock_app):
+        """Sibling of the client=None case: dict(scope.get("headers", []))
+        subscript-fails the same way on an explicit headers=None. Both reads
+        of the scope use the same defensive form, so neither can be the one
+        that 500s."""
+        middleware = TailscaleAuthMiddleware(mock_app)
+
+        scope = {
+            "type": "http",
+            "path": "/mcp",
+            "method": "POST",
+            "client": ("100.64.0.1", 4321),
+            "headers": None,
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        responses = []
+
+        async def send(message):
+            responses.append(message)
+
+        await middleware(scope, receive, send)
+
+        # No identity, so a 401 - the point is that it answers rather than raising
+        assert not mock_app.called
+        assert responses[0]["status"] == 401
+
+    @pytest.mark.asyncio
     async def test_rejects_request_without_tailscale_header(self, mock_app):
         """Requests without Tailscale-User-Login header get 401."""
         middleware = TailscaleAuthMiddleware(mock_app)
@@ -859,3 +918,227 @@ class TestLoggingOffLoop:
         # The lookup ran (the log line was built) but not on the loop thread
         assert "thread" in seen
         assert seen["thread"] is not threading.current_thread()
+
+
+class TestPeerLogging:
+    """Opt-in peer address/port on register_session (#145).
+
+    Instrumentation, not a permanent log line: something registers and
+    immediately unregisters a session ~1.5x/min on the bus host and nothing
+    records where the calls come from. The port is the identifying half -
+    it is what `lsof -i` maps back to a PID.
+    """
+
+    def _run(
+        self,
+        monkeypatch,
+        tool_name="register_session",
+        scope_extra=None,
+        dev_mode=True,
+        log_peer=False,
+        arguments=None,
+    ):
+        """Drive one MCP tool call through the middleware, return the log line."""
+        import asyncio
+        import json
+
+        from agent_event_bus import middleware as mw
+
+        if dev_mode:
+            monkeypatch.setenv("DEV_MODE", "1")
+        else:
+            monkeypatch.delenv("DEV_MODE", raising=False)
+        if log_peer:
+            monkeypatch.setenv("AGENT_EVENT_BUS_LOG_PEER", "1")
+        else:
+            monkeypatch.delenv("AGENT_EVENT_BUS_LOG_PEER", raising=False)
+        monkeypatch.setattr(mw, "_lookup_session_display_id", lambda sid: None)
+
+        lines = []
+        monkeypatch.setattr(mw.logger, "info", lambda msg: lines.append(msg))
+
+        async def fake_app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'event: message\ndata: {"result": {"session_id": "abc-123"}}\n\n',
+                    "more_body": False,
+                }
+            )
+
+        app = mw.RequestLoggingMiddleware(fake_app)
+        request_body = json.dumps(
+            {
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": {"name": "evansenter"} if arguments is None else arguments,
+                },
+            }
+        ).encode()
+
+        async def main():
+            scope = {"type": "http", "path": "/mcp", "method": "POST"}
+            scope.update(
+                scope_extra if scope_extra is not None else {"client": ("127.0.0.1", 54321)}
+            )
+            messages = [{"type": "http.request", "body": request_body, "more_body": False}]
+
+            async def receive():
+                return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+            async def send(message):
+                pass
+
+            await app(scope, receive, send)
+
+        asyncio.run(main())
+        assert len(lines) == 1
+        return lines[0]
+
+    def test_register_session_logs_the_peer_under_dev_mode(self, monkeypatch):
+        line = self._run(monkeypatch)
+
+        # The port is the point: `lsof -i :54321` is what names the process
+        assert "from 127.0.0.1:54321" in line
+        # On the same line as the call it belongs to, so the peer is already
+        # paired with the registration it produced
+        assert "register_session" in line
+
+    def test_nothing_is_logged_without_dev_mode(self, monkeypatch):
+        """Off by default - this must not become a permanent log line."""
+        line = self._run(monkeypatch, dev_mode=False)
+
+        assert "127.0.0.1" not in line
+        assert "54321" not in line
+        assert " from " not in line
+        # The rest of the line is untouched
+        assert "register_session" in line
+
+    def test_other_tools_stay_quiet_even_under_dev_mode(self, monkeypatch):
+        """Scoped to the one call that answers the question. get_events runs
+        every few seconds per session; a peer on each would drown the log the
+        diagnosis is being read from."""
+        line = self._run(monkeypatch, tool_name="get_events")
+
+        assert "54321" not in line
+        assert " from " not in line
+
+    def test_missing_peer_is_named_rather_than_dropped(self, monkeypatch):
+        """A scope with no client (unix socket, or an ASGI server that omits
+        it) must not read as "DEV_MODE isn't on" to the operator who just
+        turned it on - and must not raise inside the logging path."""
+        line = self._run(monkeypatch, scope_extra={})
+
+        assert "from unknown peer" in line
+        # The server said there is no peer - expected, nothing to chase. Not
+        # the same event as a peer this label could not render.
+        assert "unparseable" not in line
+
+    def test_malformed_client_does_not_break_logging(self, monkeypatch):
+        """Distinguished from the absent-peer case: here a peer exists and
+        rendering it failed, which is something to chase (and a bug on that
+        line) rather than a dead end."""
+        line = self._run(monkeypatch, scope_extra={"client": "127.0.0.1"})
+
+        assert "from unknown peer (unparseable)" in line
+        assert "register_session" in line
+
+    def test_the_no_args_log_branch_carries_the_peer_too(self, monkeypatch):
+        """session_id is filtered out of the args (it becomes the caller
+        prefix), so a call carrying only that renders through the OTHER
+        logger.info branch. Both have to append the peer or the diagnosis
+        silently depends on which arguments the culprit happens to send."""
+        line = self._run(monkeypatch, arguments={"session_id": "abc-123"})
+
+        # Empty parens: the args branch never renders these (session_id was
+        # the only argument, and it is filtered into the caller prefix)
+        assert "()" in line
+        assert "register_session" in line
+        assert "from 127.0.0.1:54321" in line
+
+    def test_log_peer_env_var_works_without_dev_mode(self, monkeypatch):
+        """DEV_MODE is not a quiet switch: it also fires a desktop
+        notification per tool call (_dev_notify) and drops the logger to
+        DEBUG. An operator diagnosing #145 on the bus host would take
+        ~1.5 notifications/min from the churn alone, so peer logging has its
+        own switch."""
+        line = self._run(monkeypatch, dev_mode=False, log_peer=True)
+
+        assert "from 127.0.0.1:54321" in line
+
+    def test_tailscale_proxied_calls_are_marked(self, monkeypatch):
+        """Behind `tailscale serve` the peer is the LOCAL tailscaled, not the
+        caller - so lsof names tailscaled while the culprit is remote. Marked,
+        because un-marked it is byte-identical to a genuinely local caller and
+        would have an operator eliminate every remote candidate."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={
+                "client": ("127.0.0.1", 54321),
+                "headers": [(b"tailscale-user-login", b"evansenter@github")],
+            },
+        )
+
+        assert "from 127.0.0.1:54321 via tailscale" in line
+
+    def test_ipv6_peers_are_bracketed(self, monkeypatch):
+        """`from ::1:54321` hides where the address ends and the port begins,
+        and the port is the half the line exists for. `[::1]:54321` is the
+        conventional form and what lsof/ss print back."""
+        line = self._run(monkeypatch, scope_extra={"client": ("::1", 54321)})
+
+        assert "from [::1]:54321" in line
+
+    def test_ipv4_peers_are_not_bracketed(self, monkeypatch):
+        """The bracketing must key on the address family, not apply always."""
+        line = self._run(monkeypatch)
+
+        assert "from 127.0.0.1:54321" in line
+        # Not `"[" not in ...`: the line is full of ANSI escapes, which are
+        # all brackets. Name the shape that would actually be wrong.
+        assert "[127.0.0.1]" not in line
+
+    def test_malformed_header_entries_do_not_fail_the_request(self, monkeypatch):
+        """_peer_label runs BEFORE the app is awaited, so an exception here
+        fails the request rather than costing a log line - unlike
+        _log_tool_call, which is wrapped and runs after the response. The
+        port survives, and the identity is reported as unreadable rather
+        than rendering the unmarked form, which would assert "local"."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={"client": ("127.0.0.1", 54321), "headers": [(b"only-one-item",)]},
+        )
+
+        assert "from 127.0.0.1:54321 - headers unreadable" in line
+        assert "via tailscale" not in line
+
+    def test_empty_identity_header_is_not_treated_as_proxied(self, monkeypatch):
+        """TailscaleAuthMiddleware treats an empty value as no identity at
+        all (`if not tailscale_user`), so keying the marker on presence would
+        label a request "proxied" that the auth layer would have rejected -
+        and the marker exists precisely to keep an operator from eliminating
+        the wrong candidates."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={
+                "client": ("127.0.0.1", 54321),
+                "headers": [(b"tailscale-user-login", b"")],
+            },
+        )
+
+        assert "from 127.0.0.1:54321" in line
+        assert "via tailscale" not in line
+
+    def test_direct_calls_are_not_marked_as_proxied(self, monkeypatch):
+        """The marker has to mean something: a direct loopback call is the
+        case where the port DOES name the culprit."""
+        line = self._run(
+            monkeypatch,
+            scope_extra={"client": ("127.0.0.1", 54321), "headers": [(b"user-agent", b"python")]},
+        )
+
+        assert "from 127.0.0.1:54321" in line
+        assert "via tailscale" not in line

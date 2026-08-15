@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import anyio.to_thread
@@ -369,14 +370,22 @@ class TailscaleAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Trust localhost connections (CLI, local MCP)
-        client_ip = scope.get("client", ("", 0))[0]
+        # Trust localhost connections (CLI, local MCP).
+        # `or`, not a .get default: a unix-socket scope carries an explicit
+        # client=None, and subscripting that raised TypeError here - a 500 on
+        # every request, before any handler ran. "" is not in TRUSTED_IPS, so
+        # such a request falls through to the header check exactly as an
+        # unknown peer should.
+        client_ip = (scope.get("client") or ("", 0))[0]
         if client_ip in self.TRUSTED_IPS:
             await self.app(scope, receive, send)
             return
 
-        # Check for Tailscale identity header
-        headers = dict(scope.get("headers", []))
+        # Check for Tailscale identity header. Same defensive read as the
+        # client line above, and for the same reason: an explicit
+        # headers=None would subscript-fail here instead. Two lines reading
+        # one scope should not disagree about how.
+        headers = dict(scope.get("headers") or [])
         tailscale_user = headers.get(self.TAILSCALE_USER_HEADER)
 
         if not tailscale_user:
@@ -416,6 +425,110 @@ class TailscaleAuthMiddleware:
         )
 
 
+# Tools whose log line carries the caller's peer address under peer logging
+# (#145). Just register_session: the churn being diagnosed arrives as
+# register/unregister pairs, and the registration alone names the process, so
+# there is no reason to double the noise.
+PEER_LOGGED_TOOLS = ("register_session",)
+
+
+def _peer_logging_enabled() -> bool:
+    """Whether register_session lines carry the caller's peer (#145).
+
+    Two switches, deliberately. DEV_MODE is the repo-wide debug switch, but
+    it is not a QUIET one: _dev_notify fires a desktop notification per tool
+    call and the logger drops to DEBUG, so an operator who flips it on the
+    bus host to read one port also gets a notification for every
+    registration - ~1.5/min from the churn alone, plus every real session.
+    AGENT_EVENT_BUS_LOG_PEER turns peer logging on by itself, which is the
+    mode this instrumentation is actually meant to be used in.
+
+    Read from the environment per call rather than captured at import, so
+    flipping it in a test does not depend on import order. An operator flips
+    it by restarting the server either way.
+    """
+    return bool(os.environ.get("DEV_MODE") or os.environ.get("AGENT_EVENT_BUS_LOG_PEER"))
+
+
+def _peer_label(scope) -> str | None:
+    """Peer of the connection behind an ASGI scope, as host:port.
+
+    Instrumentation for #145, not a permanent log line: something registers
+    and immediately unregisters a session ~1.5x/min on the bus host, and
+    nothing recorded WHERE the calls came from. Returns None (and the log
+    line is unchanged) unless peer logging is switched on, so a bus serving
+    real sessions does not record a peer for every registration forever.
+
+    The PORT is the identifying half of a DIRECT connection: the bus listens
+    on loopback, so the address alone rarely narrows anything, while the
+    ephemeral port is what `lsof -i :PORT` maps back to a PID while the churn
+    is live.
+
+    That reasoning inverts behind `tailscale serve`, which is why the label
+    says so - see the marker below.
+    """
+    if not _peer_logging_enabled():
+        return None
+    # Absent for a unix socket, and some ASGI servers omit it entirely. Say
+    # so rather than dropping the suffix, which would read as "not enabled"
+    # to an operator who just turned this on.
+    client = scope.get("client")
+    if not client:
+        return "unknown peer"
+    try:
+        host, port = client
+    except (TypeError, ValueError):
+        # Distinct from the branch above: there, the server told us there is
+        # no peer (expected, nothing to chase). Here it handed over a shape
+        # this label did not anticipate - the peer exists and rendering it
+        # failed, which is a bug on this line rather than a dead end.
+        return "unknown peer (unparseable)"
+
+    # Bracket an IPv6 host. `from ::1:54321` gives a reader no way to see
+    # where the address ends and the port begins, and the port is the half
+    # this whole line exists for - a tailnet peer (fd7a:...) is worse still.
+    # `[::1]:54321` is the conventional form and what lsof/ss print back.
+    # IPv4 is untouched.
+    if ":" in str(host):
+        host = f"[{host}]"
+
+    # Behind `tailscale serve` the connection is terminated by the LOCAL
+    # tailscaled and proxied here, so this is tailscaled's socket rather than
+    # the caller's: `lsof -i :PORT` names tailscaled while the real caller is
+    # somewhere on the tailnet. Un-marked, that is byte-identical to a
+    # genuinely local caller, and an operator would eliminate every remote
+    # candidate on the strength of a loopback address. Tailscale's identity
+    # header is the only thing in the scope that separates them.
+    #
+    # Truthiness, not presence, so this agrees with the auth check above on
+    # what an identity is; advisory either way, since loopback bypasses auth
+    # and a local process can set the header itself. Both pinned by tests
+    # (test_empty_identity_header_..., test_direct_calls_are_not_marked_...).
+    #
+    # Scanned, not dict()-ed: this runs on the event loop for every /mcp POST
+    # while only register_session consumes it (the tool name lives in the
+    # request body, so PEER_LOGGED_TOOLS cannot be checked until
+    # _log_tool_call), so short-circuit rather than build a dict every
+    # get_events poll discards. Short-circuiting means the guard below sees
+    # only the entries scanned BEFORE the match, so a malformed entry after
+    # the identity header renders `via tailscale` rather than the unreadable
+    # form. Both are safe in the direction that matters - neither renders the
+    # bare unmarked form, which is the one claim this must not make falsely.
+    wanted = TailscaleAuthMiddleware.TAILSCALE_USER_HEADER
+    try:
+        identity = next((v for k, v in (scope.get("headers") or []) if k == wanted), None)
+    except (TypeError, ValueError):
+        # Same guard as the client unpack above, and it matters more here:
+        # _peer_label runs BEFORE the app is awaited, so a raise fails the
+        # REQUEST rather than costing a log line. Rendering the unmarked form
+        # instead would assert "local", the one thing this must not claim
+        # falsely - so say the identity is unreadable and keep the port.
+        return f"{host}:{port} - headers unreadable"
+    if identity:
+        return f"{host}:{port} via tailscale"
+    return f"{host}:{port}"
+
+
 class RequestLoggingMiddleware:
     """ASGI middleware that logs MCP tool calls with pretty formatting."""
 
@@ -434,6 +547,10 @@ class RequestLoggingMiddleware:
         if path != "/mcp" or method != "POST":
             await self.app(scope, receive, send)
             return
+
+        # Read here, not in the worker thread: the scope is the only place
+        # the peer exists, and _log_tool_call never sees it.
+        peer = _peer_label(scope)
 
         # Collect request body
         body_parts = []
@@ -460,10 +577,16 @@ class RequestLoggingMiddleware:
         # (#112 invariant - same class of fix as the tool bodies).
         request_body = b"".join(body_parts)
         response_body = b"".join(response_parts)
-        await anyio.to_thread.run_sync(self._log_tool_call, request_body, response_body)
+        await anyio.to_thread.run_sync(self._log_tool_call, request_body, response_body, peer)
 
-    def _log_tool_call(self, request_body: bytes, response_body: bytes) -> None:
-        """Parse and log one MCP tool call (runs in a worker thread)."""
+    def _log_tool_call(
+        self, request_body: bytes, response_body: bytes, peer: str | None = None
+    ) -> None:
+        """Parse and log one MCP tool call (runs in a worker thread).
+
+        `peer` is None unless peer logging is on (#145); see
+        _peer_logging_enabled.
+        """
         try:
             req_json = json.loads(request_body) if request_body else {}
             req_method = req_json.get("method", "?")
@@ -509,10 +632,21 @@ class RequestLoggingMiddleware:
             args_colored = f"{_DIM}{args_str}{_RESET}" if args_str else ""
             arrow = f"{_DIM}→{_RESET}"
 
+            # Appended to the SAME line, not logged separately, so the peer is
+            # already paired with the session_id the call minted - matching a
+            # port to a PID is useless if you cannot tell which registration
+            # it belongs to.
+            peer_suffix = ""
+            if peer and tool_name in PEER_LOGGED_TOOLS:
+                peer_suffix = f" {_DIM}from {peer}{_RESET}"
+
             if args_str:
-                logger.info(f"{caller_prefix}{tool_colored}({args_colored}) {arrow} {result_str}")
+                logger.info(
+                    f"{caller_prefix}{tool_colored}({args_colored}) {arrow} "
+                    f"{result_str}{peer_suffix}"
+                )
             else:
-                logger.info(f"{caller_prefix}{tool_colored}() {arrow} {result_str}")
+                logger.info(f"{caller_prefix}{tool_colored}() {arrow} {result_str}{peer_suffix}")
 
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.debug(f"Skipping malformed MCP request: {e}")
