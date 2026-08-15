@@ -651,6 +651,30 @@ class TestCmdUnregisterErrorSurfacing:
         captured = capsys.readouterr()
         assert "Session not found" in captured.err
 
+    @patch("agent_event_bus.cli.call_tool")
+    def test_deleted_session_hint_reaches_stderr(self, mock_call, capsys):
+        """The CLI is what shutdown hooks call, so the contract has to reach
+        it: cmd_publish/cmd_events/cmd_ack all print the hint, and dropping it
+        here left the caller a better error string with nothing to do about
+        it. Exit code is unchanged - this always errored."""
+        mock_call.return_value = {
+            "error": "Session deleted",
+            "session_deleted": True,
+            "session_id": "stale-id",
+            "display_id": "grand-bison",
+            "hint": "This session was already unregistered or timed out; nothing left to clean up.",
+        }
+
+        args = Namespace(session_id="stale-id", client_id=None, url=None, debug=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_unregister(args)
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "Session deleted" in err
+        assert "nothing left to clean up" in err
+
 
 def make_ack_args(**overrides):
     """Namespace matching the ack subparser's output - keep in sync."""

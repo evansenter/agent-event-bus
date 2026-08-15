@@ -1796,6 +1796,167 @@ class TestDeletedSessionPublishing:
             assert len(server._warned_deleted_sessions) == 2
 
 
+class TestDeletedSessionUnregister:
+    """The last session-scoped tool that can meet a deleted id (#144).
+
+    unregister_session was never silent - the call already failed - but it
+    reported "Session not found" for a row that exists and that the bus
+    itself deleted, which is the one distinction #140 is built on returned as
+    its opposite. A client branching on `session_deleted` got an answer from
+    three tools out of four.
+    """
+
+    def test_deleted_session_reports_deletion_not_absence(self):
+        reg = register_session(name="unreg-twice", client_id="unreg-twice-client")
+        sid = reg["session_id"]
+        assert unregister_session(session_id=sid)["success"] is True
+
+        result = unregister_session(session_id=sid)
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+        assert result["display_id"] == reg["display_id"]
+        assert result["deleted_at"]
+
+    def test_the_hint_does_not_promise_a_cleanup(self):
+        """The hint is derived from the disposition, not passed in, so this
+        path cannot inherit the reader's "stop polling" or the publisher's
+        "the event was stored" - neither is true of an unregister."""
+        reg = register_session(name="unreg-hint", client_id="unreg-hint-client")
+        unregister_session(session_id=reg["session_id"])
+
+        hint = unregister_session(session_id=reg["session_id"])["hint"]
+
+        assert "nothing left to clean up" in hint
+        assert "polling" not in hint
+        assert "stored" not in hint
+
+    def test_stale_cleanup_deletion_is_reported_too(self):
+        """The common case: the 24h sweep took the session and the client's
+        shutdown hook unregisters afterwards."""
+        reg = register_session(name="unreg-stale", client_id="unreg-stale-client")
+        server.storage.cleanup_stale_sessions(timeout_seconds=0)
+
+        result = unregister_session(session_id=reg["session_id"])
+
+        assert result["session_deleted"] is True
+
+    def test_unknown_session_is_still_a_plain_not_found(self):
+        """Never-registered ids keep their old answer - the contract only
+        speaks about ids the bus knows it deleted."""
+        result = unregister_session(session_id="never-registered-unreg")
+
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_the_client_id_path_reports_deletion_too(self):
+        """The contract has to hold for the argument the caller used, not just
+        for session_id - the CLI's --client-id form resolves through
+        find_session_by_client, which was active-only and so answered
+        "not found" for a session the bus deleted."""
+        machine = socket.gethostname()
+        reg = register_session(name="unreg-by-client", machine=machine, client_id="unreg-cid")
+        assert unregister_session(client_id="unreg-cid")["success"] is True
+
+        result = unregister_session(client_id="unreg-cid")
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+        assert result["display_id"] == reg["display_id"]
+
+    def test_unknown_client_id_is_still_a_plain_not_found(self):
+        result = unregister_session(client_id="never-registered-cid")
+
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_a_live_row_wins_over_a_deleted_one_sharing_a_client_id(self):
+        """include_deleted widens the lookup, so find_session_by_client's
+        `ORDER BY deleted_at IS NOT NULL` is now load-bearing: with both a
+        deleted and a live row under one client_id, unregister must take the
+        LIVE one.
+
+        Built through storage directly, NOT through register_session: that
+        revives a deleted row in place (add_session is INSERT OR REPLACE keyed
+        on id, and `id` IS the client_id when one is given), so it can never
+        produce the two-row state this ordering exists for - and a test
+        written that way stays green with the ORDER BY deleted.
+        """
+        machine = socket.gethostname()
+        now = datetime.now()
+        for sid in ("unreg-order-old", "unreg-order-live"):
+            server.storage.add_session(
+                Session(
+                    id=sid,
+                    display_id=f"dino-{sid.rsplit('-', 1)[-1]}",
+                    name="unreg-order",
+                    machine=machine,
+                    cwd="/x",
+                    repo="x",
+                    registered_at=now,
+                    last_heartbeat=now,
+                    client_id="unreg-order-cid",
+                )
+            )
+        assert server.storage.delete_session("unreg-order-old")
+
+        result = unregister_session(client_id="unreg-order-cid")
+
+        assert result["success"] is True
+        assert result["session_id"] == "unreg-order-live"
+
+    def test_losing_the_delete_race_does_not_report_success(self):
+        """delete_session is guarded by `deleted_at IS NULL`, so a concurrent
+        unregister (or the sweep) makes the write a no-op. Reporting success
+        would be this fix's own bug arriving through the TOCTOU door - and it
+        would publish a SECOND session_unregistered event for one ending."""
+        reg = register_session(name="unreg-raced", client_id="unreg-raced-client")
+        sid = reg["session_id"]
+        real_delete = server.storage.delete_session
+
+        def delete_twice(session_id):
+            real_delete(session_id)  # the concurrent unregister lands first
+            return real_delete(session_id)
+
+        with patch.object(server.storage, "delete_session", delete_twice):
+            result = unregister_session(session_id=sid)
+
+        assert "success" not in result
+        assert result["session_deleted"] is True
+        # And only ONE lifecycle event for the one session that ended
+        unregs = [
+            e
+            for e in get_events(order="desc", limit=50)["events"]
+            if e["event_type"] == "session_unregistered" and e["session_id"] == sid
+        ]
+        assert len(unregs) == 0
+
+    def test_a_live_session_still_unregisters(self):
+        reg = register_session(name="unreg-live", client_id="unreg-live-client")
+
+        result = unregister_session(session_id=reg["session_id"])
+
+        assert result["success"] is True
+        assert "session_deleted" not in result
+
+    def test_no_warning_is_logged(self, caplog):
+        """The warn-once line exists to surface an orphan still WORKING the
+        bus. A client unregistering is one winding down - warning here would
+        flag the well-behaved caller and dilute the signal."""
+        reg = register_session(name="unreg-quiet", client_id="unreg-quiet-client")
+        unregister_session(session_id=reg["session_id"])
+
+        with patch.object(server, "_warned_deleted_sessions", set()):
+            with caplog.at_level(logging.WARNING, logger="agent-event-bus"):
+                unregister_session(session_id=reg["session_id"])
+
+            assert [r for r in caplog.records if "deleted session" in r.message] == []
+            # And it does not burn the warn-once slot: a later poll from the
+            # same session still warns
+            get_events(session_id=reg["session_id"], resume=True)
+            assert len(server._warned_deleted_sessions) == 1
+
+
 class TestAckEvents:
     """ack_events: advance the cursor to an id the caller already holds (#134).
 

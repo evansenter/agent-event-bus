@@ -374,6 +374,21 @@ to revive) and publish under the live id from then on. Nothing needs re-sending
 — the flagged event is already stored. The CLI exits **0** and prints the
 warning to stderr, since the publish succeeded.
 
+**Unregistering one twice** reports the same shape, with `error` — there is
+nothing left to clean up, and this used to say `"Session not found"`, which is
+the one thing it is not:
+
+```
+unregister_session(session_id="stale-id")
+→ { error: "Session deleted", session_deleted: true, display_id: "grand-bison", ... }
+```
+
+So all four session-scoped tools answer the same way: `get_events` and
+`ack_events` refuse, `publish_event` stores and flags, `unregister_session`
+says it is already done. Branch on `session_deleted` and the tool no longer
+matters. Unlike a poll or a publish, this one logs no `WARNING` — a client
+unregistering is one winding *down*, not an orphan still working the bus.
+
 **Finding orphaned pollers and publishers** on a bus host:
 
 ```sql
