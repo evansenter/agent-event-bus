@@ -36,6 +36,46 @@ One consulted variable is deliberately outside the prefix: **`CLAUDE_CODE_SESSIO
 
 ---
 
+## VERIFICATION BOUNDARIES
+
+**Host-specific behavior cannot be verified from a dev container. State such
+claims as unverified and hand them to the bus host; do not assert them.**
+
+In scope: launchd and systemd semantics (restart, throttling, whether a log
+capture appends or truncates), `/health` and anything else about the *running*
+supervised bus or bridge, port binding, `tmux`/`zellij` injection, the real
+`~/.claude/contrib/agent-event-bus/` tree. A container has no launchd, no bus
+process, no multiplexer, and no session on the bus - so a claim about any of
+them is a guess with a confident voice.
+
+This is not hypothetical. Both corrections in #141 were exactly this failure:
+
+- launchd was documented as **truncating** its `StandardOutPath` /
+  `StandardErrorPath` captures on restart. It appends. The wrong claim had
+  propagated into three files and was motivating a follow-up - adding an
+  append-mode file handler to the bridge - that would have been pure cost for a
+  problem that does not exist. The corrected note now lives in the Log files row
+  of the naming table above.
+- A `/health` check was written up as reproducible when `registered` is the
+  cached result of the *last registration attempt* and is never re-checked
+  against the bus. Unloading the bus under a registered bridge leaves `/health`
+  still reporting `true`, so the "verification" verified nothing.
+
+Both were disproved by the bus host in minutes. The cost is not the wrong
+sentence - it is that documentation asserts with the same voice whether or not
+anything was run, so an unverified claim is indistinguishable from a tested one
+and gets built on.
+
+**How to write it instead:** name the check, the expected result, and who has to
+run it - "unverified from this environment; on the bus host, `kill -9` the
+bridge and confirm the `.err` still holds the prior PID's startup lines."
+`docs/BRIDGE.md`'s "Verifying supervision" section is the model: it lists the
+manual checks precisely because the test suite mocks launchd entirely. Tests
+that mock the host verify the caller, never the host's behavior - do not cite a
+passing suite as evidence for a claim in this section's scope.
+
+---
+
 ## DATABASE PROTECTION
 
 **The database at `~/.claude/contrib/agent-event-bus/data.db` contains irreplaceable event history.**
