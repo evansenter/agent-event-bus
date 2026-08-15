@@ -624,10 +624,20 @@ _UNREGISTER_HINT = (
 # the caller simply asked for something already done.
 _Disposition = Literal["refused", "flagged", "already_gone"]
 
-_DISPOSITION_HINTS: dict[str, str] = {
+_DISPOSITION_HINTS: dict[_Disposition, str] = {
     "refused": _READ_HINT,
     "flagged": _PUBLISH_HINT,
     "already_gone": _UNREGISTER_HINT,
+}
+
+# How the warning names each disposition. A mapping rather than a ternary for
+# the same reason the hints are: a fourth disposition added later would be
+# silently logged as whatever the `else` branch said, which is exactly the
+# drift the derive-don't-pass design exists to prevent. `already_gone` has no
+# entry because it does not warn - a missing key would raise rather than lie.
+_DISPOSITION_VERBS: dict[_Disposition, str] = {
+    "refused": "rejecting calls from",
+    "flagged": "storing events from",
 }
 
 
@@ -681,7 +691,7 @@ def _deleted_session_notice(
     warn_key = (session_id, deleted_at_str, tool)
     if disposition != "already_gone" and warn_key not in _warned_deleted_sessions:
         _warned_deleted_sessions.add(warn_key)
-        verb = "rejecting calls from" if disposition == "refused" else "storing events from"
+        verb = _DISPOSITION_VERBS[disposition]
         logger.warning(
             f"{tool}: {verb} deleted session {session.display_id} "
             f"({session_id[:8]}..., deleted_at={deleted_at_str}) - an orphaned "
@@ -1066,7 +1076,12 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
     # Look up session by client_id if provided
     if client_id and not session_id:
         machine = socket.gethostname()
-        session = storage.find_session_by_client(machine, client_id)
+        # include_deleted, so this path reaches the deleted-session check below
+        # rather than answering "not found" for a session the bus deleted - the
+        # contract has to hold for the argument the caller happened to use, not
+        # just for session_id. Safe for live sessions: the ordering puts active
+        # rows first, so an active match still wins over a deleted one.
+        session = storage.find_session_by_client(machine, client_id, include_deleted=True)
         if session:
             session_id = session.id
         else:
@@ -1087,7 +1102,15 @@ def _unregister_session_impl(session_id: str | None = None, client_id: str | Non
         _dev_notify("unregister_session", f"{session_id} not found")
         return {"error": "Session not found", "session_id": session_id}
 
-    storage.delete_session(session_id)
+    if not storage.delete_session(session_id):
+        # Lost a race: a concurrent unregister (or the 24h sweep) deleted the
+        # row between the load above and this write, which is guarded by
+        # `deleted_at IS NULL`. Same shape ack_events uses for its analogous
+        # race - reporting success here would be this PR's own bug arriving
+        # through the TOCTOU door, and it would publish a SECOND
+        # session_unregistered event for one session ending.
+        raced = _deleted_session_gone(_load_polling_session(session_id))
+        return raced or {"error": "Session not found", "session_id": session_id}
 
     # Publish unregister event
     storage.add_event(

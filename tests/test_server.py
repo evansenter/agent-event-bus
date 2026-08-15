@@ -1849,6 +1849,69 @@ class TestDeletedSessionUnregister:
         assert result["error"] == "Session not found"
         assert "session_deleted" not in result
 
+    def test_the_client_id_path_reports_deletion_too(self):
+        """The contract has to hold for the argument the caller used, not just
+        for session_id - the CLI's --client-id form resolves through
+        find_session_by_client, which was active-only and so answered
+        "not found" for a session the bus deleted."""
+        machine = socket.gethostname()
+        reg = register_session(name="unreg-by-client", machine=machine, client_id="unreg-cid")
+        assert unregister_session(client_id="unreg-cid")["success"] is True
+
+        result = unregister_session(client_id="unreg-cid")
+
+        assert result["error"] == "Session deleted"
+        assert result["session_deleted"] is True
+        assert result["display_id"] == reg["display_id"]
+
+    def test_unknown_client_id_is_still_a_plain_not_found(self):
+        result = unregister_session(client_id="never-registered-cid")
+
+        assert result["error"] == "Session not found"
+        assert "session_deleted" not in result
+
+    def test_a_live_client_id_still_wins_over_a_deleted_row(self):
+        """include_deleted widens the lookup, so the ordering that puts active
+        rows first is now load-bearing: re-registering under the same
+        client_id must still unregister the LIVE session."""
+        machine = socket.gethostname()
+        register_session(name="unreg-revive", machine=machine, client_id="unreg-revive-cid")
+        unregister_session(client_id="unreg-revive-cid")
+        second = register_session(
+            name="unreg-revive", machine=machine, client_id="unreg-revive-cid"
+        )
+
+        result = unregister_session(client_id="unreg-revive-cid")
+
+        assert result["success"] is True
+        assert result["session_id"] == second["session_id"]
+
+    def test_losing_the_delete_race_does_not_report_success(self):
+        """delete_session is guarded by `deleted_at IS NULL`, so a concurrent
+        unregister (or the sweep) makes the write a no-op. Reporting success
+        would be this fix's own bug arriving through the TOCTOU door - and it
+        would publish a SECOND session_unregistered event for one ending."""
+        reg = register_session(name="unreg-raced", client_id="unreg-raced-client")
+        sid = reg["session_id"]
+        real_delete = server.storage.delete_session
+
+        def delete_twice(session_id):
+            real_delete(session_id)  # the concurrent unregister lands first
+            return real_delete(session_id)
+
+        with patch.object(server.storage, "delete_session", delete_twice):
+            result = unregister_session(session_id=sid)
+
+        assert "success" not in result
+        assert result["session_deleted"] is True
+        # And only ONE lifecycle event for the one session that ended
+        unregs = [
+            e
+            for e in get_events(order="desc", limit=50)["events"]
+            if e["event_type"] == "session_unregistered" and e["session_id"] == sid
+        ]
+        assert len(unregs) == 0
+
     def test_a_live_session_still_unregisters(self):
         reg = register_session(name="unreg-live", client_id="unreg-live-client")
 
