@@ -509,7 +509,11 @@ def _peer_label(scope) -> str | None:
     # while only register_session consumes it (the tool name lives in the
     # request body, so PEER_LOGGED_TOOLS cannot be checked until
     # _log_tool_call), so short-circuit rather than build a dict every
-    # get_events poll discards.
+    # get_events poll discards. Short-circuiting means the guard below sees
+    # only the entries scanned BEFORE the match, so a malformed entry after
+    # the identity header renders `via tailscale` rather than the unreadable
+    # form. Both are safe in the direction that matters - neither renders the
+    # bare unmarked form, which is the one claim this must not make falsely.
     wanted = TailscaleAuthMiddleware.TAILSCALE_USER_HEADER
     try:
         identity = next((v for k, v in (scope.get("headers") or []) if k == wanted), None)

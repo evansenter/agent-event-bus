@@ -223,11 +223,14 @@ DEV_MODE=1 agent-event-bus
 # Only register_session carries it: get_events runs every few seconds per
 # session and would drown the log you are reading it from.
 #
-# The four forms a peer can take: `127.0.0.1:54321` (direct - the port names
+# The five forms a peer can take: `127.0.0.1:54321` (direct - the port names
 # the caller), `... via tailscale` (see below), `unknown peer` (the server
-# reported no peer - nothing to chase), and `... - headers unreadable` (the
-# port is good, the identity check failed, so a MISSING `via tailscale` there
-# is not evidence of a local caller).
+# reported no peer - nothing to chase), `unknown peer (unparseable)` (a peer
+# EXISTS and this label could not render it - a bug here, not a dead end;
+# note the previous form is a prefix of this one, so match the longer first),
+# and `... - headers unreadable` (the port is good, the identity check
+# failed, so a MISSING `via tailscale` there is not evidence of a local
+# caller).
 #
 # CAVEAT - `tailscale serve`: a proxied request is terminated by the LOCAL
 # tailscaled, so the peer is tailscaled's socket and `lsof` names tailscaled
