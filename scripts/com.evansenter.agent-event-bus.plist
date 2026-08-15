@@ -38,7 +38,11 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- Note: launchd truncates on restart; Python logger handles append to .log file -->
+    <!-- launchd APPENDS to these across restarts - verified on the bridge's
+         equivalents, where a kill -9 respawn left the prior PID's lines in
+         place; same launchd behaviour applies here. Note StandardOutPath is
+         a THIRD file (.stdout), not the Python logger's .log, which
+         AGENT_EVENT_BUS_LOG moves and which appends on its own. -->
     <key>StandardOutPath</key>
     <string>__HOME__/.claude/contrib/agent-event-bus/agent-event-bus.stdout</string>
 

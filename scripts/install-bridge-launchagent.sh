@@ -22,20 +22,30 @@ if [[ ! -f "$VENV_PYTHON" ]]; then
     exit 1
 fi
 
-# Preflight the import rather than running `uv sync` here. A stale venv missing
+# Preflight the imports rather than running `uv sync` here. uvicorn is listed
+# explicitly because bridge.py imports it lazily INSIDE main(), so importing
+# the module alone would not surface its absence - and a missing uvicorn is
+# precisely the crash-loop this check exists to prevent. A stale venv missing
 # a bridge dependency would otherwise become an import crash-loop under
-# KeepAlive - the one case where the log-truncation caveat bites hardest, since
-# every respawn wipes the previous traceback. Checking beats syncing: `uv sync
+# KeepAlive - respawning every ThrottleInterval forever, never serving a
+# delivery, with /health never answering to say so. Checking beats syncing: `uv sync
 # --no-dev` (what install-server runs) would silently strip pytest/ruff from a
 # venv someone just set up with `make dev`.
-if ! PYTHONPATH="$PROJECT_DIR/src" "$VENV_PYTHON" -c "import agent_event_bus.bridge" 2>/tmp/bridge-import-check.$$; then
-    echo "Error: the venv cannot import agent_event_bus.bridge:"
-    sed 's/^/  /' /tmp/bridge-import-check.$$
-    rm -f /tmp/bridge-import-check.$$
+# mktemp, not a predictable /tmp path: the 2> redirect follows symlinks, so a
+# pre-planted file of a guessable name would be truncated as the installing
+# user. The trap also covers an interrupt between creation and cleanup.
+IMPORT_ERR="$(mktemp "${TMPDIR:-/tmp}/agent-event-bus-bridge-import.XXXXXX")"
+trap 'rm -f "$IMPORT_ERR"' EXIT
+# uvicorn is named explicitly because bridge.py imports it lazily INSIDE
+# main(), so importing the module alone would not surface its absence. Keep
+# this list in sync with the deferred imports in bridge.py:main() - a second
+# one added there silently reopens the crash-loop hole this check closes.
+if ! PYTHONPATH="$PROJECT_DIR/src" "$VENV_PYTHON" -c "import agent_event_bus.bridge, uvicorn" 2>"$IMPORT_ERR"; then
+    echo "Error: the venv cannot import the bridge and its runtime deps:"
+    sed 's/^/  /' "$IMPORT_ERR"
     echo "Run: make dev   (or: uv sync)"
     exit 1
 fi
-rm -f /tmp/bridge-import-check.$$
 
 # The bridge is useless without a bus to register against. It would retry with
 # backoff rather than die (register_with_retry), so this is a warning and not a
@@ -51,10 +61,16 @@ fi
 
 mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p "$DATA_DIR"
+# The log paths are overridable and may point outside DATA_DIR; launchd
+# cannot create a missing parent for StandardOutPath/StandardErrorPath and
+# the job simply fails to start.
+mkdir -p "$(dirname "$BRIDGE_LOG_FILE")" "$(dirname "$BRIDGE_ERR_FILE")"
 
+REPLACED_LOADED_JOB=false
 if launchctl list | grep -q "$LABEL$"; then
     echo "Stopping existing bridge service..."
     launchctl unload "$PLIST_DEST" 2>/dev/null || true
+    REPLACED_LOADED_JOB=true
 fi
 
 echo "Installing bridge LaunchAgent..."
@@ -67,14 +83,37 @@ sed -e "s|__VENV_PYTHON__|$VENV_PYTHON|g" \
 echo "Starting bridge..."
 launchctl load "$PLIST_DEST"
 
-# POLL rather than sleep a fixed interval. On a re-install over a live bridge,
-# `launchctl unload` returns as soon as SIGTERM is delivered, so the outgoing
-# process can still hold the singleton flock and port 8082 when the replacement
-# starts. The replacement then exits on the lock - correctly; that ordering is
-# what keeps the outgoing instance's unregister from racing a new registration
-# - and KeepAlive only retries after ThrottleInterval (~10s). A flat 2s probe
-# lands inside that window and reports a perfectly healthy idempotent
-# re-install as a failure. 20s covers the throttle with room to spare.
+# POLL rather than sleep a fixed interval - but only after the handoff has
+# had time to resolve, when there was one. `launchctl unload` returns as soon
+# as SIGTERM is delivered, and the outgoing bridge keeps port 8082 through its
+# shielded stop-join-unregister. So an immediate probe is answered by the
+# instance that is about to DIE: HEALTH would be set from it, the loop would
+# break, and the `launchctl list` check below reports only that the JOB is
+# loaded, not that a process is alive - so the script would print "installed
+# and running" and the outgoing registered: value while the replacement had
+# just exited on the singleton flock, not to return for ~ThrottleInterval.
+# /health carries nothing instance-specific to tell them apart, so wait the
+# throttle out first. Skipped on a fresh install, where no job was displaced.
+#
+# The 12 is ThrottleInterval (10, set in the plist) plus margin, and the two
+# are coupled with nothing but this comment to link them: raise the plist's
+# ThrottleInterval without raising this and the gate under-waits, letting the
+# dying instance answer the poll again - the exact failure it was added to
+# close. The plist comment points back here.
+#
+# Two honest limits. The flag is set from `launchctl list`, which reports the
+# JOB is loaded, not that a process is alive - a loaded-but-dead job pays the
+# wait for no handoff. And 12s bounds ThrottleInterval, not the outgoing
+# shutdown: an unregister retrying against a slow bus can outlive it, and an
+# unsupervised `uv run agent-event-bus-bridge` already holding 8082 produces
+# the same shape on the fresh-install path. Both dissolve once /health carries
+# something instance-specific (a pid or start timestamp), which would let the
+# poll assert it is talking to the new process and drop this sleep entirely.
+if [[ "$REPLACED_LOADED_JOB" == true ]]; then
+    echo "Waiting out the restart throttle so /health reports the NEW instance..."
+    sleep 12
+fi
+
 HEALTH=""
 for _ in $(seq 1 40); do
     HEALTH="$(curl -fsS --max-time 2 http://127.0.0.1:8082/health 2>/dev/null || true)"
@@ -111,7 +150,11 @@ if [[ -n "$HEALTH" ]]; then
             echo "  Not registered yet - retrying with backoff (is the bus up?)." ;;
     esac
 else
-    echo "  /health did not answer within 20s; check $BRIDGE_ERR_FILE."
+    # No elapsed figure: the poll's real bound is 20s only if every probe
+    # fails instantly (40 x sleep 0.5) and ~100s if they all hang out to
+    # --max-time 2, and the re-install path adds the 12s throttle wait ahead
+    # of it. The log path is what the operator needs anyway.
+    echo "  /health did not answer; check $BRIDGE_ERR_FILE."
 fi
 
 echo ""
