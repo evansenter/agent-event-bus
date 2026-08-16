@@ -436,10 +436,17 @@ run once end to end there - a live session in a mapped zellij pane woke, read
 the bus, and acted - and it is worth re-running after any change to the
 injection path, because nothing else exercises it.
 
-A safe way to run it: start a **scratch** session (`zellij attach -b probe`,
-then `claude` in it) rather than testing against a pane you are working in.
-An injection into a pane where someone is mid-keystroke submits their draft
-along with the wake text, and that is not a failure the bridge can prevent.
+A safe way to run it: use a **scratch** session rather than a pane you are
+working in. An injection into a pane where someone is mid-keystroke submits
+their draft along with the wake text, and that is not a failure the bridge can
+prevent.
+
+In a second terminal, `zellij -s probe` (or `tmux new -s probe`) and run
+`claude` inside it. Note that `zellij attach -b probe` is NOT that command -
+`-b` creates the session **detached**, so it returns immediately and leaves you
+nowhere; it is useful for driving a pane entirely from outside (`zellij
+--session probe action write-chars ...`), which is how this was first run, but
+it does not give you a pane to type in.
 
 Before enabling injection on a host that has been running the spool backend,
 **audit `panes.json`**: a stale entry from earlier testing can point at a pane

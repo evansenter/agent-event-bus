@@ -164,7 +164,22 @@ echo ""
 # spool; the spool is durable bookkeeping and the fallback for anything that
 # cannot be injected. What actually gates a wake is the pane mapping, so name
 # that instead - it is the part an operator has to install.
-if [[ -s "$DATA_DIR/wake/panes.json" ]] && grep -q '[^[:space:]{}]' "$DATA_DIR/wake/panes.json" 2>/dev/null; then
+# Parsed, not grepped. A content-shaped check ("any byte that is not
+# whitespace or a brace") calls `[]`, `null`, or a half-written file
+# "populated", so the installer would report that sessions can be woken while
+# the bridge - which PARSES this file and falls back to no-mapping - resolves
+# every delivery to spool-unmapped. That is the same inversion this message was
+# rewritten to remove, one layer down. Mirror the reader's own test instead:
+# a JSON object with at least one key.
+if "$VENV_PYTHON" -c "
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d else 1)
+" "$DATA_DIR/wake/panes.json" 2>/dev/null; then
     echo "NOTE: wake/panes.json has entries, so mapped sessions on this host can"
     echo "      be woken by a DM to their session_id. Unmapped sessions (and"
     echo "      sessions on other machines) are spooled only."

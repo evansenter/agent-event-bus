@@ -202,7 +202,7 @@ load-bearing block ordering between `drain-directed-events.sh` and
 ## What could not be verified while writing this — and what happened after
 
 Per the verification-boundaries rule in `CLAUDE.md`, these were handed to the
-bus host rather than asserted. All but the last have since been run there:
+bus host rather than asserted. All but the last two have since been run there:
 
 - **An actual Claude Code session waking** — *done*. A scratch session in a
   mapped zellij pane went from an idle prompt to processing, called
