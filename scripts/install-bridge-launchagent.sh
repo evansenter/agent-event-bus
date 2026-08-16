@@ -158,8 +158,37 @@ else
 fi
 
 echo ""
-echo "NOTE: nothing drains wake/<session>.jsonl yet (agent-event-bus#134)."
-echo "      The bridge will spool actionable DMs durably, but no session is"
-echo "      woken by them until a drain hook exists."
+# Was "nothing drains the spool, so no session is woken" - true until the mux
+# backend landed (#149), and printed by this script for months after it
+# stopped being true. Sessions are now woken by INJECTION, not by draining the
+# spool; the spool is durable bookkeeping and the fallback for anything that
+# cannot be injected. What actually gates a wake is the pane mapping, so name
+# that instead - it is the part an operator has to install.
+# Parsed, not grepped. A content-shaped check ("any byte that is not
+# whitespace or a brace") calls `[]`, `null`, or a half-written file
+# "populated", so the installer would report that sessions can be woken while
+# the bridge - which PARSES this file and falls back to no-mapping - resolves
+# every delivery to spool-unmapped. That is the same inversion this message was
+# rewritten to remove, one layer down. Mirror the reader's own test instead:
+# a JSON object with at least one key.
+if "$VENV_PYTHON" -c "
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d else 1)
+" "$DATA_DIR/wake/panes.json" 2>/dev/null; then
+    echo "NOTE: wake/panes.json has entries, so mapped sessions on this host can"
+    echo "      be woken by a DM to their session_id. Unmapped sessions (and"
+    echo "      sessions on other machines) are spooled only."
+else
+    echo "NOTE: wake/panes.json is empty, so nothing here can be woken yet -"
+    echo "      every DM will spool and resolve to \"spool-unmapped\"."
+    echo "      Sessions map themselves via a SessionStart hook running:"
+    echo "        agent-event-bus-cli panes set --session-id \"\$SESSION_ID\""
+    echo "      See docs/BRIDGE.md, \"Maintaining the pane mapping\"."
+fi
 echo ""
 echo "To uninstall: $SCRIPT_DIR/uninstall-bridge-launchagent.sh"

@@ -6,9 +6,11 @@ subsystem (RFC #122). It is documented here rather than in
 into working sessions, and this is operator documentation for a component
 most sessions never run.
 
-**Status: prototype.** Supervised on macOS since #139 (`make install-bridge`);
-no systemd unit yet, and the addressability and durability caveats below are
-real. See issue #122.
+**Status: prototype, but the wake path works.** Supervised on macOS since #139
+(`make install-bridge`), injecting since #149, and verified once end to end on
+the bus host - a live Claude Code session in a mapped zellij pane was woken by
+a DM, read the bus, and acted on the event. Still a prototype: no systemd unit,
+and the addressability and durability caveats below are real. See issue #122.
 
 ---
 
@@ -112,9 +114,12 @@ them check claims the unit's own comments make:
 4. **Clean unload** - `make uninstall-bridge`, then confirm the webhook row
    is gone and port 8082 is free.
 
-What none of this covers: whether a session actually *wakes*. That needs a
-live Claude Code session in a pane this host's `panes.json` maps, and a DM
-addressed to its `session_id` - see **Verifying a wake** below.
+What none of this covers: whether a session actually *wakes*. That is a
+separate check - see **Verifying a wake** below. It has been done once, on the
+bus host: a live Claude Code session in a mapped zellij pane was woken by a DM
+to its `session_id`, read the bus, and acted on the event. Re-run it after any
+change to the injection path, since none of the four checks above would catch
+a break in it.
 
 ## Backends
 
@@ -425,8 +430,28 @@ behaviour for a deployment that would rather latch than risk a mid-turn wake.
 
 ## Verifying a wake
 
-Unverifiable from a dev container (no launchd, no multiplexer, no session on
-the bus), so this is a checklist for the bus host rather than a claim:
+Still unverifiable from a dev container (no launchd, no multiplexer, no
+session on the bus), so this stays a checklist for the bus host. It has been
+run once end to end there - a live session in a mapped zellij pane woke, read
+the bus, and acted - and it is worth re-running after any change to the
+injection path, because nothing else exercises it.
+
+A safe way to run it: use a **scratch** session rather than a pane you are
+working in. An injection into a pane where someone is mid-keystroke submits
+their draft along with the wake text, and that is not a failure the bridge can
+prevent.
+
+In a second terminal, `zellij -s probe` (or `tmux new -s probe`) and run
+`claude` inside it. Note that `zellij attach -b probe` is NOT that command -
+`-b` creates the session **detached**, so it returns immediately and leaves you
+nowhere; it is useful for driving a pane entirely from outside (`zellij
+--session probe action write-chars ...`), which is how this was first run, but
+it does not give you a pane to type in.
+
+Before enabling injection on a host that has been running the spool backend,
+**audit `panes.json`**: a stale entry from earlier testing can point at a pane
+someone is now using, and it is inert under `spool` but armed the moment the
+backend flips.
 
 1. Confirm the daemon found a multiplexer: the startup line
    `Wake injection available via: ...` in the bridge's `.err`. If it names
@@ -454,13 +479,16 @@ string into `cat` in the same pane arrived byte-exact every time. So
 `write-chars` transmits faithfully and the lost keystroke is the shell's line
 editor - autosuggestion-class ZLE widgets dropping input at paste speed.
 
-Two consequences. First, a garbled wake in a *shell* pane is the
-stale-mapping symptom, not a bridge fault - it means the session that owned
-that pane exited without clearing its entry. Second, whether a given TUI has
-its own version of this is a property of that TUI: it is **unverified** for
-Claude Code's input handling, which is not zsh ZLE. Worth checking on the
-first real wake, though the failure is cosmetic - a prompt missing a space
-still reads.
+**Claude Code's TUI does not do this.** Measured on the first real wake: the
+scrollback held `Check the event bus - a directed event arrived for this
+session.` intact, wrapped only by the pane width. Its input handling is not
+zsh ZLE, and the drop does not reproduce there.
+
+So a garbled wake in a *shell* pane is the stale-mapping symptom, not a bridge
+fault - it means the session that owned that pane exited without clearing its
+entry, and something injected into the shell that replaced it. Fidelity is a
+property of the receiving program, so a result for one does not transfer to
+another: measure a new target rather than assuming either way.
 
 ## Loop prevention and single-instance
 
