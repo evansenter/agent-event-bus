@@ -199,12 +199,28 @@ writer, tests, `docs/BRIDGE.md`, plist. `dotfiles`: `session-start.sh`,
 load-bearing block ordering between `drain-directed-events.sh` and
 `enforce-insight-publish.sh`.
 
-## What cannot be verified from here
+## What could not be verified while writing this — and what happened after
 
-Per the verification-boundaries rule in `CLAUDE.md`. Hand to the bus host:
+Per the verification-boundaries rule in `CLAUDE.md`, these were handed to the
+bus host rather than asserted. All but the last have since been run there:
 
-- An actual Claude Code session waking. Needs a live session in a mapped pane.
-- `make install-bridge` picking up the new backend, and the supervised bridge
-  reading a real `panes.json`.
-- `ZELLIJ_PANE_ID` uniqueness across a session's full pane set in daily use
-  (single-pane and cross-tab addressing were verified directly).
+- **An actual Claude Code session waking** — *done*. A scratch session in a
+  mapped zellij pane went from an idle prompt to processing, called
+  `get_events`, and acted on the DM.
+- **`make install-bridge` picking up the new backend** — *done*. The preflight
+  logged `Wake injection available via: tmux, zellij` under launchd's own PATH.
+- **Injection fidelity into Claude Code's TUI** — *done, and it is fine*. The
+  one-space drop reproduces in an interactive zsh pane and not in the TUI. The
+  lesson generalizes better than the result: fidelity belongs to the receiving
+  program, so measure a new target rather than inferring from an old one.
+- **`ZELLIJ_PANE_ID` uniqueness across a session's full pane set in daily use**
+  — still open. Single-pane and cross-tab addressing were verified directly.
+- **Reboot** — still open; needs the host restarted.
+
+Two things the live run surfaced that no amount of local reasoning would have:
+a stale `panes.json` entry from earlier testing was pointing at the operator's
+own working pane (inert under `spool`, armed the instant the backend flipped),
+and the installer was still printing "no session is woken until a drain hook
+exists" — a caveat that outlived its uncertainty and had become the opposite of
+true. Both are the same failure shape the rule is about, pointing the other
+way: prose that stopped tracking reality and had nothing forcing it to.

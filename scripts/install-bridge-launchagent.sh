@@ -158,8 +158,22 @@ else
 fi
 
 echo ""
-echo "NOTE: nothing drains wake/<session>.jsonl yet (agent-event-bus#134)."
-echo "      The bridge will spool actionable DMs durably, but no session is"
-echo "      woken by them until a drain hook exists."
+# Was "nothing drains the spool, so no session is woken" - true until the mux
+# backend landed (#149), and printed by this script for months after it
+# stopped being true. Sessions are now woken by INJECTION, not by draining the
+# spool; the spool is durable bookkeeping and the fallback for anything that
+# cannot be injected. What actually gates a wake is the pane mapping, so name
+# that instead - it is the part an operator has to install.
+if [[ -s "$DATA_DIR/wake/panes.json" ]] && grep -q '[^[:space:]{}]' "$DATA_DIR/wake/panes.json" 2>/dev/null; then
+    echo "NOTE: wake/panes.json has entries, so mapped sessions on this host can"
+    echo "      be woken by a DM to their session_id. Unmapped sessions (and"
+    echo "      sessions on other machines) are spooled only."
+else
+    echo "NOTE: wake/panes.json is empty, so nothing here can be woken yet -"
+    echo "      every DM will spool and resolve to \"spool-unmapped\"."
+    echo "      Sessions map themselves via a SessionStart hook running:"
+    echo "        agent-event-bus-cli panes set --session-id \"\$SESSION_ID\""
+    echo "      See docs/BRIDGE.md, \"Maintaining the pane mapping\"."
+fi
 echo ""
 echo "To uninstall: $SCRIPT_DIR/uninstall-bridge-launchagent.sh"
